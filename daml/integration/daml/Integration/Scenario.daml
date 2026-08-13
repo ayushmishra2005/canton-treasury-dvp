@@ -1,0 +1,295 @@
+module Integration.Scenario where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import DA.List (sort)
+import DA.Optional (isNone, isSome)
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, hours)
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV1
+import Splice.Api.Token.AllocationRequestV1
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Dvp.Proposal
+import Dvp.Trade
+
+import Integration.Control
+import Integration.Topology
+
+import Stablecoin.Eligibility qualified as Stablecoin
+import Stablecoin.Eligibility (StablecoinEligibility(..))
+import Stablecoin.Holding (StablecoinHolding)
+import Stablecoin.Instrument
+import Stablecoin.Rules qualified as Stablecoin
+import Stablecoin.Rules (StablecoinRules(..))
+import Treasury.Eligibility qualified as Treasury
+import Treasury.Eligibility (TreasuryEligibility(..))
+import Treasury.Holding (TreasuryHolding)
+import Treasury.Instrument
+import Treasury.Rules qualified as Treasury
+import Treasury.Rules (TreasuryRules(..))
+
+treasuryInstrumentName : Text
+treasuryInstrumentName = "UST-2028-11"
+
+paymentInstrumentName : Text
+paymentInstrumentName = "USD-C"
+
+deliveryQuantity : Decimal
+deliveryQuantity = 100.0
+
+paymentAmount : Decimal
+paymentAmount = 100000.0
+
+noExtraArgs : ExtraArgs
+noExtraArgs = ExtraArgs with
+  context = emptyChoiceContext
+  meta = emptyMetadata
+
+completedAllocation : AllocationInstructionResult -> Script (ContractId Allocation)
+completedAllocation result = case result.output of
+  AllocationInstructionResult_Completed allocationCid -> pure allocationCid
+  _ -> abort "Allocation did not complete"
+
+onlyBackingHolding : [ContractId Holding] -> Script (ContractId Holding)
+onlyBackingHolding holdingCids = case holdingCids of
+  [holdingCid] -> pure holdingCid
+  _ -> abort "Expected exactly one backing holding"
+
+legSpec : AllocationRequestView -> Text -> Script AllocationSpecification
+legSpec requestView transferLegId =
+  case TextMap.lookup transferLegId requestView.transferLegs of
+    Some transferLeg -> pure AllocationSpecification with
+      settlement = requestView.settlement
+      transferLegId
+      transferLeg
+    None -> abort ("Unknown transfer leg " <> transferLegId)
+
+requestViewAs : Party -> ContractId DvpTrade -> Script AllocationRequestView
+requestViewAs party tradeCid = do
+  Some requestView <- queryInterfaceContractId @AllocationRequest party
+    (toInterfaceContractId @AllocationRequest tradeCid)
+  pure requestView
+
+holdingSummary : Party -> Script [(Text, Decimal, Bool)]
+holdingSummary party = do
+  holdings <- queryInterface @Holding party
+  pure $ sort
+    [ (holdingView.instrumentId.id, holdingView.amount, isSome holdingView.lock)
+    | (_, Some holdingView) <- holdings
+    ]
+
+instrumentTotal : Party -> Script Decimal
+instrumentTotal admin = do
+  holdings <- queryInterface @Holding admin
+  pure (sum [holdingView.amount | (_, Some holdingView) <- holdings])
+
+disclosureOf : Template t => Party -> ContractId t -> Script Disclosure
+disclosureOf party contractId = do
+  disclosure <- queryDisclosure party contractId
+  case disclosure of
+    Some found -> pure found
+    None -> abort "Expected a disclosure for an already visible contract"
+
+dvpAcrossParticipants : Script ()
+dvpAcrossParticipants = do
+  topology <- allocateTopology
+  assertExclusiveHosting topology
+
+  controlCid <- submit topology.outsider $ createCmd ControlPing with
+    owner = topology.outsider
+    label = controlLabel
+  control <- queryContractId topology.outsider controlCid
+  isSome control === True
+
+  now <- getTime
+  let allocateBefore = addRelTime now (hours 1)
+      settleBefore = addRelTime now (hours 2)
+      treasuryInstrumentId = InstrumentId with
+        admin = topology.treasuryRegistry
+        id = treasuryInstrumentName
+      paymentInstrumentId = InstrumentId with
+        admin = topology.cashRegistry
+        id = paymentInstrumentName
+
+  treasuryInstrumentCid <- submit topology.treasuryRegistry $ createCmd TreasuryInstrument with
+    treasuryRegistry = topology.treasuryRegistry
+    id = treasuryInstrumentName
+    description = "US Treasury Note 1.5% due 2028-11-15"
+    faceValue = 1000.0
+    maturityDate = date 2028 Nov 15
+  treasuryRulesCid <- submit topology.treasuryRegistry $
+    createCmd TreasuryRules with instrumentId = treasuryInstrumentId
+  deliveryHoldingCid <- submit topology.treasuryRegistry $
+    exerciseCmd treasuryInstrumentCid Issue with
+      owner = topology.seller
+      amount = deliveryQuantity
+
+  cashInstrumentCid <- submit topology.cashRegistry $ createCmd StablecoinInstrument with
+    cashRegistry = topology.cashRegistry
+    id = paymentInstrumentName
+    description = "Regulated USD payment stablecoin"
+  cashRulesCid <- submit topology.cashRegistry $
+    createCmd StablecoinRules with instrumentId = paymentInstrumentId
+  paymentHoldingCid <- submit topology.cashRegistry $
+    exerciseCmd cashInstrumentCid Mint with
+      owner = topology.buyer
+      amount = paymentAmount
+
+  let treasuryEligibility investor = submit topology.treasuryRegistry $
+        createCmd TreasuryEligibility with
+          instrumentId = treasuryInstrumentId
+          investor
+          status = Treasury.Eligible
+          validFrom = addRelTime now (hours (-1))
+          validUntil = addRelTime now (hours 24)
+          attestationRef = "attestation-000"
+      paymentEligibility investor = submit topology.cashRegistry $
+        createCmd StablecoinEligibility with
+          instrumentId = paymentInstrumentId
+          investor
+          status = Stablecoin.Eligible
+          validFrom = addRelTime now (hours (-1))
+          validUntil = addRelTime now (hours 24)
+          attestationRef = "attestation-000"
+
+  sellerTreasuryEligibilityCid <- treasuryEligibility topology.seller
+  buyerTreasuryEligibilityCid <- treasuryEligibility topology.buyer
+  sellerPaymentEligibilityCid <- paymentEligibility topology.seller
+  buyerPaymentEligibilityCid <- paymentEligibility topology.buyer
+
+  let treasuryLeg = TransferLeg with
+        sender = topology.seller
+        receiver = topology.buyer
+        amount = deliveryQuantity
+        instrumentId = treasuryInstrumentId
+        meta = emptyMetadata
+      paymentLeg = TransferLeg with
+        sender = topology.buyer
+        receiver = topology.seller
+        amount = paymentAmount
+        instrumentId = paymentInstrumentId
+        meta = emptyMetadata
+
+  proposalCid <- submit topology.seller $ createCmd DvpProposal with
+    venue = topology.venue
+    seller = topology.seller
+    buyer = topology.buyer
+    treasuryLeg
+    paymentLeg
+    requestedAt = now
+    allocateBefore
+    settleBefore
+    approvers = []
+    tradeCid = None
+  acceptedBySeller <- submit topology.seller $
+    exerciseCmd proposalCid DvpProposal_Accept with approver = topology.seller
+  acceptedByBuyer <- submit topology.buyer $
+    exerciseCmd acceptedBySeller DvpProposal_Accept with approver = topology.buyer
+  tradeCid <- submit topology.venue $
+    exerciseCmd acceptedByBuyer DvpProposal_InitiateSettlement
+
+  sellerRequestView <- requestViewAs topology.seller tradeCid
+  buyerRequestView <- requestViewAs topology.buyer tradeCid
+  sellerRequestView === buyerRequestView
+  treasurySpec <- legSpec sellerRequestView treasuryLegId
+  paymentSpec <- legSpec buyerRequestView paymentLegId
+
+  treasuryRulesDisclosure <- disclosureOf topology.treasuryRegistry treasuryRulesCid
+  buyerTreasuryEligibilityDisclosure <-
+    disclosureOf topology.treasuryRegistry buyerTreasuryEligibilityCid
+  treasuryResult <- submit
+    (actAs topology.seller
+      <> disclose treasuryRulesDisclosure
+      <> disclose buyerTreasuryEligibilityDisclosure) $
+    exerciseCmd (toInterfaceContractId @AllocationFactory treasuryRulesCid)
+      AllocationFactory_Allocate with
+        expectedAdmin = topology.treasuryRegistry
+        allocation = treasurySpec
+        requestedAt = now
+        inputHoldingCids = [toInterfaceContractId @Holding deliveryHoldingCid]
+        extraArgs = ExtraArgs with
+          context = ChoiceContext with
+            values = TextMap.fromList
+              [ (Treasury.senderEligibilityKey, AV_ContractId (coerceContractId sellerTreasuryEligibilityCid))
+              , (Treasury.receiverEligibilityKey, AV_ContractId (coerceContractId buyerTreasuryEligibilityCid))
+              ]
+          meta = emptyMetadata
+  treasuryAllocationCid <- completedAllocation treasuryResult
+
+  cashRulesDisclosure <- disclosureOf topology.cashRegistry cashRulesCid
+  sellerPaymentEligibilityDisclosure <-
+    disclosureOf topology.cashRegistry sellerPaymentEligibilityCid
+  paymentResult <- submit
+    (actAs topology.buyer
+      <> disclose cashRulesDisclosure
+      <> disclose sellerPaymentEligibilityDisclosure) $
+    exerciseCmd (toInterfaceContractId @AllocationFactory cashRulesCid)
+      AllocationFactory_Allocate with
+        expectedAdmin = topology.cashRegistry
+        allocation = paymentSpec
+        requestedAt = now
+        inputHoldingCids = [toInterfaceContractId @Holding paymentHoldingCid]
+        extraArgs = ExtraArgs with
+          context = ChoiceContext with
+            values = TextMap.fromList
+              [ (Stablecoin.senderEligibilityKey, AV_ContractId (coerceContractId buyerPaymentEligibilityCid))
+              , (Stablecoin.receiverEligibilityKey, AV_ContractId (coerceContractId sellerPaymentEligibilityCid))
+              ]
+          meta = emptyMetadata
+  paymentAllocationCid <- completedAllocation paymentResult
+
+  Some treasuryAllocationView <-
+    queryInterfaceContractId @Allocation topology.treasuryRegistry treasuryAllocationCid
+  Some paymentAllocationView <-
+    queryInterfaceContractId @Allocation topology.cashRegistry paymentAllocationCid
+  treasuryLockedCid <- onlyBackingHolding treasuryAllocationView.holdingCids
+  paymentLockedCid <- onlyBackingHolding paymentAllocationView.holdingCids
+  treasuryLockedDisclosure <- disclosureOf topology.treasuryRegistry
+    (fromInterfaceContractId @TreasuryHolding treasuryLockedCid)
+  paymentLockedDisclosure <- disclosureOf topology.cashRegistry
+    (fromInterfaceContractId @StablecoinHolding paymentLockedCid)
+
+  settleResult <- submit
+    (actAs topology.venue
+      <> disclose treasuryLockedDisclosure
+      <> disclose paymentLockedDisclosure) $
+    exerciseCmd tradeCid DvpTrade_Settle with
+      allocations =
+        [ SettlementAllocation with
+            transferLegId = treasuryLegId
+            allocationCid = treasuryAllocationCid
+            extraArgs = noExtraArgs
+        , SettlementAllocation with
+            transferLegId = paymentLegId
+            allocationCid = paymentAllocationCid
+            extraArgs = noExtraArgs
+        ]
+  length settleResult.treasuryResult.receiverHoldingCids === 1
+  length settleResult.paymentResult.receiverHoldingCids === 1
+
+  buyerSummary <- holdingSummary topology.buyer
+  sellerSummary <- holdingSummary topology.seller
+  buyerSummary === [(treasuryInstrumentName, deliveryQuantity, False)]
+  sellerSummary === [(paymentInstrumentName, paymentAmount, False)]
+
+  treasuryTotal <- instrumentTotal topology.treasuryRegistry
+  paymentTotal <- instrumentTotal topology.cashRegistry
+  treasuryTotal === deliveryQuantity
+  paymentTotal === paymentAmount
+
+  tradeAfter <- queryContractId topology.venue tradeCid
+  treasuryAllocationAfter <-
+    queryInterfaceContractId @Allocation topology.treasuryRegistry treasuryAllocationCid
+  paymentAllocationAfter <-
+    queryInterfaceContractId @Allocation topology.cashRegistry paymentAllocationCid
+  isNone tradeAfter === True
+  isNone treasuryAllocationAfter === True
+  isNone paymentAllocationAfter === True
+
+  outsiderHoldings <- holdingSummary topology.outsider
+  outsiderHoldings === []

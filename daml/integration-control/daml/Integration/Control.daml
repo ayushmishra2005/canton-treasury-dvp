@@ -1,0 +1,12 @@
+module Integration.Control where
+
+controlLabel : Text
+controlLabel = "outsider-stream-control"
+
+template ControlPing
+  with
+    owner : Party
+    label : Text
+  where
+    signatory owner
+    ensure label /= ""

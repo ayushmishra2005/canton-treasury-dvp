@@ -3,3 +3,5 @@ packages:
   - ./daml/stablecoin-registry
   - ./daml/dvp-settlement
   - ./daml/tests
+  - ./daml/integration-control
+  - ./daml/integration

@@ -1,0 +1,7 @@
+sdk-version: 3.5.5
+name: canton-treasury-dvp-integration-control
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib

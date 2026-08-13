@@ -1,0 +1,69 @@
+module Integration.Topology where
+
+import DA.Foldable (forA_)
+import Daml.Script
+
+data Topology = Topology with
+  treasuryRegistry : Party
+  cashRegistry : Party
+  seller : Party
+  buyer : Party
+  venue : Party
+  outsider : Party
+
+treasuryParticipant : Text
+treasuryParticipant = "p-treasury"
+
+cashParticipant : Text
+cashParticipant = "p-cash"
+
+sellerParticipant : Text
+sellerParticipant = "p-seller"
+
+buyerParticipant : Text
+buyerParticipant = "p-buyer"
+
+venueParticipant : Text
+venueParticipant = "p-venue"
+
+outsiderParticipant : Text
+outsiderParticipant = "p-outsider"
+
+allocateOn : Text -> Text -> Script Party
+allocateOn hint participant =
+  allocatePartyByHintOn (PartyIdHint hint) (ParticipantName participant)
+
+allocateTopology : Script Topology
+allocateTopology = do
+  treasuryRegistry <- allocateOn "treasuryRegistry" treasuryParticipant
+  cashRegistry <- allocateOn "cashRegistry" cashParticipant
+  seller <- allocateOn "seller" sellerParticipant
+  buyer <- allocateOn "buyer" buyerParticipant
+  venue <- allocateOn "venue" venueParticipant
+  outsider <- allocateOn "outsider" outsiderParticipant
+  pure Topology with ..
+
+hostingMap : Topology -> [(Text, Party)]
+hostingMap topology =
+  [ (treasuryParticipant, topology.treasuryRegistry)
+  , (cashParticipant, topology.cashRegistry)
+  , (sellerParticipant, topology.seller)
+  , (buyerParticipant, topology.buyer)
+  , (venueParticipant, topology.venue)
+  , (outsiderParticipant, topology.outsider)
+  ]
+
+assertExclusiveHosting : Topology -> Script ()
+assertExclusiveHosting topology = do
+  let hosts = hostingMap topology
+  forA_ hosts $ \(host, party) ->
+    forA_ hosts $ \(candidate, _) -> do
+      known <- listKnownPartiesOn (ParticipantName candidate)
+      let hostedLocally = [details | details <- known, details.party == party, details.isLocal]
+      if host == candidate
+        then assertMsg
+          ("Party " <> partyToText party <> " must be hosted on " <> host)
+          (length hostedLocally == 1)
+        else assertMsg
+          ("Party " <> partyToText party <> " must not be hosted on " <> candidate)
+          (null hostedLocally)

@@ -1,0 +1,12 @@
+{
+  "default_participant": { "host": "127.0.0.1", "port": 5011 },
+  "participants": {
+    "p-treasury": { "host": "127.0.0.1", "port": 5011 },
+    "p-cash": { "host": "127.0.0.1", "port": 5021 },
+    "p-seller": { "host": "127.0.0.1", "port": 5031 },
+    "p-buyer": { "host": "127.0.0.1", "port": 5041 },
+    "p-venue": { "host": "127.0.0.1", "port": 5051 },
+    "p-outsider": { "host": "127.0.0.1", "port": 5061 }
+  },
+  "party_participants": {}
+}

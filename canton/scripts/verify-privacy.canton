@@ -1,0 +1,278 @@
+import com.daml.ledger.api.v2.transaction_filter.TransactionShape
+import com.daml.ledger.api.v2.value.Value
+import java.nio.file.{Files, Paths}
+
+val synchronizerAlias = "settlement-sync"
+
+val partyHints = Seq(
+  "p-treasury" -> "treasuryRegistry",
+  "p-cash" -> "cashRegistry",
+  "p-seller" -> "seller",
+  "p-buyer" -> "buyer",
+  "p-venue" -> "venue",
+  "p-outsider" -> "outsider",
+)
+
+val runDir = Paths.get(sys.env.getOrElse("CANTON_RUN_DIR", "canton/.run"))
+val checkpoints = Files
+  .readString(runDir.resolve("checkpoints.txt"))
+  .split("\n")
+  .map(_.trim)
+  .filter(_.nonEmpty)
+  .map { line =>
+    val parts = line.split("=")
+    parts(0) -> parts(1).toLong
+  }
+  .toMap
+
+var failures = Vector.empty[String]
+
+def check(name: String, condition: Boolean): Unit =
+  if (condition) println(s"PRIVACY_OK $name")
+  else {
+    failures = failures :+ name
+    println(s"PRIVACY_FAIL $name")
+  }
+
+def numerics(value: Value): Set[BigDecimal] = value.sum match {
+  case Value.Sum.Numeric(raw) => Set(BigDecimal(raw))
+  case Value.Sum.Record(record) => record.fields.flatMap(_.value.toSeq.flatMap(numerics)).toSet
+  case Value.Sum.List(list) => list.elements.flatMap(numerics).toSet
+  case Value.Sum.Optional(opt) => opt.value.toSeq.flatMap(numerics).toSet
+  case Value.Sum.Variant(variant) => variant.value.toSeq.flatMap(numerics).toSet
+  case Value.Sum.TextMap(map) => map.entries.flatMap(_.value.toSeq.flatMap(numerics)).toSet
+  case Value.Sum.GenMap(map) => map.entries.flatMap(_.value.toSeq.flatMap(numerics)).toSet
+  case _ => Set.empty
+}
+
+case class CreatedFact(template: String, cid: String, amounts: Set[BigDecimal], updateId: String)
+case class ExercisedFact(template: String, choice: String, cid: String, updateId: String)
+case class Projection(
+  participant: String,
+  party: String,
+  created: Seq[CreatedFact],
+  exercised: Seq[ExercisedFact],
+)
+
+def projectionOf(participantName: String, hint: String): Projection = {
+  val node = participants.remote
+    .find(_.name == participantName)
+    .getOrElse(sys.error(s"missing participant $participantName"))
+  val connected = node.synchronizers.list_connected().map(_.synchronizerAlias.unwrap)
+  check(s"$participantName-connected-to-$synchronizerAlias", connected.contains(synchronizerAlias))
+  val party = node.parties
+    .hosted()
+    .map(_.party)
+    .find(_.filterString.startsWith(hint + "::"))
+    .getOrElse(sys.error(s"party $hint is not hosted on $participantName"))
+  val begin = checkpoints.getOrElse(participantName, sys.error(s"no checkpoint for $participantName"))
+  val end = node.ledger_api.state.end()
+  val transactions = node.ledger_api.updates.transactions(
+    partyIds = Set(party),
+    completeAfter = PositiveInt.tryCreate(1000),
+    beginOffsetExclusive = begin,
+    endOffsetInclusive = Some(end),
+    transactionShape = TransactionShape.TRANSACTION_SHAPE_LEDGER_EFFECTS,
+  )
+  val created = transactions.flatMap { wrapper =>
+    wrapper.transaction.events.flatMap(_.event.created).map { event =>
+      val id = event.templateId.getOrElse(sys.error("created event without template id"))
+      CreatedFact(
+        s"${id.moduleName}:${id.entityName}",
+        event.contractId,
+        event.createArguments.toSeq.flatMap(_.fields.flatMap(_.value.toSeq.flatMap(numerics))).toSet,
+        wrapper.transaction.updateId,
+      )
+    }
+  }
+  val exercised = transactions.flatMap { wrapper =>
+    wrapper.transaction.events.flatMap(_.event.exercised).map { event =>
+      val id = event.templateId.getOrElse(sys.error("exercised event without template id"))
+      ExercisedFact(
+        s"${id.moduleName}:${id.entityName}",
+        event.choice,
+        event.contractId,
+        wrapper.transaction.updateId,
+      )
+    }
+  }
+  Projection(participantName, party.filterString, created, exercised)
+}
+
+val projections = partyHints.map { case (participantName, hint) =>
+  participantName -> projectionOf(participantName, hint)
+}.toMap
+
+projections.values.foreach { projection =>
+  check(
+    s"${projection.participant}-stream-non-vacuous",
+    projection.created.nonEmpty || projection.exercised.nonEmpty,
+  )
+}
+
+def createdTemplates(participant: String): Set[String] =
+  projections(participant).created.map(_.template).toSet
+
+def exercisedChoices(participant: String): Set[String] =
+  projections(participant).exercised.map(fact => s"${fact.template}#${fact.choice}").toSet
+
+def createdCids(participant: String): Set[String] =
+  projections(participant).created.map(_.cid).toSet
+
+def amountsSeen(participant: String): Set[BigDecimal] =
+  projections(participant).created.flatMap(_.amounts).toSet
+
+def holdingLifecycle(participant: String, template: String): Seq[String] =
+  projections(participant).created.filter(_.template == template).map(_.cid)
+
+val treasuryHoldings = holdingLifecycle("p-treasury", "Treasury.Holding:TreasuryHolding")
+val stablecoinHoldings = holdingLifecycle("p-cash", "Stablecoin.Holding:StablecoinHolding")
+check("treasury-holding-lifecycle-has-three-states", treasuryHoldings.size == 3)
+check("stablecoin-holding-lifecycle-has-three-states", stablecoinHoldings.size == 3)
+
+val treasuryIssuedCid = treasuryHoldings.head
+val treasuryLockedCid = treasuryHoldings(1)
+val treasuryDeliveredCid = treasuryHoldings(2)
+val stablecoinMintedCid = stablecoinHoldings.head
+val stablecoinLockedCid = stablecoinHoldings(1)
+val stablecoinDeliveredCid = stablecoinHoldings(2)
+
+val settlementExercise = projections("p-venue").exercised
+  .find(fact => fact.template == "Dvp.Trade:DvpTrade" && fact.choice == "DvpTrade_Settle")
+  .getOrElse(sys.error("venue did not witness DvpTrade_Settle"))
+val settlementUpdateId = settlementExercise.updateId
+
+val treasuryAmount = BigDecimal(100)
+val paymentAmount = BigDecimal(100000)
+
+check("p-outsider-receives-control-event",
+  createdTemplates("p-outsider").contains("Integration.Control:ControlPing"))
+check("p-outsider-sees-only-the-control-event",
+  createdTemplates("p-outsider") == Set("Integration.Control:ControlPing"))
+check("p-outsider-exercises-nothing", exercisedChoices("p-outsider").isEmpty)
+check("p-outsider-sees-no-dvp-template",
+  !createdTemplates("p-outsider").exists(t => t.startsWith("Dvp.") || t.startsWith("Treasury.") || t.startsWith("Stablecoin.")))
+check("p-outsider-sees-no-settlement-transaction",
+  !projections("p-outsider").created.exists(_.updateId == settlementUpdateId) &&
+    !projections("p-outsider").exercised.exists(_.updateId == settlementUpdateId))
+check("p-outsider-sees-no-project-holding",
+  Set(treasuryIssuedCid, treasuryLockedCid, treasuryDeliveredCid, stablecoinMintedCid, stablecoinLockedCid, stablecoinDeliveredCid)
+    .intersect(createdCids("p-outsider")).isEmpty)
+check("p-outsider-sees-no-trade-amounts",
+  !amountsSeen("p-outsider").contains(treasuryAmount) && !amountsSeen("p-outsider").contains(paymentAmount))
+
+check("p-treasury-sees-treasury-instrument",
+  createdTemplates("p-treasury").contains("Treasury.Instrument:TreasuryInstrument"))
+check("p-treasury-sees-treasury-holdings",
+  createdTemplates("p-treasury").contains("Treasury.Holding:TreasuryHolding"))
+check("p-treasury-sees-treasury-eligibility",
+  createdTemplates("p-treasury").contains("Treasury.Eligibility:TreasuryEligibility"))
+check("p-treasury-sees-treasury-allocation",
+  createdTemplates("p-treasury").contains("Treasury.Allocation:TreasuryAllocation"))
+check("p-treasury-sees-treasury-settlement-leg",
+  exercisedChoices("p-treasury").contains("Treasury.Allocation:TreasuryAllocation#Allocation_ExecuteTransfer"))
+check("p-treasury-settlement-leg-is-in-the-settlement-transaction",
+  projections("p-treasury").exercised.exists(fact =>
+    fact.template == "Treasury.Allocation:TreasuryAllocation" &&
+      fact.choice == "Allocation_ExecuteTransfer" &&
+      fact.updateId == settlementUpdateId))
+check("p-treasury-sees-no-stablecoin-contract",
+  !createdTemplates("p-treasury").exists(_.startsWith("Stablecoin.")))
+check("p-treasury-sees-no-stablecoin-holding-cid",
+  Set(stablecoinMintedCid, stablecoinLockedCid, stablecoinDeliveredCid)
+    .intersect(createdCids("p-treasury")).isEmpty)
+check("p-treasury-sees-no-payment-amount", !amountsSeen("p-treasury").contains(paymentAmount))
+check("p-treasury-sees-no-trade-payload",
+  !createdTemplates("p-treasury").exists(t => t.startsWith("Dvp.")))
+check("p-treasury-does-not-witness-the-trade-settle-choice",
+  !exercisedChoices("p-treasury").contains("Dvp.Trade:DvpTrade#DvpTrade_Settle"))
+
+check("p-cash-sees-stablecoin-instrument",
+  createdTemplates("p-cash").contains("Stablecoin.Instrument:StablecoinInstrument"))
+check("p-cash-sees-stablecoin-holdings",
+  createdTemplates("p-cash").contains("Stablecoin.Holding:StablecoinHolding"))
+check("p-cash-sees-stablecoin-eligibility",
+  createdTemplates("p-cash").contains("Stablecoin.Eligibility:StablecoinEligibility"))
+check("p-cash-sees-stablecoin-allocation",
+  createdTemplates("p-cash").contains("Stablecoin.Allocation:StablecoinAllocation"))
+check("p-cash-sees-stablecoin-settlement-leg",
+  exercisedChoices("p-cash").contains("Stablecoin.Allocation:StablecoinAllocation#Allocation_ExecuteTransfer"))
+check("p-cash-settlement-leg-is-in-the-settlement-transaction",
+  projections("p-cash").exercised.exists(fact =>
+    fact.template == "Stablecoin.Allocation:StablecoinAllocation" &&
+      fact.choice == "Allocation_ExecuteTransfer" &&
+      fact.updateId == settlementUpdateId))
+check("p-cash-sees-no-treasury-contract",
+  !createdTemplates("p-cash").exists(_.startsWith("Treasury.")))
+check("p-cash-sees-no-treasury-holding-cid",
+  Set(treasuryIssuedCid, treasuryLockedCid, treasuryDeliveredCid)
+    .intersect(createdCids("p-cash")).isEmpty)
+check("p-cash-sees-no-treasury-amount", !amountsSeen("p-cash").contains(treasuryAmount))
+check("p-cash-sees-no-trade-payload",
+  !createdTemplates("p-cash").exists(t => t.startsWith("Dvp.")))
+check("p-cash-does-not-witness-the-trade-settle-choice",
+  !exercisedChoices("p-cash").contains("Dvp.Trade:DvpTrade#DvpTrade_Settle"))
+
+check("p-seller-sees-proposal", createdTemplates("p-seller").contains("Dvp.Proposal:DvpProposal"))
+check("p-seller-sees-trade", createdTemplates("p-seller").contains("Dvp.Trade:DvpTrade"))
+check("p-seller-sees-treasury-allocation",
+  createdTemplates("p-seller").contains("Treasury.Allocation:TreasuryAllocation"))
+check("p-seller-sees-stablecoin-allocation",
+  createdTemplates("p-seller").contains("Stablecoin.Allocation:StablecoinAllocation"))
+check("p-seller-sees-settlement-outcome",
+  exercisedChoices("p-seller").contains("Dvp.Trade:DvpTrade#DvpTrade_Settle"))
+check("p-seller-sees-its-original-treasury-holding",
+  createdCids("p-seller").contains(treasuryIssuedCid))
+check("p-seller-sees-its-resulting-stablecoin-holding",
+  createdCids("p-seller").contains(stablecoinDeliveredCid))
+check("p-seller-does-not-see-the-buyer-original-stablecoin-holding",
+  !createdCids("p-seller").contains(stablecoinMintedCid))
+check("p-seller-does-not-see-the-outsider-control-contract",
+  !createdTemplates("p-seller").contains("Integration.Control:ControlPing"))
+
+check("p-buyer-sees-proposal", createdTemplates("p-buyer").contains("Dvp.Proposal:DvpProposal"))
+check("p-buyer-sees-trade", createdTemplates("p-buyer").contains("Dvp.Trade:DvpTrade"))
+check("p-buyer-sees-treasury-allocation",
+  createdTemplates("p-buyer").contains("Treasury.Allocation:TreasuryAllocation"))
+check("p-buyer-sees-stablecoin-allocation",
+  createdTemplates("p-buyer").contains("Stablecoin.Allocation:StablecoinAllocation"))
+check("p-buyer-sees-settlement-outcome",
+  exercisedChoices("p-buyer").contains("Dvp.Trade:DvpTrade#DvpTrade_Settle"))
+check("p-buyer-sees-its-original-stablecoin-holding",
+  createdCids("p-buyer").contains(stablecoinMintedCid))
+check("p-buyer-sees-its-resulting-treasury-holding",
+  createdCids("p-buyer").contains(treasuryDeliveredCid))
+check("p-buyer-does-not-see-the-seller-original-treasury-holding",
+  !createdCids("p-buyer").contains(treasuryIssuedCid))
+check("p-buyer-does-not-see-the-outsider-control-contract",
+  !createdTemplates("p-buyer").contains("Integration.Control:ControlPing"))
+
+check("p-venue-sees-proposal-approval",
+  exercisedChoices("p-venue").contains("Dvp.Proposal:DvpProposal#DvpProposal_Accept"))
+check("p-venue-sees-trade-terms", createdTemplates("p-venue").contains("Dvp.Trade:DvpTrade"))
+check("p-venue-sees-treasury-allocation",
+  createdTemplates("p-venue").contains("Treasury.Allocation:TreasuryAllocation"))
+check("p-venue-sees-stablecoin-allocation",
+  createdTemplates("p-venue").contains("Stablecoin.Allocation:StablecoinAllocation"))
+check("p-venue-sees-treasury-settlement-outcome",
+  createdCids("p-venue").contains(treasuryDeliveredCid))
+check("p-venue-sees-stablecoin-settlement-outcome",
+  createdCids("p-venue").contains(stablecoinDeliveredCid))
+check("p-venue-sees-no-treasury-eligibility",
+  !createdTemplates("p-venue").contains("Treasury.Eligibility:TreasuryEligibility"))
+check("p-venue-sees-no-stablecoin-eligibility",
+  !createdTemplates("p-venue").contains("Stablecoin.Eligibility:StablecoinEligibility"))
+check("p-venue-does-not-see-the-seller-original-treasury-holding",
+  !createdCids("p-venue").contains(treasuryIssuedCid))
+check("p-venue-does-not-see-the-buyer-original-stablecoin-holding",
+  !createdCids("p-venue").contains(stablecoinMintedCid))
+check("p-venue-does-not-see-the-outsider-control-contract",
+  !createdTemplates("p-venue").contains("Integration.Control:ControlPing"))
+
+println(s"PRIVACY_SETTLEMENT_UPDATE_ID $settlementUpdateId")
+projections.toSeq.sortBy(_._1).foreach { case (name, projection) =>
+  println(s"PRIVACY_PROJECTION $name party=${projection.party} created=${projection.created.size} exercised=${projection.exercised.size}")
+}
+
+if (failures.nonEmpty) sys.error(s"privacy assertions failed: ${failures.mkString(", ")}")
+println("PRIVACY_VERIFIED")

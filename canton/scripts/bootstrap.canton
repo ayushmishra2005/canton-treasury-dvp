@@ -1,0 +1,62 @@
+import java.nio.file.{Files, Paths}
+
+val synchronizerAlias = "settlement-sync"
+
+val sequencer = sequencers.local.find(_.name == "settlement-sequencer").getOrElse(sys.error("missing sequencer"))
+val mediator = mediators.local.find(_.name == "settlement-mediator").getOrElse(sys.error("missing mediator"))
+
+bootstrap.synchronizer(
+  synchronizerName = synchronizerAlias,
+  sequencers = Seq(sequencer),
+  mediators = Seq(mediator),
+  synchronizerOwners = Seq(sequencer),
+  synchronizerThreshold = PositiveInt.one,
+  staticSynchronizerParameters =
+    StaticSynchronizerParameters.defaults(sequencer.config.crypto, ProtocolVersion.latest),
+)
+
+val participantNames =
+  Seq("p-treasury", "p-cash", "p-seller", "p-buyer", "p-venue", "p-outsider")
+
+val hosts = participantNames.map { name =>
+  participants.local.find(_.name == name).getOrElse(sys.error(s"missing participant $name"))
+}
+
+hosts.foreach(_.synchronizers.connect_local(sequencer, alias = synchronizerAlias))
+
+hosts.foreach { host =>
+  val connected = host.synchronizers.list_connected().map(_.synchronizerAlias.unwrap)
+  if (!connected.contains(synchronizerAlias))
+    sys.error(s"${host.name} is not connected to $synchronizerAlias")
+  println(s"CONNECTED ${host.name} ${connected.mkString(",")}")
+}
+
+val darPaths = Seq(
+  "daml/treasury-registry/.daml/dist/treasury-registry-0.1.0.dar",
+  "daml/stablecoin-registry/.daml/dist/stablecoin-registry-0.1.0.dar",
+  "daml/dvp-settlement/.daml/dist/dvp-settlement-0.1.0.dar",
+  "daml/integration-control/.daml/dist/canton-treasury-dvp-integration-control-0.1.0.dar",
+)
+
+val uploaded = hosts.map { host =>
+  host.name -> darPaths.map(path => host.dars.upload(path))
+}.toMap
+
+hosts.foreach { host =>
+  val vetted = host.topology.vetted_packages
+    .list(filterParticipant = host.id.filterString)
+    .flatMap(_.item.packages.map(_.packageId.toString))
+    .toSet
+  val missing = uploaded(host.name).filterNot(vetted.contains)
+  if (missing.nonEmpty) sys.error(s"${host.name} has unvetted packages ${missing.mkString(",")}")
+  println(s"VETTED ${host.name} ${uploaded(host.name).mkString(",")}")
+}
+
+val runDir = Paths.get(sys.env.getOrElse("CANTON_RUN_DIR", "canton/.run"))
+Files.createDirectories(runDir)
+
+val checkpoints = hosts.map(host => s"${host.name}=${host.ledger_api.state.end()}")
+Files.write(runDir.resolve("checkpoints.txt"), checkpoints.mkString("\n").getBytes("UTF-8"))
+checkpoints.foreach(line => println(s"CHECKPOINT $line"))
+
+println("BOOTSTRAP_COMPLETE")

@@ -1,0 +1,133 @@
+module Tests.Treasury.AllocationFixture where
+
+import DA.Date (Month(..), date)
+import DA.Time (RelTime, addRelTime, hours, time)
+import DA.TextMap qualified as TextMap
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV1
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Treasury.Eligibility
+import Treasury.Holding
+import Treasury.Instrument
+import Treasury.Rules
+
+data Fixture = Fixture with
+  treasuryRegistry : Party
+  seller : Party
+  buyer : Party
+  executor : Party
+  instrumentId : InstrumentId
+  instrumentCid : ContractId TreasuryInstrument
+  rulesCid : ContractId TreasuryRules
+  now : Time
+
+setup : Script Fixture
+setup = do
+  setTime (time (date 2026 Jan 1) 12 0 0)
+  treasuryRegistry <- allocateParty "TreasuryRegistry"
+  seller <- allocateParty "Seller"
+  buyer <- allocateParty "Buyer"
+  executor <- allocateParty "Venue"
+  instrumentCid <- submit treasuryRegistry $ createCmd TreasuryInstrument with
+    treasuryRegistry
+    id = "UST-2028-11"
+    description = "US Treasury Note 1.5% due 2028-11-15"
+    faceValue = 1000.0
+    maturityDate = date 2028 Nov 15
+  let instrumentId = InstrumentId with admin = treasuryRegistry, id = "UST-2028-11"
+  rulesCid <- submit treasuryRegistry $ createCmd TreasuryRules with instrumentId
+  now <- getTime
+  pure Fixture with
+    treasuryRegistry
+    seller
+    buyer
+    executor
+    instrumentId
+    instrumentCid
+    rulesCid
+    now
+
+factoryCid : Fixture -> ContractId AllocationFactory
+factoryCid fixture = toInterfaceContractId @AllocationFactory fixture.rulesCid
+
+issue : Fixture -> Party -> Decimal -> Script (ContractId TreasuryHolding)
+issue fixture owner amount =
+  submit fixture.treasuryRegistry $ exerciseCmd fixture.instrumentCid Issue with owner, amount
+
+attest : Fixture -> Party -> EligibilityStatus -> RelTime -> RelTime -> Script (ContractId TreasuryEligibility)
+attest fixture investor status fromOffset untilOffset =
+  submit fixture.treasuryRegistry $ createCmd TreasuryEligibility with
+    instrumentId = fixture.instrumentId
+    investor
+    status
+    validFrom = addRelTime fixture.now fromOffset
+    validUntil = addRelTime fixture.now untilOffset
+    attestationRef = "attestation-000"
+
+eligible : Fixture -> Party -> Script (ContractId TreasuryEligibility)
+eligible fixture investor = attest fixture investor Eligible (hours (-1)) (hours 24)
+
+allocationSpec : Fixture -> Decimal -> AllocationSpecification
+allocationSpec fixture amount = AllocationSpecification with
+  settlement = SettlementInfo with
+    executor = fixture.executor
+    settlementRef = Reference with id = "settlement-000", cid = None
+    requestedAt = fixture.now
+    allocateBefore = addRelTime fixture.now (hours 1)
+    settleBefore = addRelTime fixture.now (hours 2)
+    meta = emptyMetadata
+  transferLegId = "delivery"
+  transferLeg = TransferLeg with
+    sender = fixture.seller
+    receiver = fixture.buyer
+    amount
+    instrumentId = fixture.instrumentId
+    meta = emptyMetadata
+
+eligibilityArgs : ContractId TreasuryEligibility -> ContractId TreasuryEligibility -> ExtraArgs
+eligibilityArgs senderEligibilityCid receiverEligibilityCid = ExtraArgs with
+  context = ChoiceContext with
+    values = TextMap.fromList
+      [ (senderEligibilityKey, AV_ContractId (coerceContractId senderEligibilityCid))
+      , (receiverEligibilityKey, AV_ContractId (coerceContractId receiverEligibilityCid))
+      ]
+  meta = emptyMetadata
+
+noExtraArgs : ExtraArgs
+noExtraArgs = ExtraArgs with
+  context = emptyChoiceContext
+  meta = emptyMetadata
+
+allocateAs : Fixture -> Party -> AllocationSpecification -> [ContractId TreasuryHolding] -> ExtraArgs -> Commands AllocationInstructionResult
+allocateAs fixture sender spec inputHoldingCids extraArgs =
+  exerciseCmd (factoryCid fixture) AllocationFactory_Allocate with
+    expectedAdmin = fixture.treasuryRegistry
+    allocation = spec
+    requestedAt = fixture.now
+    inputHoldingCids = map (toInterfaceContractId @Holding) inputHoldingCids
+    extraArgs
+
+allocate : Fixture -> AllocationSpecification -> [ContractId TreasuryHolding] -> ExtraArgs -> Script (ContractId Allocation, [ContractId Holding])
+allocate fixture spec inputHoldingCids extraArgs = do
+  result <- submit (actAs fixture.seller <> readAs fixture.treasuryRegistry) $
+    allocateAs fixture fixture.seller spec inputHoldingCids extraArgs
+  case result.output of
+    AllocationInstructionResult_Completed allocationCid ->
+      pure (allocationCid, result.senderChangeCids)
+    _ -> abort "Allocation did not complete"
+
+allocateMustFail : Fixture -> AllocationSpecification -> [ContractId TreasuryHolding] -> ExtraArgs -> Script ()
+allocateMustFail fixture spec inputHoldingCids extraArgs =
+  submitMustFail (actAs fixture.seller <> readAs fixture.treasuryRegistry) $
+    allocateAs fixture fixture.seller spec inputHoldingCids extraArgs
+
+lockedHoldingOf : Party -> ContractId Allocation -> Script (ContractId TreasuryHolding)
+lockedHoldingOf reader allocationCid = do
+  Some allocationView <- queryInterfaceContractId @Allocation reader allocationCid
+  case allocationView.holdingCids of
+    [holdingCid] -> pure (fromInterfaceContractId @TreasuryHolding holdingCid)
+    _ -> abort "Expected exactly one backing holding"

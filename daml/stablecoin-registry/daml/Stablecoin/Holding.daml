@@ -19,7 +19,7 @@ template StablecoinHolding
 
     choice Burn : ()
       controller instrumentId.admin
-      do pure ()
+      do assertMsg "Holding must be unlocked" (isNone lock)
 
     choice Split : (ContractId StablecoinHolding, ContractId StablecoinHolding)
       with

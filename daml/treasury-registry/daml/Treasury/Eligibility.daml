@@ -1,0 +1,37 @@
+module Treasury.Eligibility where
+
+import Splice.Api.Token.HoldingV1
+
+data EligibilityStatus
+  = Eligible
+  | Suspended
+  deriving (Eq, Show)
+
+template TreasuryEligibility
+  with
+    instrumentId : InstrumentId
+    investor : Party
+    status : EligibilityStatus
+    validFrom : Time
+    validUntil : Time
+    attestationRef : Text
+  where
+    signatory instrumentId.admin
+    observer investor
+
+    ensure validFrom < validUntil && attestationRef /= ""
+
+    choice Revoke : ()
+      controller instrumentId.admin
+      do pure ()
+
+requireEligible : InstrumentId -> Party -> Time -> Time -> TreasuryEligibility -> Update ()
+requireEligible instrumentId party now settleBefore eligibility = do
+  assertMsg "Eligibility must be administered by the instrument registry"
+    (eligibility.instrumentId == instrumentId)
+  assertMsg "Eligibility must name the transfer party" (eligibility.investor == party)
+  assertMsg "Eligibility must not be suspended" (eligibility.status == Eligible)
+  assertMsg "Eligibility must already be active" (eligibility.validFrom <= now)
+  assertMsg "Eligibility must not have expired" (now < eligibility.validUntil)
+  assertMsg "Eligibility must remain valid through settlement"
+    (settleBefore <= eligibility.validUntil)

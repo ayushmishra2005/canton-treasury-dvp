@@ -1,0 +1,318 @@
+module Tests.Stablecoin.Allocation where
+
+import DA.Assert ((===))
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, hours, minutes)
+import Daml.Script
+
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Stablecoin.Eligibility
+import Stablecoin.Holding
+import Stablecoin.Instrument
+import Stablecoin.Rules
+
+import Tests.Stablecoin.AllocationFixture
+
+exactBalanceAllocationSucceeds : Script ()
+exactBalanceAllocationSucceeds = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  (allocationCid, changeCids) <- allocate fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+  changeCids === []
+  lockedCid <- lockedHoldingOf fixture.payer allocationCid
+  Some locked <- queryContractId fixture.payer lockedCid
+  locked.amount === 250.0
+  locked.owner === fixture.payer
+  locked.lock === Some Lock with
+    holders = [fixture.cashRegistry]
+    expiresAt = Some (addRelTime fixture.now (hours 2))
+    expiresAfter = None
+    context = Some "Settlement allocation"
+
+overfundedAllocationCreatesChange : Script ()
+overfundedAllocationCreatesChange = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  (_, changeCids) <- allocate fixture (allocationSpec fixture 150.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+  case changeCids of
+    [changeCid] -> do
+      Some changeView <- queryInterfaceContractId @Holding fixture.payer changeCid
+      changeView.amount === 100.0
+      changeView.owner === fixture.payer
+      changeView.lock === None
+    _ -> abort "Expected exactly one change holding"
+
+inputTotalEqualsLockedPlusChange : Script ()
+inputTotalEqualsLockedPlusChange = do
+  fixture <- setup
+  firstCid <- mint fixture fixture.payer 175.0
+  secondCid <- mint fixture fixture.payer 75.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  (allocationCid, _) <- allocate fixture (allocationSpec fixture 150.0) [firstCid, secondCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+  lockedCid <- lockedHoldingOf fixture.payer allocationCid
+  Some locked <- queryContractId fixture.payer lockedCid
+  holdings <- queryInterface @Holding fixture.payer
+  let total = sum [holdingView.amount | (_, Some holdingView) <- holdings]
+  locked.amount === 150.0
+  total === 250.0
+
+allocationViewExposesSpecificationAndLockedHolding : Script ()
+allocationViewExposesSpecificationAndLockedHolding = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  let spec = allocationSpec fixture 250.0
+  (allocationCid, _) <- allocate fixture spec [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+  Some allocationView <- queryInterfaceContractId @Allocation fixture.payee allocationCid
+  allocationView.allocation === spec
+  allocationView.meta === emptyMetadata
+  lockedCid <- lockedHoldingOf fixture.payer allocationCid
+  allocationView.holdingCids === [toInterfaceContractId @Holding lockedCid]
+
+insufficientBalanceFails : Script ()
+insufficientBalanceFails = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 100.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+wrongHoldingOwnerFails : Script ()
+wrongHoldingOwnerFails = do
+  fixture <- setup
+  payeeHoldingCid <- mint fixture fixture.payee 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  submitMustFail (actAs fixture.payer <> readAs [fixture.cashRegistry, fixture.payee]) $
+    allocateAs fixture (allocationSpec fixture 250.0) [payeeHoldingCid]
+      (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+wrongHoldingInstrumentFails : Script ()
+wrongHoldingInstrumentFails = do
+  fixture <- setup
+  otherInstrumentCid <- submit fixture.cashRegistry $ createCmd StablecoinInstrument with
+    cashRegistry = fixture.cashRegistry
+    id = "EUR-C"
+    description = "Regulated EUR payment stablecoin"
+  otherHoldingCid <- submit fixture.cashRegistry $
+    exerciseCmd otherInstrumentCid Mint with owner = fixture.payer, amount = 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  allocateMustFail fixture (allocationSpec fixture 250.0) [otherHoldingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+lockedInputHoldingFails : Script ()
+lockedInputHoldingFails = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  (allocationCid, _) <- allocate fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+  lockedCid <- lockedHoldingOf fixture.payer allocationCid
+  allocateMustFail fixture (allocationSpec fixture 250.0) [lockedCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+duplicateInputHoldingFails : Script ()
+duplicateInputHoldingFails = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid, holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+noInputHoldingsFails : Script ()
+noInputHoldingsFails = do
+  fixture <- setup
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  allocateMustFail fixture (allocationSpec fixture 250.0) []
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+nonPositiveTransferAmountFails : Script ()
+nonPositiveTransferAmountFails = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  allocateMustFail fixture (allocationSpec fixture 0.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+nonSenderCannotAllocate : Script ()
+nonSenderCannotAllocate = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  submitMustFail (actAs fixture.payee <> readAs [fixture.cashRegistry, fixture.payer]) $
+    allocateAs fixture (allocationSpec fixture 250.0) [holdingCid]
+      (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+allocationAfterAllocateBeforeFails : Script ()
+allocationAfterAllocateBeforeFails = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  passTime (minutes 90)
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+invalidDeadlineOrderingFails : Script ()
+invalidDeadlineOrderingFails = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  let spec = allocationSpec fixture 250.0
+      badSpec = spec with
+        settlement = spec.settlement with
+          settleBefore = addRelTime fixture.now (minutes 30)
+  allocateMustFail fixture badSpec [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+suspendedEligibilityRejected : Script ()
+suspendedEligibilityRejected = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- attest fixture fixture.payer Suspended (hours (-1)) (hours 24)
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+revokedEligibilityRejected : Script ()
+revokedEligibilityRejected = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  submit fixture.cashRegistry $ exerciseCmd receiverEligibilityCid Revoke
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+notYetValidEligibilityRejected : Script ()
+notYetValidEligibilityRejected = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- attest fixture fixture.payee Eligible (minutes 10) (hours 24)
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+expiredEligibilityRejected : Script ()
+expiredEligibilityRejected = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- attest fixture fixture.payer Eligible (hours (-2)) (hours (-1))
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+eligibilityExpiringBeforeSettleBeforeRejected : Script ()
+eligibilityExpiringBeforeSettleBeforeRejected = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- attest fixture fixture.payee Eligible (hours (-1)) (minutes 90)
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+wrongInvestorEligibilityRejected : Script ()
+wrongInvestorEligibilityRejected = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid senderEligibilityCid)
+
+wrongInstrumentEligibilityRejected : Script ()
+wrongInstrumentEligibilityRejected = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- submit fixture.cashRegistry $ createCmd StablecoinEligibility with
+    instrumentId = InstrumentId with admin = fixture.cashRegistry, id = "EUR-C"
+    investor = fixture.payee
+    status = Eligible
+    validFrom = addRelTime fixture.now (hours (-1))
+    validUntil = addRelTime fixture.now (hours 24)
+    attestationRef = "attestation-000"
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+
+missingEligibilityContextRejected : Script ()
+missingEligibilityContextRejected = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  _ <- eligible fixture fixture.payee
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid] noExtraArgs
+  let senderOnly = ExtraArgs with
+        context = ChoiceContext with
+          values = TextMap.fromList
+            [(senderEligibilityKey, AV_ContractId (coerceContractId senderEligibilityCid))]
+        meta = emptyMetadata
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid] senderOnly
+
+malformedEligibilityContextRejected : Script ()
+malformedEligibilityContextRejected = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  let malformed = ExtraArgs with
+        context = ChoiceContext with
+          values = TextMap.fromList
+            [ (senderEligibilityKey, AV_ContractId (coerceContractId senderEligibilityCid))
+            , (receiverEligibilityKey, AV_Text "not-a-contract-id")
+            ]
+        meta = emptyMetadata
+  allocateMustFail fixture (allocationSpec fixture 250.0) [holdingCid] malformed
+
+splitRejectsLockedAllocationHolding : Script ()
+splitRejectsLockedAllocationHolding = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  (allocationCid, _) <- allocate fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+  lockedCid <- lockedHoldingOf fixture.payer allocationCid
+  submitMustFail fixture.payer $ exerciseCmd lockedCid Split with splitAmount = 100.0
+
+mergeRejectsLockedAllocationHolding : Script ()
+mergeRejectsLockedAllocationHolding = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  spareCid <- mint fixture fixture.payer 25.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  (allocationCid, _) <- allocate fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+  lockedCid <- lockedHoldingOf fixture.payer allocationCid
+  submitMustFail fixture.payer $ exerciseCmd spareCid Merge with otherHoldingCid = lockedCid
+
+burnCannotConsumeLockedAllocationHolding : Script ()
+burnCannotConsumeLockedAllocationHolding = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  (allocationCid, _) <- allocate fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+  lockedCid <- lockedHoldingOf fixture.payer allocationCid
+  submitMustFail fixture.cashRegistry $ exerciseCmd lockedCid Burn

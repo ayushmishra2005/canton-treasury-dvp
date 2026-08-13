@@ -1,0 +1,131 @@
+module Tests.Stablecoin.AllocationFixture where
+
+import DA.Date (Month(..), date)
+import DA.Time (RelTime, addRelTime, hours, time)
+import DA.TextMap qualified as TextMap
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV1
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Stablecoin.Eligibility
+import Stablecoin.Holding
+import Stablecoin.Instrument
+import Stablecoin.Rules
+
+data Fixture = Fixture with
+  cashRegistry : Party
+  payer : Party
+  payee : Party
+  executor : Party
+  instrumentId : InstrumentId
+  instrumentCid : ContractId StablecoinInstrument
+  rulesCid : ContractId StablecoinRules
+  now : Time
+
+setup : Script Fixture
+setup = do
+  setTime (time (date 2026 Jan 1) 12 0 0)
+  cashRegistry <- allocateParty "CashRegistry"
+  payer <- allocateParty "Buyer"
+  payee <- allocateParty "Seller"
+  executor <- allocateParty "Venue"
+  instrumentCid <- submit cashRegistry $ createCmd StablecoinInstrument with
+    cashRegistry
+    id = "USD-C"
+    description = "Regulated USD payment stablecoin"
+  let instrumentId = InstrumentId with admin = cashRegistry, id = "USD-C"
+  rulesCid <- submit cashRegistry $ createCmd StablecoinRules with instrumentId
+  now <- getTime
+  pure Fixture with
+    cashRegistry
+    payer
+    payee
+    executor
+    instrumentId
+    instrumentCid
+    rulesCid
+    now
+
+factoryCid : Fixture -> ContractId AllocationFactory
+factoryCid fixture = toInterfaceContractId @AllocationFactory fixture.rulesCid
+
+mint : Fixture -> Party -> Decimal -> Script (ContractId StablecoinHolding)
+mint fixture owner amount =
+  submit fixture.cashRegistry $ exerciseCmd fixture.instrumentCid Mint with owner, amount
+
+attest : Fixture -> Party -> EligibilityStatus -> RelTime -> RelTime -> Script (ContractId StablecoinEligibility)
+attest fixture investor status fromOffset untilOffset =
+  submit fixture.cashRegistry $ createCmd StablecoinEligibility with
+    instrumentId = fixture.instrumentId
+    investor
+    status
+    validFrom = addRelTime fixture.now fromOffset
+    validUntil = addRelTime fixture.now untilOffset
+    attestationRef = "attestation-000"
+
+eligible : Fixture -> Party -> Script (ContractId StablecoinEligibility)
+eligible fixture investor = attest fixture investor Eligible (hours (-1)) (hours 24)
+
+allocationSpec : Fixture -> Decimal -> AllocationSpecification
+allocationSpec fixture amount = AllocationSpecification with
+  settlement = SettlementInfo with
+    executor = fixture.executor
+    settlementRef = Reference with id = "settlement-000", cid = None
+    requestedAt = fixture.now
+    allocateBefore = addRelTime fixture.now (hours 1)
+    settleBefore = addRelTime fixture.now (hours 2)
+    meta = emptyMetadata
+  transferLegId = "payment"
+  transferLeg = TransferLeg with
+    sender = fixture.payer
+    receiver = fixture.payee
+    amount
+    instrumentId = fixture.instrumentId
+    meta = emptyMetadata
+
+eligibilityArgs : ContractId StablecoinEligibility -> ContractId StablecoinEligibility -> ExtraArgs
+eligibilityArgs senderEligibilityCid receiverEligibilityCid = ExtraArgs with
+  context = ChoiceContext with
+    values = TextMap.fromList
+      [ (senderEligibilityKey, AV_ContractId (coerceContractId senderEligibilityCid))
+      , (receiverEligibilityKey, AV_ContractId (coerceContractId receiverEligibilityCid))
+      ]
+  meta = emptyMetadata
+
+noExtraArgs : ExtraArgs
+noExtraArgs = ExtraArgs with
+  context = emptyChoiceContext
+  meta = emptyMetadata
+
+allocateAs : Fixture -> AllocationSpecification -> [ContractId StablecoinHolding] -> ExtraArgs -> Commands AllocationInstructionResult
+allocateAs fixture spec inputHoldingCids extraArgs =
+  exerciseCmd (factoryCid fixture) AllocationFactory_Allocate with
+    expectedAdmin = fixture.cashRegistry
+    allocation = spec
+    requestedAt = fixture.now
+    inputHoldingCids = map (toInterfaceContractId @Holding) inputHoldingCids
+    extraArgs
+
+allocate : Fixture -> AllocationSpecification -> [ContractId StablecoinHolding] -> ExtraArgs -> Script (ContractId Allocation, [ContractId Holding])
+allocate fixture spec inputHoldingCids extraArgs = do
+  result <- submit (actAs fixture.payer <> readAs fixture.cashRegistry) $
+    allocateAs fixture spec inputHoldingCids extraArgs
+  case result.output of
+    AllocationInstructionResult_Completed allocationCid ->
+      pure (allocationCid, result.senderChangeCids)
+    _ -> abort "Allocation did not complete"
+
+allocateMustFail : Fixture -> AllocationSpecification -> [ContractId StablecoinHolding] -> ExtraArgs -> Script ()
+allocateMustFail fixture spec inputHoldingCids extraArgs =
+  submitMustFail (actAs fixture.payer <> readAs fixture.cashRegistry) $
+    allocateAs fixture spec inputHoldingCids extraArgs
+
+lockedHoldingOf : Party -> ContractId Allocation -> Script (ContractId StablecoinHolding)
+lockedHoldingOf reader allocationCid = do
+  Some allocationView <- queryInterfaceContractId @Allocation reader allocationCid
+  case allocationView.holdingCids of
+    [holdingCid] -> pure (fromInterfaceContractId @StablecoinHolding holdingCid)
+    _ -> abort "Expected exactly one backing holding"

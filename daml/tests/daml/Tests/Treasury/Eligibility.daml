@@ -1,0 +1,69 @@
+module Tests.Treasury.Eligibility where
+
+import DA.Assert ((===))
+import DA.Time (addRelTime, hours)
+import Daml.Script
+
+import Treasury.Eligibility
+
+import Tests.Treasury.AllocationFixture
+
+registryIssuesEligibilityAttestation : Script ()
+registryIssuesEligibilityAttestation = do
+  fixture <- setup
+  eligibilityCid <- eligible fixture fixture.seller
+  Some eligibility <- queryContractId fixture.seller eligibilityCid
+  eligibility.instrumentId === fixture.instrumentId
+  eligibility.investor === fixture.seller
+  eligibility.status === Eligible
+  eligibility.attestationRef === "attestation-000"
+  eligibility.validUntil === addRelTime fixture.now (hours 24)
+
+nonRegistryCannotIssueAttestation : Script ()
+nonRegistryCannotIssueAttestation = do
+  fixture <- setup
+  submitMustFail (actAs fixture.seller <> readAs fixture.treasuryRegistry) $
+    createCmd TreasuryEligibility with
+      instrumentId = fixture.instrumentId
+      investor = fixture.seller
+      status = Eligible
+      validFrom = fixture.now
+      validUntil = addRelTime fixture.now (hours 24)
+      attestationRef = "attestation-000"
+
+attestationRejectsInvalidValidityInterval : Script ()
+attestationRejectsInvalidValidityInterval = do
+  fixture <- setup
+  submitMustFail fixture.treasuryRegistry $ createCmd TreasuryEligibility with
+    instrumentId = fixture.instrumentId
+    investor = fixture.seller
+    status = Eligible
+    validFrom = addRelTime fixture.now (hours 24)
+    validUntil = fixture.now
+    attestationRef = "attestation-000"
+
+attestationRejectsEmptyReference : Script ()
+attestationRejectsEmptyReference = do
+  fixture <- setup
+  submitMustFail fixture.treasuryRegistry $ createCmd TreasuryEligibility with
+    instrumentId = fixture.instrumentId
+    investor = fixture.seller
+    status = Eligible
+    validFrom = fixture.now
+    validUntil = addRelTime fixture.now (hours 24)
+    attestationRef = ""
+
+registryRevokesAttestation : Script ()
+registryRevokesAttestation = do
+  fixture <- setup
+  eligibilityCid <- eligible fixture fixture.seller
+  submit fixture.treasuryRegistry $ exerciseCmd eligibilityCid Revoke
+  revoked <- queryContractId fixture.seller eligibilityCid
+  revoked === None
+
+investorCannotRevokeAttestation : Script ()
+investorCannotRevokeAttestation = do
+  fixture <- setup
+  eligibilityCid <- eligible fixture fixture.seller
+  submitMustFail (actAs fixture.seller <> readAs fixture.treasuryRegistry) $
+    exerciseCmd eligibilityCid Revoke

@@ -1,0 +1,69 @@
+module Tests.Stablecoin.Eligibility where
+
+import DA.Assert ((===))
+import DA.Time (addRelTime, hours)
+import Daml.Script
+
+import Stablecoin.Eligibility
+
+import Tests.Stablecoin.AllocationFixture
+
+registryIssuesEligibilityAttestation : Script ()
+registryIssuesEligibilityAttestation = do
+  fixture <- setup
+  eligibilityCid <- eligible fixture fixture.payer
+  Some eligibility <- queryContractId fixture.payer eligibilityCid
+  eligibility.instrumentId === fixture.instrumentId
+  eligibility.investor === fixture.payer
+  eligibility.status === Eligible
+  eligibility.attestationRef === "attestation-000"
+  eligibility.validUntil === addRelTime fixture.now (hours 24)
+
+nonRegistryCannotIssueAttestation : Script ()
+nonRegistryCannotIssueAttestation = do
+  fixture <- setup
+  submitMustFail (actAs fixture.payer <> readAs fixture.cashRegistry) $
+    createCmd StablecoinEligibility with
+      instrumentId = fixture.instrumentId
+      investor = fixture.payer
+      status = Eligible
+      validFrom = fixture.now
+      validUntil = addRelTime fixture.now (hours 24)
+      attestationRef = "attestation-000"
+
+attestationRejectsInvalidValidityInterval : Script ()
+attestationRejectsInvalidValidityInterval = do
+  fixture <- setup
+  submitMustFail fixture.cashRegistry $ createCmd StablecoinEligibility with
+    instrumentId = fixture.instrumentId
+    investor = fixture.payer
+    status = Eligible
+    validFrom = addRelTime fixture.now (hours 24)
+    validUntil = fixture.now
+    attestationRef = "attestation-000"
+
+attestationRejectsEmptyReference : Script ()
+attestationRejectsEmptyReference = do
+  fixture <- setup
+  submitMustFail fixture.cashRegistry $ createCmd StablecoinEligibility with
+    instrumentId = fixture.instrumentId
+    investor = fixture.payer
+    status = Eligible
+    validFrom = fixture.now
+    validUntil = addRelTime fixture.now (hours 24)
+    attestationRef = ""
+
+registryRevokesAttestation : Script ()
+registryRevokesAttestation = do
+  fixture <- setup
+  eligibilityCid <- eligible fixture fixture.payer
+  submit fixture.cashRegistry $ exerciseCmd eligibilityCid Revoke
+  revoked <- queryContractId fixture.payer eligibilityCid
+  revoked === None
+
+investorCannotRevokeAttestation : Script ()
+investorCannotRevokeAttestation = do
+  fixture <- setup
+  eligibilityCid <- eligible fixture fixture.payer
+  submitMustFail (actAs fixture.payer <> readAs fixture.cashRegistry) $
+    exerciseCmd eligibilityCid Revoke

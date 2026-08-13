@@ -1,0 +1,102 @@
+module Stablecoin.Rules where
+
+import DA.Foldable (forA_)
+import DA.List (unique)
+import DA.Optional (isNone)
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.AllocationInstructionV1
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Stablecoin.Allocation
+import Stablecoin.Eligibility
+import Stablecoin.Holding
+
+senderEligibilityKey : Text
+senderEligibilityKey = "stablecoin.canton-treasury-dvp/sender-eligibility"
+
+receiverEligibilityKey : Text
+receiverEligibilityKey = "stablecoin.canton-treasury-dvp/receiver-eligibility"
+
+eligibilityCid : ChoiceContext -> Text -> Update (ContractId StablecoinEligibility)
+eligibilityCid context key =
+  case TextMap.lookup key context.values of
+    Some (AV_ContractId anyCid) -> pure (coerceContractId anyCid)
+    Some _ -> abort ("Malformed eligibility context entry " <> key)
+    None -> abort ("Missing eligibility context entry " <> key)
+
+template StablecoinRules
+  with
+    instrumentId : InstrumentId
+  where
+    signatory instrumentId.admin
+
+    interface instance AllocationFactory for StablecoinRules where
+      view = AllocationFactoryView with
+        admin = instrumentId.admin
+        meta = emptyMetadata
+
+      allocationFactory_publicFetchImpl _self arg = do
+        assertMsg "Unexpected instrument administrator" (arg.expectedAdmin == instrumentId.admin)
+        pure AllocationFactoryView with
+          admin = instrumentId.admin
+          meta = emptyMetadata
+
+      allocationFactory_allocateImpl _self arg = do
+        now <- getTime
+        let settlement = arg.allocation.settlement
+            leg = arg.allocation.transferLeg
+        assertMsg "Unexpected instrument administrator" (arg.expectedAdmin == instrumentId.admin)
+        assertMsg "Instrument must match the rules contract" (leg.instrumentId == instrumentId)
+        assertMsg "Transfer amount must be positive" (leg.amount > 0.0)
+        assertMsg "Allocation deadline has passed" (now < settlement.allocateBefore)
+        assertMsg "Allocation deadline must precede the settlement deadline"
+          (settlement.allocateBefore < settlement.settleBefore)
+        assertMsg "At least one input holding is required" (not (null arg.inputHoldingCids))
+        assertMsg "Input holdings must be unique" (unique arg.inputHoldingCids)
+
+        let inputCids = map (fromInterfaceContractId @StablecoinHolding) arg.inputHoldingCids
+        inputs <- forA inputCids fetch
+        forA_ inputs $ \input -> do
+          assertMsg "Input holdings must belong to the sender" (input.owner == leg.sender)
+          assertMsg "Input holdings must use the allocated instrument"
+            (input.instrumentId == instrumentId)
+          assertMsg "Input holdings must be unlocked" (isNone input.lock)
+        let inputTotal = sum (map (.amount) inputs)
+        assertMsg "Input holdings must cover the allocated amount" (inputTotal >= leg.amount)
+
+        senderEligibility <- fetch =<< eligibilityCid arg.extraArgs.context senderEligibilityKey
+        receiverEligibility <- fetch =<< eligibilityCid arg.extraArgs.context receiverEligibilityKey
+        requireEligible instrumentId leg.sender now settlement.settleBefore senderEligibility
+        requireEligible instrumentId leg.receiver now settlement.settleBefore receiverEligibility
+
+        forA_ inputCids archive
+        lockedHoldingCid <- create StablecoinHolding with
+          instrumentId
+          owner = leg.sender
+          amount = leg.amount
+          lock = Some Lock with
+            holders = [instrumentId.admin]
+            expiresAt = Some settlement.settleBefore
+            expiresAfter = None
+            context = Some "Settlement allocation"
+        senderChangeCids <-
+          if inputTotal > leg.amount
+            then do
+              changeCid <- create StablecoinHolding with
+                instrumentId
+                owner = leg.sender
+                amount = inputTotal - leg.amount
+                lock = None
+              pure [toInterfaceContractId @Holding changeCid]
+            else pure []
+        allocationCid <- create StablecoinAllocation with
+          allocation = arg.allocation
+          lockedHoldingCid
+        pure AllocationInstructionResult with
+          output = AllocationInstructionResult_Completed with
+            allocationCid = toInterfaceContractId @Allocation allocationCid
+          senderChangeCids
+          meta = emptyMetadata

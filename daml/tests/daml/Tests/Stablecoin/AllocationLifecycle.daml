@@ -1,0 +1,148 @@
+module Tests.Stablecoin.AllocationLifecycle where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.Time (hours)
+import Daml.Script
+
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Stablecoin.Eligibility
+
+import Tests.Stablecoin.AllocationFixture
+
+allocated : Script (Fixture, ContractId Allocation)
+allocated = do
+  fixture <- setup
+  holdingCid <- mint fixture fixture.payer 250.0
+  senderEligibilityCid <- eligible fixture fixture.payer
+  receiverEligibilityCid <- eligible fixture fixture.payee
+  (allocationCid, _) <- allocate fixture (allocationSpec fixture 250.0) [holdingCid]
+    (eligibilityArgs senderEligibilityCid receiverEligibilityCid)
+  pure (fixture, allocationCid)
+
+settlementParties : Fixture -> [Party]
+settlementParties fixture = [fixture.executor, fixture.payer, fixture.payee]
+
+jointlyAuthorizedExecutionSucceeds : Script ()
+jointlyAuthorizedExecutionSucceeds = do
+  (fixture, allocationCid) <- allocated
+  result <- submit (actAs (settlementParties fixture) <> readAs fixture.cashRegistry) $
+    exerciseCmd allocationCid Allocation_ExecuteTransfer with extraArgs = noExtraArgs
+  result.senderHoldingCids === []
+  length result.receiverHoldingCids === 1
+
+executionCreatesReceiverHolding : Script ()
+executionCreatesReceiverHolding = do
+  (fixture, allocationCid) <- allocated
+  result <- submit (actAs (settlementParties fixture) <> readAs fixture.cashRegistry) $
+    exerciseCmd allocationCid Allocation_ExecuteTransfer with extraArgs = noExtraArgs
+  case result.receiverHoldingCids of
+    [receiverHoldingCid] -> do
+      Some receiverView <- queryInterfaceContractId @Holding fixture.payee receiverHoldingCid
+      receiverView.owner === fixture.payee
+      receiverView.amount === 250.0
+      receiverView.lock === None
+      receiverView.instrumentId === fixture.instrumentId
+    _ -> abort "Expected exactly one receiver holding"
+  payerHoldings <- queryInterface @Holding fixture.payer
+  payerHoldings === []
+
+executorAloneCannotExecute : Script ()
+executorAloneCannotExecute = do
+  (fixture, allocationCid) <- allocated
+  submitMustFail
+    (actAs fixture.executor
+      <> readAs [fixture.cashRegistry, fixture.payer, fixture.payee]) $
+    exerciseCmd allocationCid Allocation_ExecuteTransfer with extraArgs = noExtraArgs
+
+executionAfterSettleBeforeFails : Script ()
+executionAfterSettleBeforeFails = do
+  (fixture, allocationCid) <- allocated
+  passTime (hours 3)
+  submitMustFail (actAs (settlementParties fixture) <> readAs fixture.cashRegistry) $
+    exerciseCmd allocationCid Allocation_ExecuteTransfer with extraArgs = noExtraArgs
+
+jointCancellationRestoresSenderHolding : Script ()
+jointCancellationRestoresSenderHolding = do
+  (fixture, allocationCid) <- allocated
+  result <- submit (actAs (settlementParties fixture) <> readAs fixture.cashRegistry) $
+    exerciseCmd allocationCid Allocation_Cancel with extraArgs = noExtraArgs
+  case result.senderHoldingCids of
+    [senderHoldingCid] -> do
+      Some senderView <- queryInterfaceContractId @Holding fixture.payer senderHoldingCid
+      senderView.owner === fixture.payer
+      senderView.amount === 250.0
+      senderView.lock === None
+    _ -> abort "Expected exactly one restored sender holding"
+  payeeHoldings <- queryInterface @Holding fixture.payee
+  payeeHoldings === []
+
+senderCannotCancelAlone : Script ()
+senderCannotCancelAlone = do
+  (fixture, allocationCid) <- allocated
+  submitMustFail
+    (actAs fixture.payer
+      <> readAs [fixture.cashRegistry, fixture.executor, fixture.payee]) $
+    exerciseCmd allocationCid Allocation_Cancel with extraArgs = noExtraArgs
+
+senderWithdrawalRestoresSenderHolding : Script ()
+senderWithdrawalRestoresSenderHolding = do
+  (fixture, allocationCid) <- allocated
+  result <- submit (actAs fixture.payer <> readAs fixture.cashRegistry) $
+    exerciseCmd allocationCid Allocation_Withdraw with extraArgs = noExtraArgs
+  case result.senderHoldingCids of
+    [senderHoldingCid] -> do
+      Some senderView <- queryInterfaceContractId @Holding fixture.payer senderHoldingCid
+      senderView.owner === fixture.payer
+      senderView.amount === 250.0
+      senderView.lock === None
+    _ -> abort "Expected exactly one restored sender holding"
+
+senderWithdrawsAfterExpiryWithoutOtherParties : Script ()
+senderWithdrawsAfterExpiryWithoutOtherParties = do
+  (fixture, allocationCid) <- allocated
+  passTime (hours 3)
+  result <- submit (actAs fixture.payer <> readAs fixture.cashRegistry) $
+    exerciseCmd allocationCid Allocation_Withdraw with extraArgs = noExtraArgs
+  length result.senderHoldingCids === 1
+  holdings <- queryInterface @Holding fixture.payer
+  map snd holdings === [Some HoldingView with
+    owner = fixture.payer
+    instrumentId = fixture.instrumentId
+    amount = 250.0
+    lock = None
+    meta = emptyMetadata]
+
+executeFetchesNoEligibilityOrRules : Script ()
+executeFetchesNoEligibilityOrRules = do
+  (fixture, allocationCid) <- allocated
+  retireEligibilityAndRules fixture
+  result <- submit (actAs (settlementParties fixture) <> readAs fixture.cashRegistry) $
+    exerciseCmd allocationCid Allocation_ExecuteTransfer with extraArgs = noExtraArgs
+  length result.receiverHoldingCids === 1
+
+cancelFetchesNoEligibilityOrRules : Script ()
+cancelFetchesNoEligibilityOrRules = do
+  (fixture, allocationCid) <- allocated
+  retireEligibilityAndRules fixture
+  result <- submit (actAs (settlementParties fixture) <> readAs fixture.cashRegistry) $
+    exerciseCmd allocationCid Allocation_Cancel with extraArgs = noExtraArgs
+  length result.senderHoldingCids === 1
+
+withdrawFetchesNoEligibilityOrRules : Script ()
+withdrawFetchesNoEligibilityOrRules = do
+  (fixture, allocationCid) <- allocated
+  retireEligibilityAndRules fixture
+  result <- submit (actAs fixture.payer <> readAs fixture.cashRegistry) $
+    exerciseCmd allocationCid Allocation_Withdraw with extraArgs = noExtraArgs
+  length result.senderHoldingCids === 1
+
+retireEligibilityAndRules : Fixture -> Script ()
+retireEligibilityAndRules fixture = do
+  eligibilities <- query @StablecoinEligibility fixture.cashRegistry
+  forA_ eligibilities $ \(eligibilityCid, _) ->
+    submit fixture.cashRegistry $ exerciseCmd eligibilityCid Revoke
+  submit fixture.cashRegistry $ archiveCmd fixture.rulesCid

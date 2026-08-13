@@ -23,6 +23,7 @@ sellerCreatesProposal = do
   proposal.allocateBefore === allocateBeforeOf fixture
   proposal.settleBefore === settleBeforeOf fixture
   proposal.approvers === []
+  proposal.tradeCid === None
 
 buyerCanAccept : Script ()
 buyerCanAccept = do
@@ -32,6 +33,21 @@ buyerCanAccept = do
     exerciseCmd proposalCid DvpProposal_Accept with approver = fixture.buyer
   Some accepted <- queryContractId fixture.buyer acceptedCid
   accepted.approvers === [fixture.buyer]
+  accepted.tradeCid === Some proposalCid
+
+firstAcceptancePinsProposalLineage : Script ()
+firstAcceptancePinsProposalLineage = do
+  fixture <- setup
+  originalProposalCid <- propose fixture
+  acceptedBySeller <- submit fixture.seller $
+    exerciseCmd originalProposalCid DvpProposal_Accept with approver = fixture.seller
+  Some afterSeller <- queryContractId fixture.seller acceptedBySeller
+  afterSeller.tradeCid === Some originalProposalCid
+  acceptedByBuyer <- submit fixture.buyer $
+    exerciseCmd acceptedBySeller DvpProposal_Accept with approver = fixture.buyer
+  Some afterBuyer <- queryContractId fixture.seller acceptedByBuyer
+  afterBuyer.tradeCid === Some originalProposalCid
+  afterBuyer.approvers === [fixture.seller, fixture.buyer]
 
 sellerCannotAcceptOnBehalfOfBuyer : Script ()
 sellerCannotAcceptOnBehalfOfBuyer = do
@@ -144,14 +160,28 @@ initiationConsumesProposal = do
   consumed <- queryContractId fixture.seller proposalCid
   consumed === None
 
+tradeCarriesTheOriginatingProposal : Script ()
+tradeCarriesTheOriginatingProposal = do
+  fixture <- setup
+  originalProposalCid <- propose fixture
+  acceptedBySeller <- submit fixture.seller $
+    exerciseCmd originalProposalCid DvpProposal_Accept with approver = fixture.seller
+  acceptedByBuyer <- submit fixture.buyer $
+    exerciseCmd acceptedBySeller DvpProposal_Accept with approver = fixture.buyer
+  tradeCid <- submit fixture.venue $ exerciseCmd acceptedByBuyer DvpProposal_InitiateSettlement
+  Some trade <- queryContractId fixture.venue tradeCid
+  trade.proposalCid === coerceContractId originalProposalCid
+
 venueCannotCreateTradeAlone : Script ()
 venueCannotCreateTradeAlone = do
   fixture <- setup
+  proposalCid <- propose fixture
   submitMustFail (actAs fixture.venue <> readAs [fixture.seller, fixture.buyer]) $
     createCmd DvpTrade with
       venue = fixture.venue
       seller = fixture.seller
       buyer = fixture.buyer
+      proposalCid = coerceContractId proposalCid
       treasuryLeg = treasuryLegOf fixture
       paymentLeg = paymentLegOf fixture
       requestedAt = fixture.now

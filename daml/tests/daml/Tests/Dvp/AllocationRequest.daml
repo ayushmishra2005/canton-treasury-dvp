@@ -8,6 +8,7 @@ import Splice.Api.Token.AllocationRequestV1
 import Splice.Api.Token.AllocationV1
 import Splice.Api.Token.MetadataV1
 
+import Dvp.Proposal
 import Dvp.Trade
 
 import Tests.Dvp.SettlementFixture
@@ -16,14 +17,30 @@ viewExposesExactSettlementInformation : Script ()
 viewExposesExactSettlementInformation = do
   (fixture, tradeCid) <- initiatedTrade
   requestView <- requestViewOf fixture tradeCid
+  Some trade <- queryContractId fixture.venue tradeCid
   requestView.settlement === SettlementInfo with
     executor = fixture.venue
-    settlementRef = settlementReference
+    settlementRef = Reference with id = "", cid = Some trade.proposalCid
     requestedAt = fixture.now
     allocateBefore = allocateBeforeOf fixture
     settleBefore = settleBeforeOf fixture
     meta = emptyMetadata
   requestView.meta === emptyMetadata
+
+viewReferenceTracksTheOriginalProposal : Script ()
+viewReferenceTracksTheOriginalProposal = do
+  fixture <- setup
+  originalProposalCid <- propose fixture
+  acceptedBySeller <- submit fixture.seller $
+    exerciseCmd originalProposalCid DvpProposal_Accept with approver = fixture.seller
+  acceptedByBuyer <- submit fixture.buyer $
+    exerciseCmd acceptedBySeller DvpProposal_Accept with approver = fixture.buyer
+  Some finalProposal <- queryContractId fixture.seller acceptedByBuyer
+  finalProposal.tradeCid === Some originalProposalCid
+  tradeCid <- submit fixture.venue $ exerciseCmd acceptedByBuyer DvpProposal_InitiateSettlement
+  requestView <- requestViewOf fixture tradeCid
+  requestView.settlement.settlementRef ===
+    Reference with id = "", cid = Some (coerceContractId originalProposalCid)
 
 viewExposesExactlyTheTwoExpectedLegs : Script ()
 viewExposesExactlyTheTwoExpectedLegs = do

@@ -1,6 +1,7 @@
 module Dvp.Proposal where
 
 import DA.List (unique)
+import DA.Optional (fromOptional)
 
 import Splice.Api.Token.AllocationV1
 
@@ -17,6 +18,7 @@ template DvpProposal
     allocateBefore : Time
     settleBefore : Time
     approvers : [Party]
+    tradeCid : Optional (ContractId DvpProposal)
   where
     signatory seller, approvers
     observer venue, buyer
@@ -32,7 +34,9 @@ template DvpProposal
       do
         assertMsg "Only the seller or the buyer may approve" (approver == seller || approver == buyer)
         assertMsg "Party has already approved" (approver `notElem` approvers)
-        create this with approvers = approvers <> [approver]
+        create this with
+          approvers = approvers <> [approver]
+          tradeCid = Some (fromOptional self tradeCid)
 
     choice DvpProposal_Reject : ()
       with
@@ -52,6 +56,7 @@ template DvpProposal
           venue
           seller
           buyer
+          proposalCid = coerceContractId (fromOptional self tradeCid)
           treasuryLeg
           paymentLeg
           requestedAt

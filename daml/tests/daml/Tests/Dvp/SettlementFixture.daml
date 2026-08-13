@@ -137,6 +137,7 @@ propose fixture = submit fixture.seller $ createCmd DvpProposal with
   allocateBefore = allocateBeforeOf fixture
   settleBefore = settleBeforeOf fixture
   approvers = []
+  tradeCid = None
 
 approvedProposal : Fixture -> Script (ContractId DvpProposal)
 approvedProposal fixture = do
@@ -254,9 +255,10 @@ allocateDelivery fixture = allocateDeliveryVia fixture fixture.treasuryRulesCid
 allocatePayment : Fixture -> AllocationSpecification -> ContractId StablecoinHolding -> Script (ContractId Allocation)
 allocatePayment fixture = allocatePaymentVia fixture fixture.cashRulesCid
 
-allocatedTrade : Script (Fixture, ContractId DvpTrade, ContractId Allocation, ContractId Allocation)
-allocatedTrade = do
-  (fixture, tradeCid) <- initiatedTrade
+tradeWithAllocations : Fixture -> Script (ContractId DvpTrade, ContractId Allocation, ContractId Allocation)
+tradeWithAllocations fixture = do
+  proposalCid <- approvedProposal fixture
+  tradeCid <- submit fixture.venue $ exerciseCmd proposalCid DvpProposal_InitiateSettlement
   deliveryHoldingCid <- issueDelivery fixture
   paymentHoldingCid <- mintPayment fixture
   requestView <- requestViewOf fixture tradeCid
@@ -264,6 +266,12 @@ allocatedTrade = do
   paymentSpec <- legSpec requestView paymentLegId
   treasuryAllocationCid <- allocateDelivery fixture treasurySpec deliveryHoldingCid
   paymentAllocationCid <- allocatePayment fixture paymentSpec paymentHoldingCid
+  pure (tradeCid, treasuryAllocationCid, paymentAllocationCid)
+
+allocatedTrade : Script (Fixture, ContractId DvpTrade, ContractId Allocation, ContractId Allocation)
+allocatedTrade = do
+  fixture <- setup
+  (tradeCid, treasuryAllocationCid, paymentAllocationCid) <- tradeWithAllocations fixture
   pure (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid)
 
 standardAllocations : ContractId Allocation -> ContractId Allocation -> [SettlementAllocation]

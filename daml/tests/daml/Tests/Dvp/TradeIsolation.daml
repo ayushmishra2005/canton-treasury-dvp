@@ -1,0 +1,74 @@
+module Tests.Dvp.TradeIsolation where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import Splice.Api.Token.AllocationV1
+
+import Dvp.Trade
+
+import Tests.Dvp.SettlementFixture
+
+identicalTradesHaveDistinctSettlementReferences : Script ()
+identicalTradesHaveDistinctSettlementReferences = do
+  fixture <- setup
+  (tradeA, _, _) <- tradeWithAllocations fixture
+  (tradeB, _, _) <- tradeWithAllocations fixture
+  viewA <- requestViewOf fixture tradeA
+  viewB <- requestViewOf fixture tradeB
+  viewA.transferLegs === viewB.transferLegs
+  assertMsg "Settlement references must differ"
+    (viewA.settlement.settlementRef /= viewB.settlement.settlementRef)
+  (viewA.settlement with settlementRef = viewB.settlement.settlementRef) === viewB.settlement
+
+allocationFromAnotherTradeIsRejected : Script ()
+allocationFromAnotherTradeIsRejected = do
+  fixture <- setup
+  (tradeA, treasuryA, paymentA) <- tradeWithAllocations fixture
+  (tradeB, treasuryB, paymentB) <- tradeWithAllocations fixture
+  settleMustFail fixture tradeB (standardAllocations treasuryA paymentA)
+  settleMustFail fixture tradeA (standardAllocations treasuryB paymentB)
+  assertTradeActive fixture tradeA
+  assertTradeActive fixture tradeB
+  assertNoLegDelivered fixture
+
+mixedAllocationsAcrossTradesAreRejected : Script ()
+mixedAllocationsAcrossTradesAreRejected = do
+  fixture <- setup
+  (tradeA, treasuryA, paymentA) <- tradeWithAllocations fixture
+  (tradeB, treasuryB, paymentB) <- tradeWithAllocations fixture
+  settleMustFail fixture tradeA (standardAllocations treasuryA paymentB)
+  settleMustFail fixture tradeA (standardAllocations treasuryB paymentA)
+  settleMustFail fixture tradeB (standardAllocations treasuryB paymentA)
+  settleMustFail fixture tradeB (standardAllocations treasuryA paymentB)
+  assertAllocationsActive fixture treasuryA paymentA
+  assertAllocationsActive fixture treasuryB paymentB
+  assertNoLegDelivered fixture
+
+allocationSpecificationMatchesSettlementReconstruction : Script ()
+allocationSpecificationMatchesSettlementReconstruction = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  Some trade <- queryContractId fixture.venue tradeCid
+  Some treasuryView <- queryInterfaceContractId @Allocation fixture.venue treasuryAllocationCid
+  Some paymentView <- queryInterfaceContractId @Allocation fixture.venue paymentAllocationCid
+  treasuryView.allocation === expectedAllocation trade treasuryLegId trade.treasuryLeg
+  paymentView.allocation === expectedAllocation trade paymentLegId trade.paymentLeg
+  treasuryView.allocation.settlement.settlementRef.cid === Some trade.proposalCid
+
+bothTradesSettleIndependently : Script ()
+bothTradesSettleIndependently = do
+  fixture <- setup
+  (tradeA, treasuryA, paymentA) <- tradeWithAllocations fixture
+  (tradeB, treasuryB, paymentB) <- tradeWithAllocations fixture
+  _ <- settle fixture tradeA (standardAllocations treasuryA paymentA)
+  _ <- settle fixture tradeB (standardAllocations treasuryB paymentB)
+  sellerSummary <- holdingSummary fixture.seller
+  buyerSummary <- holdingSummary fixture.buyer
+  sellerSummary ===
+    [ (paymentInstrumentName, paymentAmount, False)
+    , (paymentInstrumentName, paymentAmount, False)
+    ]
+  buyerSummary ===
+    [ (treasuryInstrumentName, deliveryQuantity, False)
+    , (treasuryInstrumentName, deliveryQuantity, False)
+    ]

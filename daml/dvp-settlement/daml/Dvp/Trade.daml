@@ -13,11 +13,6 @@ treasuryLegId = "treasury-delivery"
 paymentLegId : Text
 paymentLegId = "stablecoin-payment"
 
-settlementReference : Reference
-settlementReference = Reference with
-  id = "canton-treasury-dvp/dvp-trade"
-  cid = None
-
 data SettlementAllocation = SettlementAllocation with
     transferLegId : Text
     allocationCid : ContractId Allocation
@@ -52,6 +47,7 @@ template DvpTrade
     venue : Party
     seller : Party
     buyer : Party
+    proposalCid : AnyContractId
     treasuryLeg : TransferLeg
     paymentLeg : TransferLeg
     requestedAt : Time
@@ -111,7 +107,9 @@ template DvpTrade
 settlementInfo : DvpTrade -> SettlementInfo
 settlementInfo trade = SettlementInfo with
   executor = trade.venue
-  settlementRef = settlementReference
+  settlementRef = Reference with
+    id = ""
+    cid = Some trade.proposalCid
   requestedAt = trade.requestedAt
   allocateBefore = trade.allocateBefore
   settleBefore = trade.settleBefore

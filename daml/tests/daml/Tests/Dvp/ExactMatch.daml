@@ -1,0 +1,314 @@
+module Tests.Dvp.ExactMatch where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import DA.Time (addRelTime, minutes)
+import Daml.Script
+
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+
+import Dvp.Trade
+
+import Treasury.Instrument
+import Treasury.Rules (TreasuryRules(..))
+
+import Tests.Dvp.SettlementFixture
+
+canonicalSpecs : Fixture -> ContractId DvpTrade -> Script (AllocationSpecification, AllocationSpecification)
+canonicalSpecs fixture tradeCid = do
+  requestView <- requestViewOf fixture tradeCid
+  treasurySpec <- legSpec requestView treasuryLegId
+  paymentSpec <- legSpec requestView paymentLegId
+  pure (treasurySpec, paymentSpec)
+
+missingTreasuryLeg : Script ()
+missingTreasuryLeg = do
+  (fixture, tradeCid, _, paymentAllocationCid) <- allocatedTrade
+  settleMustFail fixture tradeCid
+    [ SettlementAllocation with
+        transferLegId = paymentLegId
+        allocationCid = paymentAllocationCid
+        extraArgs = noExtraArgs
+    ]
+  assertNoAssetsMoved fixture
+
+missingStablecoinLeg : Script ()
+missingStablecoinLeg = do
+  (fixture, tradeCid, treasuryAllocationCid, _) <- allocatedTrade
+  settleMustFail fixture tradeCid
+    [ SettlementAllocation with
+        transferLegId = treasuryLegId
+        allocationCid = treasuryAllocationCid
+        extraArgs = noExtraArgs
+    ]
+  assertNoAssetsMoved fixture
+
+emptyAllocationInput : Script ()
+emptyAllocationInput = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  settleMustFail fixture tradeCid []
+  assertSettlementUnchanged fixture tradeCid treasuryAllocationCid paymentAllocationCid
+
+extraUnknownLeg : Script ()
+extraUnknownLeg = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  settleMustFail fixture tradeCid
+    (standardAllocations treasuryAllocationCid paymentAllocationCid <>
+      [ SettlementAllocation with
+          transferLegId = "fee-leg"
+          allocationCid = paymentAllocationCid
+          extraArgs = noExtraArgs
+      ])
+  assertSettlementUnchanged fixture tradeCid treasuryAllocationCid paymentAllocationCid
+
+duplicateTreasuryLeg : Script ()
+duplicateTreasuryLeg = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  settleMustFail fixture tradeCid
+    [ SettlementAllocation with
+        transferLegId = treasuryLegId
+        allocationCid = treasuryAllocationCid
+        extraArgs = noExtraArgs
+    , SettlementAllocation with
+        transferLegId = treasuryLegId
+        allocationCid = paymentAllocationCid
+        extraArgs = noExtraArgs
+    ]
+  assertSettlementUnchanged fixture tradeCid treasuryAllocationCid paymentAllocationCid
+
+duplicateStablecoinLeg : Script ()
+duplicateStablecoinLeg = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  settleMustFail fixture tradeCid
+    [ SettlementAllocation with
+        transferLegId = paymentLegId
+        allocationCid = paymentAllocationCid
+        extraArgs = noExtraArgs
+    , SettlementAllocation with
+        transferLegId = paymentLegId
+        allocationCid = treasuryAllocationCid
+        extraArgs = noExtraArgs
+    ]
+  assertSettlementUnchanged fixture tradeCid treasuryAllocationCid paymentAllocationCid
+
+duplicateTreasuryLegAlongsideBothLegs : Script ()
+duplicateTreasuryLegAlongsideBothLegs = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  settleMustFail fixture tradeCid
+    (standardAllocations treasuryAllocationCid paymentAllocationCid <>
+      [ SettlementAllocation with
+          transferLegId = treasuryLegId
+          allocationCid = treasuryAllocationCid
+          extraArgs = noExtraArgs
+      ])
+  assertSettlementUnchanged fixture tradeCid treasuryAllocationCid paymentAllocationCid
+
+duplicateStablecoinLegAlongsideBothLegs : Script ()
+duplicateStablecoinLegAlongsideBothLegs = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  settleMustFail fixture tradeCid
+    (standardAllocations treasuryAllocationCid paymentAllocationCid <>
+      [ SettlementAllocation with
+          transferLegId = paymentLegId
+          allocationCid = paymentAllocationCid
+          extraArgs = noExtraArgs
+      ])
+  assertSettlementUnchanged fixture tradeCid treasuryAllocationCid paymentAllocationCid
+
+sameAllocationForBothLegs : Script ()
+sameAllocationForBothLegs = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  settleMustFail fixture tradeCid
+    [ SettlementAllocation with
+        transferLegId = treasuryLegId
+        allocationCid = treasuryAllocationCid
+        extraArgs = noExtraArgs
+    , SettlementAllocation with
+        transferLegId = paymentLegId
+        allocationCid = treasuryAllocationCid
+        extraArgs = noExtraArgs
+    ]
+  assertSettlementUnchanged fixture tradeCid treasuryAllocationCid paymentAllocationCid
+
+modifiedTreasuryAmount : Script ()
+modifiedTreasuryAmount = do
+  (fixture, tradeCid) <- initiatedTrade
+  (treasurySpec, paymentSpec) <- canonicalSpecs fixture tradeCid
+  deliveryHoldingCid <- issueDelivery fixture
+  paymentHoldingCid <- mintPayment fixture
+  treasuryAllocationCid <- allocateDelivery fixture
+    (treasurySpec with transferLeg = treasurySpec.transferLeg with amount = 90.0)
+    deliveryHoldingCid
+  paymentAllocationCid <- allocatePayment fixture paymentSpec paymentHoldingCid
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertNoAssetsMoved fixture
+
+modifiedStablecoinAmount : Script ()
+modifiedStablecoinAmount = do
+  (fixture, tradeCid) <- initiatedTrade
+  (treasurySpec, paymentSpec) <- canonicalSpecs fixture tradeCid
+  deliveryHoldingCid <- issueDelivery fixture
+  paymentHoldingCid <- mintPayment fixture
+  treasuryAllocationCid <- allocateDelivery fixture treasurySpec deliveryHoldingCid
+  paymentAllocationCid <- allocatePayment fixture
+    (paymentSpec with transferLeg = paymentSpec.transferLeg with amount = 90000.0)
+    paymentHoldingCid
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertNoAssetsMoved fixture
+
+modifiedSender : Script ()
+modifiedSender = do
+  (fixture, tradeCid) <- initiatedTrade
+  (treasurySpec, paymentSpec) <- canonicalSpecs fixture tradeCid
+  venueHoldingCid <- issueDeliveryTo fixture fixture.venue deliveryQuantity
+  paymentHoldingCid <- mintPayment fixture
+  treasuryAllocationCid <- allocateDelivery fixture
+    (treasurySpec with transferLeg = treasurySpec.transferLeg with sender = fixture.venue)
+    venueHoldingCid
+  paymentAllocationCid <- allocatePayment fixture paymentSpec paymentHoldingCid
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  buyerSummary <- holdingSummary fixture.buyer
+  filter (\(instrument, _, _) -> instrument == treasuryInstrumentName) buyerSummary === []
+
+modifiedReceiver : Script ()
+modifiedReceiver = do
+  (fixture, tradeCid) <- initiatedTrade
+  (treasurySpec, paymentSpec) <- canonicalSpecs fixture tradeCid
+  deliveryHoldingCid <- issueDelivery fixture
+  paymentHoldingCid <- mintPayment fixture
+  treasuryAllocationCid <- allocateDelivery fixture
+    (treasurySpec with transferLeg = treasurySpec.transferLeg with receiver = fixture.venue)
+    deliveryHoldingCid
+  paymentAllocationCid <- allocatePayment fixture paymentSpec paymentHoldingCid
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertNoAssetsMoved fixture
+
+modifiedInstrument : Script ()
+modifiedInstrument = do
+  (fixture, tradeCid) <- initiatedTrade
+  (treasurySpec, paymentSpec) <- canonicalSpecs fixture tradeCid
+  otherInstrumentCid <- submit fixture.treasuryRegistry $ createCmd TreasuryInstrument with
+    treasuryRegistry = fixture.treasuryRegistry
+    id = "UST-2030-05"
+    description = "US Treasury Note 2.0% due 2030-05-15"
+    faceValue = 1000.0
+    maturityDate = date 2030 May 15
+  let otherInstrumentId = InstrumentId with
+        admin = fixture.treasuryRegistry
+        id = "UST-2030-05"
+  otherRulesCid <- submit fixture.treasuryRegistry $
+    createCmd TreasuryRules with instrumentId = otherInstrumentId
+  otherHoldingCid <- submit fixture.treasuryRegistry $
+    exerciseCmd otherInstrumentCid Issue with
+      owner = fixture.seller
+      amount = deliveryQuantity
+  paymentHoldingCid <- mintPayment fixture
+  treasuryAllocationCid <- allocateDeliveryVia fixture otherRulesCid
+    (treasurySpec with transferLeg = treasurySpec.transferLeg with instrumentId = otherInstrumentId)
+    otherHoldingCid
+  paymentAllocationCid <- allocatePayment fixture paymentSpec paymentHoldingCid
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertNoAssetsMoved fixture
+
+modifiedSettlementExecutor : Script ()
+modifiedSettlementExecutor = do
+  (fixture, tradeCid) <- initiatedTrade
+  (treasurySpec, paymentSpec) <- canonicalSpecs fixture tradeCid
+  deliveryHoldingCid <- issueDelivery fixture
+  paymentHoldingCid <- mintPayment fixture
+  let otherSettlement = treasurySpec.settlement with executor = fixture.seller
+  treasuryAllocationCid <- allocateDelivery fixture
+    (treasurySpec with settlement = otherSettlement)
+    deliveryHoldingCid
+  paymentAllocationCid <- allocatePayment fixture paymentSpec paymentHoldingCid
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertNoAssetsMoved fixture
+
+modifiedSettlementReference : Script ()
+modifiedSettlementReference = do
+  (fixture, tradeCid) <- initiatedTrade
+  (treasurySpec, paymentSpec) <- canonicalSpecs fixture tradeCid
+  deliveryHoldingCid <- issueDelivery fixture
+  paymentHoldingCid <- mintPayment fixture
+  let otherReference = Reference with id = "other-settlement", cid = None
+      otherSettlement = treasurySpec.settlement with settlementRef = otherReference
+  treasuryAllocationCid <- allocateDelivery fixture
+    (treasurySpec with settlement = otherSettlement)
+    deliveryHoldingCid
+  paymentAllocationCid <- allocatePayment fixture paymentSpec paymentHoldingCid
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertNoAssetsMoved fixture
+
+modifiedRequestedAt : Script ()
+modifiedRequestedAt = do
+  (fixture, tradeCid) <- initiatedTrade
+  (treasurySpec, paymentSpec) <- canonicalSpecs fixture tradeCid
+  deliveryHoldingCid <- issueDelivery fixture
+  paymentHoldingCid <- mintPayment fixture
+  let otherSettlement = treasurySpec.settlement with
+        requestedAt = addRelTime fixture.now (minutes (-5))
+  treasuryAllocationCid <- allocateDelivery fixture
+    (treasurySpec with settlement = otherSettlement)
+    deliveryHoldingCid
+  paymentAllocationCid <- allocatePayment fixture paymentSpec paymentHoldingCid
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertNoAssetsMoved fixture
+
+modifiedAllocateBefore : Script ()
+modifiedAllocateBefore = do
+  (fixture, tradeCid) <- initiatedTrade
+  (treasurySpec, paymentSpec) <- canonicalSpecs fixture tradeCid
+  deliveryHoldingCid <- issueDelivery fixture
+  paymentHoldingCid <- mintPayment fixture
+  let otherSettlement = treasurySpec.settlement with
+        allocateBefore = addRelTime fixture.now (minutes 45)
+  treasuryAllocationCid <- allocateDelivery fixture
+    (treasurySpec with settlement = otherSettlement)
+    deliveryHoldingCid
+  paymentAllocationCid <- allocatePayment fixture paymentSpec paymentHoldingCid
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertNoAssetsMoved fixture
+
+modifiedSettleBefore : Script ()
+modifiedSettleBefore = do
+  (fixture, tradeCid) <- initiatedTrade
+  (treasurySpec, paymentSpec) <- canonicalSpecs fixture tradeCid
+  deliveryHoldingCid <- issueDelivery fixture
+  paymentHoldingCid <- mintPayment fixture
+  let otherSettlement = treasurySpec.settlement with
+        settleBefore = addRelTime fixture.now (minutes 105)
+  treasuryAllocationCid <- allocateDelivery fixture
+    (treasurySpec with settlement = otherSettlement)
+    deliveryHoldingCid
+  paymentAllocationCid <- allocatePayment fixture paymentSpec paymentHoldingCid
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertNoAssetsMoved fixture
+
+modifiedTransferLegIdentifier : Script ()
+modifiedTransferLegIdentifier = do
+  (fixture, tradeCid) <- initiatedTrade
+  (treasurySpec, paymentSpec) <- canonicalSpecs fixture tradeCid
+  deliveryHoldingCid <- issueDelivery fixture
+  paymentHoldingCid <- mintPayment fixture
+  treasuryAllocationCid <- allocateDelivery fixture
+    (treasurySpec with transferLegId = "delivery")
+    deliveryHoldingCid
+  paymentAllocationCid <- allocatePayment fixture paymentSpec paymentHoldingCid
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertNoAssetsMoved fixture
+
+swappedLegAllocations : Script ()
+swappedLegAllocations = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  settleMustFail fixture tradeCid
+    [ SettlementAllocation with
+        transferLegId = treasuryLegId
+        allocationCid = paymentAllocationCid
+        extraArgs = noExtraArgs
+    , SettlementAllocation with
+        transferLegId = paymentLegId
+        allocationCid = treasuryAllocationCid
+        extraArgs = noExtraArgs
+    ]
+  assertSettlementUnchanged fixture tradeCid treasuryAllocationCid paymentAllocationCid

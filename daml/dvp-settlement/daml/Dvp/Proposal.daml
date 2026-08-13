@@ -1,0 +1,59 @@
+module Dvp.Proposal where
+
+import DA.List (unique)
+
+import Splice.Api.Token.AllocationV1
+
+import Dvp.Trade
+
+template DvpProposal
+  with
+    venue : Party
+    seller : Party
+    buyer : Party
+    treasuryLeg : TransferLeg
+    paymentLeg : TransferLeg
+    requestedAt : Time
+    allocateBefore : Time
+    settleBefore : Time
+    approvers : [Party]
+  where
+    signatory seller, approvers
+    observer venue, buyer
+
+    ensure
+      wellFormedTrade venue seller buyer treasuryLeg paymentLeg allocateBefore settleBefore
+        && unique approvers
+
+    choice DvpProposal_Accept : ContractId DvpProposal
+      with
+        approver : Party
+      controller approver
+      do
+        assertMsg "Only the seller or the buyer may approve" (approver == seller || approver == buyer)
+        assertMsg "Party has already approved" (approver `notElem` approvers)
+        create this with approvers = approvers <> [approver]
+
+    choice DvpProposal_Reject : ()
+      with
+        rejector : Party
+      controller rejector
+      do
+        assertMsg "Only the seller or the buyer may reject" (rejector == seller || rejector == buyer)
+
+    choice DvpProposal_InitiateSettlement : ContractId DvpTrade
+      controller venue
+      do
+        now <- getTime
+        assertMsg "Both trading parties must approve before settlement is initiated"
+          (seller `elem` approvers && buyer `elem` approvers)
+        assertMsg "Allocation deadline has passed" (now < allocateBefore)
+        create DvpTrade with
+          venue
+          seller
+          buyer
+          treasuryLeg
+          paymentLeg
+          requestedAt
+          allocateBefore
+          settleBefore

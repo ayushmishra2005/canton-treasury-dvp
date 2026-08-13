@@ -1,0 +1,124 @@
+module Dvp.Trade where
+
+import DA.List (sort, unique)
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.AllocationRequestV1
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.MetadataV1
+
+treasuryLegId : Text
+treasuryLegId = "treasury-delivery"
+
+paymentLegId : Text
+paymentLegId = "stablecoin-payment"
+
+settlementReference : Reference
+settlementReference = Reference with
+  id = "canton-treasury-dvp/dvp-trade"
+  cid = None
+
+data SettlementAllocation = SettlementAllocation with
+    transferLegId : Text
+    allocationCid : ContractId Allocation
+    extraArgs : ExtraArgs
+  deriving (Eq, Show)
+
+data DvpTrade_SettleResult = DvpTrade_SettleResult with
+    treasuryResult : Allocation_ExecuteTransferResult
+    paymentResult : Allocation_ExecuteTransferResult
+  deriving (Eq, Show)
+
+wellFormedTrade : Party -> Party -> Party -> TransferLeg -> TransferLeg -> Time -> Time -> Bool
+wellFormedTrade venue seller buyer treasuryLeg paymentLeg allocateBefore settleBefore =
+  unique [venue, seller, buyer]
+    && treasuryLeg.amount > 0.0
+    && paymentLeg.amount > 0.0
+    && treasuryLeg.instrumentId /= paymentLeg.instrumentId
+    && treasuryLeg.sender == seller
+    && treasuryLeg.receiver == buyer
+    && paymentLeg.sender == buyer
+    && paymentLeg.receiver == seller
+    && allocateBefore < settleBefore
+
+suppliedLeg : Text -> [SettlementAllocation] -> Update SettlementAllocation
+suppliedLeg transferLegId allocations =
+  case filter (\supplied -> supplied.transferLegId == transferLegId) allocations of
+    [supplied] -> pure supplied
+    _ -> abort ("Expected exactly one allocation for leg " <> transferLegId)
+
+template DvpTrade
+  with
+    venue : Party
+    seller : Party
+    buyer : Party
+    treasuryLeg : TransferLeg
+    paymentLeg : TransferLeg
+    requestedAt : Time
+    allocateBefore : Time
+    settleBefore : Time
+  where
+    signatory venue, seller, buyer
+
+    ensure wellFormedTrade venue seller buyer treasuryLeg paymentLeg allocateBefore settleBefore
+
+    choice DvpTrade_Settle : DvpTrade_SettleResult
+      with
+        allocations : [SettlementAllocation]
+      controller venue
+      do
+        now <- getTime
+        assertMsg "Settlement deadline has passed" (now < settleBefore)
+        assertMsg "Supplied legs must be exactly the two expected legs"
+          (sort (map (.transferLegId) allocations) == sort [treasuryLegId, paymentLegId])
+        treasuryInput <- suppliedLeg treasuryLegId allocations
+        paymentInput <- suppliedLeg paymentLegId allocations
+        assertMsg "Each leg must be backed by a distinct allocation"
+          (treasuryInput.allocationCid /= paymentInput.allocationCid)
+
+        treasuryAllocation <- fetch treasuryInput.allocationCid
+        paymentAllocation <- fetch paymentInput.allocationCid
+        assertMsg "Treasury allocation does not match the expected delivery leg"
+          ((view treasuryAllocation).allocation == expectedAllocation this treasuryLegId treasuryLeg)
+        assertMsg "Stablecoin allocation does not match the expected payment leg"
+          ((view paymentAllocation).allocation == expectedAllocation this paymentLegId paymentLeg)
+
+        treasuryResult <- exercise treasuryInput.allocationCid Allocation_ExecuteTransfer with
+          extraArgs = treasuryInput.extraArgs
+        paymentResult <- exercise paymentInput.allocationCid Allocation_ExecuteTransfer with
+          extraArgs = paymentInput.extraArgs
+        pure DvpTrade_SettleResult with
+          treasuryResult
+          paymentResult
+
+    interface instance AllocationRequest for DvpTrade where
+      view = AllocationRequestView with
+        settlement = settlementInfo this
+        transferLegs = TextMap.fromList
+          [ (treasuryLegId, treasuryLeg)
+          , (paymentLegId, paymentLeg)
+          ]
+        meta = emptyMetadata
+
+      allocationRequest_RejectImpl _self arg = do
+        assertMsg "Only a sender of an expected transfer leg may reject"
+          (arg.actor == treasuryLeg.sender || arg.actor == paymentLeg.sender)
+        pure ChoiceExecutionMetadata with meta = emptyMetadata
+
+      allocationRequest_WithdrawImpl _self _arg =
+        pure ChoiceExecutionMetadata with meta = emptyMetadata
+
+settlementInfo : DvpTrade -> SettlementInfo
+settlementInfo trade = SettlementInfo with
+  executor = trade.venue
+  settlementRef = settlementReference
+  requestedAt = trade.requestedAt
+  allocateBefore = trade.allocateBefore
+  settleBefore = trade.settleBefore
+  meta = emptyMetadata
+
+expectedAllocation : DvpTrade -> Text -> TransferLeg -> AllocationSpecification
+expectedAllocation trade transferLegId transferLeg = AllocationSpecification with
+  settlement = settlementInfo trade
+  transferLegId
+  transferLeg

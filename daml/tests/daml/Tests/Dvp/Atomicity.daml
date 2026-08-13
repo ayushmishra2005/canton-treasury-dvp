@@ -1,0 +1,115 @@
+module Tests.Dvp.Atomicity where
+
+import DA.Assert ((===))
+import DA.Time (hours)
+import Daml.Script
+
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+
+import Dvp.Trade
+
+import Stablecoin.Holding (StablecoinHolding)
+import Treasury.Holding (TreasuryHolding)
+
+import Tests.Dvp.SettlementFixture
+
+treasuryLegCannotExecute : Script ()
+treasuryLegCannotExecute = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  treasuryLockedCid <- lockedBackingHolding fixture treasuryAllocationCid
+  submit fixture.treasuryRegistry $
+    archiveCmd (fromInterfaceContractId @TreasuryHolding treasuryLockedCid)
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertTradeActive fixture tradeCid
+  assertAllocationsActive fixture treasuryAllocationCid paymentAllocationCid
+  assertNoLegDelivered fixture
+  buyerSummary <- holdingSummary fixture.buyer
+  buyerSummary === [(paymentInstrumentName, paymentAmount, True)]
+
+stablecoinLegCannotExecute : Script ()
+stablecoinLegCannotExecute = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  paymentLockedCid <- lockedBackingHolding fixture paymentAllocationCid
+  submit fixture.cashRegistry $
+    archiveCmd (fromInterfaceContractId @StablecoinHolding paymentLockedCid)
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertTradeActive fixture tradeCid
+  assertAllocationsActive fixture treasuryAllocationCid paymentAllocationCid
+  assertNoLegDelivered fixture
+  sellerSummary <- holdingSummary fixture.seller
+  sellerSummary === [(treasuryInstrumentName, deliveryQuantity, True)]
+
+treasuryAllocationWithdrawnBeforeSettlement : Script ()
+treasuryAllocationWithdrawnBeforeSettlement = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  _ <- submit (actAs fixture.seller <> readAs fixture.treasuryRegistry) $
+    exerciseCmd treasuryAllocationCid Allocation_Withdraw with extraArgs = noExtraArgs
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertTradeActive fixture tradeCid
+  assertNoAssetsMoved fixture
+  sellerSummary <- holdingSummary fixture.seller
+  buyerSummary <- holdingSummary fixture.buyer
+  sellerSummary === [(treasuryInstrumentName, deliveryQuantity, False)]
+  buyerSummary === [(paymentInstrumentName, paymentAmount, True)]
+
+stablecoinAllocationWithdrawnBeforeSettlement : Script ()
+stablecoinAllocationWithdrawnBeforeSettlement = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  _ <- submit (actAs fixture.buyer <> readAs fixture.cashRegistry) $
+    exerciseCmd paymentAllocationCid Allocation_Withdraw with extraArgs = noExtraArgs
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertTradeActive fixture tradeCid
+  assertNoAssetsMoved fixture
+  sellerSummary <- holdingSummary fixture.seller
+  buyerSummary <- holdingSummary fixture.buyer
+  sellerSummary === [(treasuryInstrumentName, deliveryQuantity, True)]
+  buyerSummary === [(paymentInstrumentName, paymentAmount, False)]
+
+staleTreasuryAllocationRejected : Script ()
+staleTreasuryAllocationRejected = do
+  (fixture, tradeCid, staleAllocationCid, paymentAllocationCid) <- allocatedTrade
+  result <- submit (actAs fixture.seller <> readAs fixture.treasuryRegistry) $
+    exerciseCmd staleAllocationCid Allocation_Withdraw with extraArgs = noExtraArgs
+  requestView <- requestViewOf fixture tradeCid
+  treasurySpec <- legSpec requestView treasuryLegId
+  recoveredHoldingCid <- case result.senderHoldingCids of
+    [holdingCid] -> pure (fromInterfaceContractId @TreasuryHolding holdingCid)
+    _ -> abort "Expected exactly one recovered sender holding"
+  freshAllocationCid <- allocateDelivery fixture treasurySpec recoveredHoldingCid
+  settleMustFail fixture tradeCid (standardAllocations staleAllocationCid paymentAllocationCid)
+  assertTradeActive fixture tradeCid
+  assertAllocationsActive fixture freshAllocationCid paymentAllocationCid
+  assertNoAssetsMoved fixture
+
+settlementAfterSettleBeforeFails : Script ()
+settlementAfterSettleBeforeFails = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  passTime (hours 3)
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  assertSettlementUnchanged fixture tradeCid treasuryAllocationCid paymentAllocationCid
+
+nonVenuePartyCannotSettle : Script ()
+nonVenuePartyCannotSettle = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  submitMustFail
+    (actAs fixture.seller
+      <> readAs [fixture.venue, fixture.buyer, fixture.treasuryRegistry, fixture.cashRegistry]) $
+    exerciseCmd tradeCid DvpTrade_Settle with
+      allocations = standardAllocations treasuryAllocationCid paymentAllocationCid
+  assertSettlementUnchanged fixture tradeCid treasuryAllocationCid paymentAllocationCid
+
+settlementIsASingleAtomicTransaction : Script ()
+settlementIsASingleAtomicTransaction = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  treasuryLockedCid <- lockedBackingHolding fixture treasuryAllocationCid
+  paymentLockedCid <- lockedBackingHolding fixture paymentAllocationCid
+  result <- settle fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  treasuryLocked <- queryInterfaceContractId @Holding fixture.treasuryRegistry treasuryLockedCid
+  paymentLocked <- queryInterfaceContractId @Holding fixture.cashRegistry paymentLockedCid
+  treasuryLocked === None
+  paymentLocked === None
+  length result.treasuryResult.receiverHoldingCids === 1
+  length result.paymentResult.receiverHoldingCids === 1
+  totals <- instrumentTotals fixture
+  totals === (deliveryQuantity, paymentAmount)

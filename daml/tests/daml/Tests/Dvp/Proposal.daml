@@ -1,0 +1,165 @@
+module Tests.Dvp.Proposal where
+
+import DA.Assert ((===))
+import DA.Optional (isSome)
+import DA.Time (minutes)
+import Daml.Script
+
+import Dvp.Proposal
+import Dvp.Trade
+
+import Tests.Dvp.SettlementFixture
+
+sellerCreatesProposal : Script ()
+sellerCreatesProposal = do
+  fixture <- setup
+  proposalCid <- propose fixture
+  Some proposal <- queryContractId fixture.seller proposalCid
+  proposal.venue === fixture.venue
+  proposal.seller === fixture.seller
+  proposal.buyer === fixture.buyer
+  proposal.treasuryLeg === treasuryLegOf fixture
+  proposal.paymentLeg === paymentLegOf fixture
+  proposal.allocateBefore === allocateBeforeOf fixture
+  proposal.settleBefore === settleBeforeOf fixture
+  proposal.approvers === []
+
+buyerCanAccept : Script ()
+buyerCanAccept = do
+  fixture <- setup
+  proposalCid <- propose fixture
+  acceptedCid <- submit fixture.buyer $
+    exerciseCmd proposalCid DvpProposal_Accept with approver = fixture.buyer
+  Some accepted <- queryContractId fixture.buyer acceptedCid
+  accepted.approvers === [fixture.buyer]
+
+sellerCannotAcceptOnBehalfOfBuyer : Script ()
+sellerCannotAcceptOnBehalfOfBuyer = do
+  fixture <- setup
+  proposalCid <- propose fixture
+  submitMustFail (actAs fixture.seller <> readAs [fixture.buyer, fixture.venue]) $
+    exerciseCmd proposalCid DvpProposal_Accept with approver = fixture.buyer
+
+venueCannotAccept : Script ()
+venueCannotAccept = do
+  fixture <- setup
+  proposalCid <- propose fixture
+  submitMustFail (actAs fixture.venue <> readAs [fixture.seller, fixture.buyer]) $
+    exerciseCmd proposalCid DvpProposal_Accept with approver = fixture.venue
+
+nonTradingPartyCannotAccept : Script ()
+nonTradingPartyCannotAccept = do
+  fixture <- setup
+  outsider <- allocateParty "Outsider"
+  proposalCid <- propose fixture
+  submitMustFail (actAs outsider <> readAs [fixture.seller, fixture.buyer, fixture.venue]) $
+    exerciseCmd proposalCid DvpProposal_Accept with approver = outsider
+
+partyCannotAcceptTwice : Script ()
+partyCannotAcceptTwice = do
+  fixture <- setup
+  proposalCid <- propose fixture
+  acceptedCid <- submit fixture.buyer $
+    exerciseCmd proposalCid DvpProposal_Accept with approver = fixture.buyer
+  submitMustFail (actAs fixture.buyer <> readAs [fixture.seller, fixture.venue]) $
+    exerciseCmd acceptedCid DvpProposal_Accept with approver = fixture.buyer
+
+sellerCanRejectProposal : Script ()
+sellerCanRejectProposal = do
+  fixture <- setup
+  proposalCid <- propose fixture
+  submit fixture.seller $ exerciseCmd proposalCid DvpProposal_Reject with rejector = fixture.seller
+  rejected <- queryContractId fixture.seller proposalCid
+  rejected === None
+
+buyerCanRejectProposal : Script ()
+buyerCanRejectProposal = do
+  fixture <- setup
+  proposalCid <- propose fixture
+  submit fixture.buyer $ exerciseCmd proposalCid DvpProposal_Reject with rejector = fixture.buyer
+  rejected <- queryContractId fixture.seller proposalCid
+  rejected === None
+
+venueCannotRejectProposal : Script ()
+venueCannotRejectProposal = do
+  fixture <- setup
+  proposalCid <- propose fixture
+  submitMustFail (actAs fixture.venue <> readAs [fixture.seller, fixture.buyer]) $
+    exerciseCmd proposalCid DvpProposal_Reject with rejector = fixture.venue
+
+venueCannotInitiateWithoutAnyApproval : Script ()
+venueCannotInitiateWithoutAnyApproval = do
+  fixture <- setup
+  proposalCid <- propose fixture
+  submitMustFail (actAs fixture.venue <> readAs [fixture.seller, fixture.buyer]) $
+    exerciseCmd proposalCid DvpProposal_InitiateSettlement
+
+venueCannotInitiateWithOnlySellerApproval : Script ()
+venueCannotInitiateWithOnlySellerApproval = do
+  fixture <- setup
+  proposalCid <- propose fixture
+  acceptedCid <- submit fixture.seller $
+    exerciseCmd proposalCid DvpProposal_Accept with approver = fixture.seller
+  submitMustFail (actAs fixture.venue <> readAs [fixture.seller, fixture.buyer]) $
+    exerciseCmd acceptedCid DvpProposal_InitiateSettlement
+
+venueCannotInitiateWithOnlyBuyerApproval : Script ()
+venueCannotInitiateWithOnlyBuyerApproval = do
+  fixture <- setup
+  proposalCid <- propose fixture
+  acceptedCid <- submit fixture.buyer $
+    exerciseCmd proposalCid DvpProposal_Accept with approver = fixture.buyer
+  submitMustFail (actAs fixture.venue <> readAs [fixture.seller, fixture.buyer]) $
+    exerciseCmd acceptedCid DvpProposal_InitiateSettlement
+
+venueCannotInitiateAfterAllocateBefore : Script ()
+venueCannotInitiateAfterAllocateBefore = do
+  fixture <- setup
+  proposalCid <- approvedProposal fixture
+  passTime (minutes 90)
+  submitMustFail (actAs fixture.venue <> readAs [fixture.seller, fixture.buyer]) $
+    exerciseCmd proposalCid DvpProposal_InitiateSettlement
+
+approvedProposalCreatesJointlySignedTrade : Script ()
+approvedProposalCreatesJointlySignedTrade = do
+  (fixture, tradeCid) <- initiatedTrade
+  Some trade <- queryContractId fixture.venue tradeCid
+  trade.venue === fixture.venue
+  trade.seller === fixture.seller
+  trade.buyer === fixture.buyer
+  trade.treasuryLeg === treasuryLegOf fixture
+  trade.paymentLeg === paymentLegOf fixture
+  trade.allocateBefore === allocateBeforeOf fixture
+  trade.settleBefore === settleBeforeOf fixture
+  sellerCopy <- queryContractId fixture.seller tradeCid
+  buyerCopy <- queryContractId fixture.buyer tradeCid
+  isSome sellerCopy === True
+  isSome buyerCopy === True
+
+initiationConsumesProposal : Script ()
+initiationConsumesProposal = do
+  fixture <- setup
+  proposalCid <- approvedProposal fixture
+  _ <- submit fixture.venue $ exerciseCmd proposalCid DvpProposal_InitiateSettlement
+  consumed <- queryContractId fixture.seller proposalCid
+  consumed === None
+
+venueCannotCreateTradeAlone : Script ()
+venueCannotCreateTradeAlone = do
+  fixture <- setup
+  submitMustFail (actAs fixture.venue <> readAs [fixture.seller, fixture.buyer]) $
+    createCmd DvpTrade with
+      venue = fixture.venue
+      seller = fixture.seller
+      buyer = fixture.buyer
+      treasuryLeg = treasuryLegOf fixture
+      paymentLeg = paymentLegOf fixture
+      requestedAt = fixture.now
+      allocateBefore = allocateBeforeOf fixture
+      settleBefore = settleBeforeOf fixture
+
+legIdentifiersAreFixedAndDistinct : Script ()
+legIdentifiersAreFixedAndDistinct = do
+  treasuryLegId === "treasury-delivery"
+  paymentLegId === "stablecoin-payment"
+  assertMsg "Leg identifiers must differ" (treasuryLegId /= paymentLegId)

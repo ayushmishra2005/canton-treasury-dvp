@@ -1,0 +1,94 @@
+module Tests.Dvp.Settlement where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+
+import Dvp.Trade
+
+import Tests.Dvp.SettlementFixture
+
+allocationsAreCreatedForBothLegs : Script ()
+allocationsAreCreatedForBothLegs = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  requestView <- requestViewOf fixture tradeCid
+  treasurySpec <- legSpec requestView treasuryLegId
+  paymentSpec <- legSpec requestView paymentLegId
+  Some treasuryView <- queryInterfaceContractId @Allocation fixture.venue treasuryAllocationCid
+  Some paymentView <- queryInterfaceContractId @Allocation fixture.venue paymentAllocationCid
+  treasuryView.allocation === treasurySpec
+  paymentView.allocation === paymentSpec
+  sellerSummary <- holdingSummary fixture.seller
+  buyerSummary <- holdingSummary fixture.buyer
+  sellerSummary === [(treasuryInstrumentName, deliveryQuantity, True)]
+  buyerSummary === [(paymentInstrumentName, paymentAmount, True)]
+
+settlementDeliversBothLegs : Script ()
+settlementDeliversBothLegs = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  totalsBefore <- instrumentTotals fixture
+  _ <- settle fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  sellerSummary <- holdingSummary fixture.seller
+  buyerSummary <- holdingSummary fixture.buyer
+  buyerSummary === [(treasuryInstrumentName, deliveryQuantity, False)]
+  sellerSummary === [(paymentInstrumentName, paymentAmount, False)]
+  totalsAfter <- instrumentTotals fixture
+  totalsBefore === (deliveryQuantity, paymentAmount)
+  totalsAfter === totalsBefore
+
+settlementConsumesTradeAllocationsAndLockedHoldings : Script ()
+settlementConsumesTradeAllocationsAndLockedHoldings = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  treasuryLockedCid <- lockedBackingHolding fixture treasuryAllocationCid
+  paymentLockedCid <- lockedBackingHolding fixture paymentAllocationCid
+  _ <- settle fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  trade <- queryContractId fixture.venue tradeCid
+  trade === None
+  treasuryAllocation <- queryInterfaceContractId @Allocation fixture.venue treasuryAllocationCid
+  paymentAllocation <- queryInterfaceContractId @Allocation fixture.venue paymentAllocationCid
+  treasuryAllocation === None
+  paymentAllocation === None
+  treasuryLocked <- queryInterfaceContractId @Holding fixture.treasuryRegistry treasuryLockedCid
+  paymentLocked <- queryInterfaceContractId @Holding fixture.cashRegistry paymentLockedCid
+  treasuryLocked === None
+  paymentLocked === None
+
+settlementResultsCarryReceiverHoldings : Script ()
+settlementResultsCarryReceiverHoldings = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  result <- settle fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  result.treasuryResult.senderHoldingCids === []
+  result.paymentResult.senderHoldingCids === []
+  case result.treasuryResult.receiverHoldingCids of
+    [receiverHoldingCid] -> do
+      Some receiverView <- queryInterfaceContractId @Holding fixture.buyer receiverHoldingCid
+      receiverView.owner === fixture.buyer
+      receiverView.amount === deliveryQuantity
+      receiverView.instrumentId === fixture.treasuryInstrumentId
+      receiverView.lock === None
+    _ -> abort "Expected exactly one Treasury receiver holding"
+  case result.paymentResult.receiverHoldingCids of
+    [receiverHoldingCid] -> do
+      Some receiverView <- queryInterfaceContractId @Holding fixture.seller receiverHoldingCid
+      receiverView.owner === fixture.seller
+      receiverView.amount === paymentAmount
+      receiverView.instrumentId === fixture.paymentInstrumentId
+      receiverView.lock === None
+    _ -> abort "Expected exactly one stablecoin receiver holding"
+
+settlementCreatesNoDuplicateAmounts : Script ()
+settlementCreatesNoDuplicateAmounts = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  _ <- settle fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  treasuryHoldings <- holdingSummary fixture.treasuryRegistry
+  paymentHoldings <- holdingSummary fixture.cashRegistry
+  treasuryHoldings === [(treasuryInstrumentName, deliveryQuantity, False)]
+  paymentHoldings === [(paymentInstrumentName, paymentAmount, False)]
+
+settlementCannotBeReplayed : Script ()
+settlementCannotBeReplayed = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  _ <- settle fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)
+  settleMustFail fixture tradeCid (standardAllocations treasuryAllocationCid paymentAllocationCid)

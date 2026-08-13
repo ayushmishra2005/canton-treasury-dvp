@@ -1,0 +1,114 @@
+module Tests.Dvp.AllocationRequest where
+
+import DA.Assert ((===))
+import DA.TextMap qualified as TextMap
+import Daml.Script
+
+import Splice.Api.Token.AllocationRequestV1
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.MetadataV1
+
+import Dvp.Trade
+
+import Tests.Dvp.SettlementFixture
+
+viewExposesExactSettlementInformation : Script ()
+viewExposesExactSettlementInformation = do
+  (fixture, tradeCid) <- initiatedTrade
+  requestView <- requestViewOf fixture tradeCid
+  requestView.settlement === SettlementInfo with
+    executor = fixture.venue
+    settlementRef = settlementReference
+    requestedAt = fixture.now
+    allocateBefore = allocateBeforeOf fixture
+    settleBefore = settleBeforeOf fixture
+    meta = emptyMetadata
+  requestView.meta === emptyMetadata
+
+viewExposesExactlyTheTwoExpectedLegs : Script ()
+viewExposesExactlyTheTwoExpectedLegs = do
+  (fixture, tradeCid) <- initiatedTrade
+  requestView <- requestViewOf fixture tradeCid
+  TextMap.toList requestView.transferLegs === TextMap.toList (TextMap.fromList
+    [ (treasuryLegId, treasuryLegOf fixture)
+    , (paymentLegId, paymentLegOf fixture)
+    ])
+  TextMap.size requestView.transferLegs === 2
+
+expectedLegSenderCanReject : Script ()
+expectedLegSenderCanReject = do
+  (fixture, tradeCid) <- initiatedTrade
+  submit (actAs fixture.seller <> readAs [fixture.venue, fixture.buyer]) $
+    exerciseCmd (toInterfaceContractId @AllocationRequest tradeCid)
+      AllocationRequest_Reject with
+        actor = fixture.seller
+        extraArgs = noExtraArgs
+  rejected <- queryContractId fixture.venue tradeCid
+  rejected === None
+
+paymentLegSenderCanReject : Script ()
+paymentLegSenderCanReject = do
+  (fixture, tradeCid) <- initiatedTrade
+  submit (actAs fixture.buyer <> readAs [fixture.venue, fixture.seller]) $
+    exerciseCmd (toInterfaceContractId @AllocationRequest tradeCid)
+      AllocationRequest_Reject with
+        actor = fixture.buyer
+        extraArgs = noExtraArgs
+  rejected <- queryContractId fixture.venue tradeCid
+  rejected === None
+
+venueCannotRejectAsNonSender : Script ()
+venueCannotRejectAsNonSender = do
+  (fixture, tradeCid) <- initiatedTrade
+  submitMustFail (actAs fixture.venue <> readAs [fixture.seller, fixture.buyer]) $
+    exerciseCmd (toInterfaceContractId @AllocationRequest tradeCid)
+      AllocationRequest_Reject with
+        actor = fixture.venue
+        extraArgs = noExtraArgs
+
+unrelatedPartyCannotReject : Script ()
+unrelatedPartyCannotReject = do
+  (fixture, tradeCid) <- initiatedTrade
+  outsider <- allocateParty "Outsider"
+  submitMustFail (actAs outsider <> readAs [fixture.venue, fixture.seller, fixture.buyer]) $
+    exerciseCmd (toInterfaceContractId @AllocationRequest tradeCid)
+      AllocationRequest_Reject with
+        actor = outsider
+        extraArgs = noExtraArgs
+
+rejectionTransfersNoAssets : Script ()
+rejectionTransfersNoAssets = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  submit (actAs fixture.seller <> readAs [fixture.venue, fixture.buyer]) $
+    exerciseCmd (toInterfaceContractId @AllocationRequest tradeCid)
+      AllocationRequest_Reject with
+        actor = fixture.seller
+        extraArgs = noExtraArgs
+  assertAllocationsActive fixture treasuryAllocationCid paymentAllocationCid
+  assertNoAssetsMoved fixture
+
+venueWithdrawalTransfersNoAssets : Script ()
+venueWithdrawalTransfersNoAssets = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  submit (actAs fixture.venue <> readAs [fixture.seller, fixture.buyer]) $
+    exerciseCmd (toInterfaceContractId @AllocationRequest tradeCid)
+      AllocationRequest_Withdraw with extraArgs = noExtraArgs
+  withdrawn <- queryContractId fixture.venue tradeCid
+  withdrawn === None
+  assertAllocationsActive fixture treasuryAllocationCid paymentAllocationCid
+  assertNoAssetsMoved fixture
+
+sendersRecoverAssetsAfterWithdrawal : Script ()
+sendersRecoverAssetsAfterWithdrawal = do
+  (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid) <- allocatedTrade
+  submit (actAs fixture.venue <> readAs [fixture.seller, fixture.buyer]) $
+    exerciseCmd (toInterfaceContractId @AllocationRequest tradeCid)
+      AllocationRequest_Withdraw with extraArgs = noExtraArgs
+  _ <- submit (actAs fixture.seller <> readAs fixture.treasuryRegistry) $
+    exerciseCmd treasuryAllocationCid Allocation_Withdraw with extraArgs = noExtraArgs
+  _ <- submit (actAs fixture.buyer <> readAs fixture.cashRegistry) $
+    exerciseCmd paymentAllocationCid Allocation_Withdraw with extraArgs = noExtraArgs
+  sellerSummary <- holdingSummary fixture.seller
+  buyerSummary <- holdingSummary fixture.buyer
+  sellerSummary === [(treasuryInstrumentName, deliveryQuantity, False)]
+  buyerSummary === [(paymentInstrumentName, paymentAmount, False)]

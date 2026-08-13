@@ -1,4 +1,5 @@
 packages:
   - ./daml/treasury-registry
   - ./daml/stablecoin-registry
+  - ./daml/dvp-settlement
   - ./daml/tests

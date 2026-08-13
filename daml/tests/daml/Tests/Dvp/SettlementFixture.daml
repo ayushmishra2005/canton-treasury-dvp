@@ -1,0 +1,353 @@
+module Tests.Dvp.SettlementFixture where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import DA.List (sort)
+import DA.Optional (isSome)
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, hours, time)
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV1
+import Splice.Api.Token.AllocationRequestV1
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Dvp.Proposal
+import Dvp.Trade
+
+import Stablecoin.Eligibility qualified as Stablecoin
+import Stablecoin.Eligibility (StablecoinEligibility(..))
+import Stablecoin.Holding (StablecoinHolding)
+import Stablecoin.Instrument
+import Stablecoin.Rules qualified as Stablecoin
+import Stablecoin.Rules (StablecoinRules(..))
+import Treasury.Eligibility qualified as Treasury
+import Treasury.Eligibility (TreasuryEligibility(..))
+import Treasury.Holding (TreasuryHolding)
+import Treasury.Instrument
+import Treasury.Rules qualified as Treasury
+import Treasury.Rules (TreasuryRules(..))
+
+treasuryInstrumentName : Text
+treasuryInstrumentName = "UST-2028-11"
+
+paymentInstrumentName : Text
+paymentInstrumentName = "USD-C"
+
+deliveryQuantity : Decimal
+deliveryQuantity = 100.0
+
+paymentAmount : Decimal
+paymentAmount = 100000.0
+
+data Fixture = Fixture with
+  treasuryRegistry : Party
+  cashRegistry : Party
+  venue : Party
+  seller : Party
+  buyer : Party
+  treasuryInstrumentId : InstrumentId
+  paymentInstrumentId : InstrumentId
+  treasuryInstrumentCid : ContractId TreasuryInstrument
+  cashInstrumentCid : ContractId StablecoinInstrument
+  treasuryRulesCid : ContractId TreasuryRules
+  cashRulesCid : ContractId StablecoinRules
+  now : Time
+
+setup : Script Fixture
+setup = do
+  setTime (time (date 2026 Jan 1) 12 0 0)
+  treasuryRegistry <- allocateParty "TreasuryRegistry"
+  cashRegistry <- allocateParty "CashRegistry"
+  venue <- allocateParty "Venue"
+  seller <- allocateParty "Seller"
+  buyer <- allocateParty "Buyer"
+  treasuryInstrumentCid <- submit treasuryRegistry $ createCmd TreasuryInstrument with
+    treasuryRegistry
+    id = treasuryInstrumentName
+    description = "US Treasury Note 1.5% due 2028-11-15"
+    faceValue = 1000.0
+    maturityDate = date 2028 Nov 15
+  cashInstrumentCid <- submit cashRegistry $ createCmd StablecoinInstrument with
+    cashRegistry
+    id = paymentInstrumentName
+    description = "Regulated USD payment stablecoin"
+  let treasuryInstrumentId = InstrumentId with
+        admin = treasuryRegistry
+        id = treasuryInstrumentName
+      paymentInstrumentId = InstrumentId with
+        admin = cashRegistry
+        id = paymentInstrumentName
+  treasuryRulesCid <- submit treasuryRegistry $
+    createCmd TreasuryRules with instrumentId = treasuryInstrumentId
+  cashRulesCid <- submit cashRegistry $
+    createCmd StablecoinRules with instrumentId = paymentInstrumentId
+  now <- getTime
+  pure Fixture with
+    treasuryRegistry
+    cashRegistry
+    venue
+    seller
+    buyer
+    treasuryInstrumentId
+    paymentInstrumentId
+    treasuryInstrumentCid
+    cashInstrumentCid
+    treasuryRulesCid
+    cashRulesCid
+    now
+
+noExtraArgs : ExtraArgs
+noExtraArgs = ExtraArgs with
+  context = emptyChoiceContext
+  meta = emptyMetadata
+
+allocateBeforeOf : Fixture -> Time
+allocateBeforeOf fixture = addRelTime fixture.now (hours 1)
+
+settleBeforeOf : Fixture -> Time
+settleBeforeOf fixture = addRelTime fixture.now (hours 2)
+
+treasuryLegOf : Fixture -> TransferLeg
+treasuryLegOf fixture = TransferLeg with
+  sender = fixture.seller
+  receiver = fixture.buyer
+  amount = deliveryQuantity
+  instrumentId = fixture.treasuryInstrumentId
+  meta = emptyMetadata
+
+paymentLegOf : Fixture -> TransferLeg
+paymentLegOf fixture = TransferLeg with
+  sender = fixture.buyer
+  receiver = fixture.seller
+  amount = paymentAmount
+  instrumentId = fixture.paymentInstrumentId
+  meta = emptyMetadata
+
+propose : Fixture -> Script (ContractId DvpProposal)
+propose fixture = submit fixture.seller $ createCmd DvpProposal with
+  venue = fixture.venue
+  seller = fixture.seller
+  buyer = fixture.buyer
+  treasuryLeg = treasuryLegOf fixture
+  paymentLeg = paymentLegOf fixture
+  requestedAt = fixture.now
+  allocateBefore = allocateBeforeOf fixture
+  settleBefore = settleBeforeOf fixture
+  approvers = []
+
+approvedProposal : Fixture -> Script (ContractId DvpProposal)
+approvedProposal fixture = do
+  proposalCid <- propose fixture
+  acceptedBySeller <- submit fixture.seller $
+    exerciseCmd proposalCid DvpProposal_Accept with approver = fixture.seller
+  submit fixture.buyer $
+    exerciseCmd acceptedBySeller DvpProposal_Accept with approver = fixture.buyer
+
+initiatedTrade : Script (Fixture, ContractId DvpTrade)
+initiatedTrade = do
+  fixture <- setup
+  proposalCid <- approvedProposal fixture
+  tradeCid <- submit fixture.venue $ exerciseCmd proposalCid DvpProposal_InitiateSettlement
+  pure (fixture, tradeCid)
+
+requestViewOf : Fixture -> ContractId DvpTrade -> Script AllocationRequestView
+requestViewOf fixture tradeCid = do
+  Some requestView <- queryInterfaceContractId @AllocationRequest fixture.seller
+    (toInterfaceContractId @AllocationRequest tradeCid)
+  pure requestView
+
+legSpec : AllocationRequestView -> Text -> Script AllocationSpecification
+legSpec requestView transferLegId =
+  case TextMap.lookup transferLegId requestView.transferLegs of
+    Some transferLeg -> pure AllocationSpecification with
+      settlement = requestView.settlement
+      transferLegId
+      transferLeg
+    None -> abort ("Unknown transfer leg " <> transferLegId)
+
+treasuryAttestation : Fixture -> InstrumentId -> Party -> Script (ContractId TreasuryEligibility)
+treasuryAttestation fixture instrumentId investor =
+  submit fixture.treasuryRegistry $ createCmd TreasuryEligibility with
+    instrumentId
+    investor
+    status = Treasury.Eligible
+    validFrom = addRelTime fixture.now (hours (-1))
+    validUntil = addRelTime fixture.now (hours 24)
+    attestationRef = "attestation-000"
+
+paymentAttestation : Fixture -> InstrumentId -> Party -> Script (ContractId StablecoinEligibility)
+paymentAttestation fixture instrumentId investor =
+  submit fixture.cashRegistry $ createCmd StablecoinEligibility with
+    instrumentId
+    investor
+    status = Stablecoin.Eligible
+    validFrom = addRelTime fixture.now (hours (-1))
+    validUntil = addRelTime fixture.now (hours 24)
+    attestationRef = "attestation-000"
+
+issueDeliveryTo : Fixture -> Party -> Decimal -> Script (ContractId TreasuryHolding)
+issueDeliveryTo fixture owner amount = submit fixture.treasuryRegistry $
+  exerciseCmd fixture.treasuryInstrumentCid Issue with owner, amount
+
+mintPaymentTo : Fixture -> Party -> Decimal -> Script (ContractId StablecoinHolding)
+mintPaymentTo fixture owner amount = submit fixture.cashRegistry $
+  exerciseCmd fixture.cashInstrumentCid Mint with owner, amount
+
+issueDelivery : Fixture -> Script (ContractId TreasuryHolding)
+issueDelivery fixture = issueDeliveryTo fixture fixture.seller deliveryQuantity
+
+mintPayment : Fixture -> Script (ContractId StablecoinHolding)
+mintPayment fixture = mintPaymentTo fixture fixture.buyer paymentAmount
+
+allocateDeliveryVia : Fixture -> ContractId TreasuryRules -> AllocationSpecification -> ContractId TreasuryHolding -> Script (ContractId Allocation)
+allocateDeliveryVia fixture rulesCid spec holdingCid = do
+  let leg = spec.transferLeg
+  senderEligibilityCid <- treasuryAttestation fixture leg.instrumentId leg.sender
+  receiverEligibilityCid <- treasuryAttestation fixture leg.instrumentId leg.receiver
+  result <- submit (actAs leg.sender <> readAs fixture.treasuryRegistry) $
+    exerciseCmd (toInterfaceContractId @AllocationFactory rulesCid)
+      AllocationFactory_Allocate with
+        expectedAdmin = fixture.treasuryRegistry
+        allocation = spec
+        requestedAt = fixture.now
+        inputHoldingCids = [toInterfaceContractId @Holding holdingCid]
+        extraArgs = ExtraArgs with
+          context = ChoiceContext with
+            values = TextMap.fromList
+              [ (Treasury.senderEligibilityKey, AV_ContractId (coerceContractId senderEligibilityCid))
+              , (Treasury.receiverEligibilityKey, AV_ContractId (coerceContractId receiverEligibilityCid))
+              ]
+          meta = emptyMetadata
+  case result.output of
+    AllocationInstructionResult_Completed allocationCid -> pure allocationCid
+    _ -> abort "Treasury allocation did not complete"
+
+allocatePaymentVia : Fixture -> ContractId StablecoinRules -> AllocationSpecification -> ContractId StablecoinHolding -> Script (ContractId Allocation)
+allocatePaymentVia fixture rulesCid spec holdingCid = do
+  let leg = spec.transferLeg
+  senderEligibilityCid <- paymentAttestation fixture leg.instrumentId leg.sender
+  receiverEligibilityCid <- paymentAttestation fixture leg.instrumentId leg.receiver
+  result <- submit (actAs leg.sender <> readAs fixture.cashRegistry) $
+    exerciseCmd (toInterfaceContractId @AllocationFactory rulesCid)
+      AllocationFactory_Allocate with
+        expectedAdmin = fixture.cashRegistry
+        allocation = spec
+        requestedAt = fixture.now
+        inputHoldingCids = [toInterfaceContractId @Holding holdingCid]
+        extraArgs = ExtraArgs with
+          context = ChoiceContext with
+            values = TextMap.fromList
+              [ (Stablecoin.senderEligibilityKey, AV_ContractId (coerceContractId senderEligibilityCid))
+              , (Stablecoin.receiverEligibilityKey, AV_ContractId (coerceContractId receiverEligibilityCid))
+              ]
+          meta = emptyMetadata
+  case result.output of
+    AllocationInstructionResult_Completed allocationCid -> pure allocationCid
+    _ -> abort "Stablecoin allocation did not complete"
+
+allocateDelivery : Fixture -> AllocationSpecification -> ContractId TreasuryHolding -> Script (ContractId Allocation)
+allocateDelivery fixture = allocateDeliveryVia fixture fixture.treasuryRulesCid
+
+allocatePayment : Fixture -> AllocationSpecification -> ContractId StablecoinHolding -> Script (ContractId Allocation)
+allocatePayment fixture = allocatePaymentVia fixture fixture.cashRulesCid
+
+allocatedTrade : Script (Fixture, ContractId DvpTrade, ContractId Allocation, ContractId Allocation)
+allocatedTrade = do
+  (fixture, tradeCid) <- initiatedTrade
+  deliveryHoldingCid <- issueDelivery fixture
+  paymentHoldingCid <- mintPayment fixture
+  requestView <- requestViewOf fixture tradeCid
+  treasurySpec <- legSpec requestView treasuryLegId
+  paymentSpec <- legSpec requestView paymentLegId
+  treasuryAllocationCid <- allocateDelivery fixture treasurySpec deliveryHoldingCid
+  paymentAllocationCid <- allocatePayment fixture paymentSpec paymentHoldingCid
+  pure (fixture, tradeCid, treasuryAllocationCid, paymentAllocationCid)
+
+standardAllocations : ContractId Allocation -> ContractId Allocation -> [SettlementAllocation]
+standardAllocations treasuryAllocationCid paymentAllocationCid =
+  [ SettlementAllocation with
+      transferLegId = treasuryLegId
+      allocationCid = treasuryAllocationCid
+      extraArgs = noExtraArgs
+  , SettlementAllocation with
+      transferLegId = paymentLegId
+      allocationCid = paymentAllocationCid
+      extraArgs = noExtraArgs
+  ]
+
+settlementActors : Fixture -> Commands a -> Script a
+settlementActors fixture =
+  submit (actAs fixture.venue
+    <> readAs [fixture.seller, fixture.buyer, fixture.treasuryRegistry, fixture.cashRegistry])
+
+settle : Fixture -> ContractId DvpTrade -> [SettlementAllocation] -> Script DvpTrade_SettleResult
+settle fixture tradeCid allocations =
+  settlementActors fixture $ exerciseCmd tradeCid DvpTrade_Settle with allocations
+
+settleMustFail : Fixture -> ContractId DvpTrade -> [SettlementAllocation] -> Script ()
+settleMustFail fixture tradeCid allocations =
+  submitMustFail (actAs fixture.venue
+    <> readAs [fixture.seller, fixture.buyer, fixture.treasuryRegistry, fixture.cashRegistry]) $
+    exerciseCmd tradeCid DvpTrade_Settle with allocations
+
+holdingSummary : Party -> Script [(Text, Decimal, Bool)]
+holdingSummary party = do
+  holdings <- queryInterface @Holding party
+  pure $ sort
+    [ (holdingView.instrumentId.id, holdingView.amount, isSome holdingView.lock)
+    | (_, Some holdingView) <- holdings
+    ]
+
+instrumentTotals : Fixture -> Script (Decimal, Decimal)
+instrumentTotals fixture = do
+  treasuryHoldings <- queryInterface @Holding fixture.treasuryRegistry
+  paymentHoldings <- queryInterface @Holding fixture.cashRegistry
+  pure
+    ( sum [holdingView.amount | (_, Some holdingView) <- treasuryHoldings]
+    , sum [holdingView.amount | (_, Some holdingView) <- paymentHoldings]
+    )
+
+assertNoLegDelivered : Fixture -> Script ()
+assertNoLegDelivered fixture = do
+  sellerSummary <- holdingSummary fixture.seller
+  buyerSummary <- holdingSummary fixture.buyer
+  filter (\(instrument, _, _) -> instrument == paymentInstrumentName) sellerSummary === []
+  filter (\(instrument, _, _) -> instrument == treasuryInstrumentName) buyerSummary === []
+
+assertNoAssetsMoved : Fixture -> Script ()
+assertNoAssetsMoved fixture = do
+  assertNoLegDelivered fixture
+  totals <- instrumentTotals fixture
+  totals === (deliveryQuantity, paymentAmount)
+
+assertTradeActive : Fixture -> ContractId DvpTrade -> Script ()
+assertTradeActive fixture tradeCid = do
+  trade <- queryContractId fixture.venue tradeCid
+  isSome trade === True
+
+assertAllocationsActive : Fixture -> ContractId Allocation -> ContractId Allocation -> Script ()
+assertAllocationsActive fixture treasuryAllocationCid paymentAllocationCid = do
+  treasuryAllocation <- queryInterfaceContractId @Allocation fixture.venue treasuryAllocationCid
+  paymentAllocation <- queryInterfaceContractId @Allocation fixture.venue paymentAllocationCid
+  isSome treasuryAllocation === True
+  isSome paymentAllocation === True
+
+assertSettlementUnchanged : Fixture -> ContractId DvpTrade -> ContractId Allocation -> ContractId Allocation -> Script ()
+assertSettlementUnchanged fixture tradeCid treasuryAllocationCid paymentAllocationCid = do
+  assertTradeActive fixture tradeCid
+  assertAllocationsActive fixture treasuryAllocationCid paymentAllocationCid
+  sellerSummary <- holdingSummary fixture.seller
+  buyerSummary <- holdingSummary fixture.buyer
+  sellerSummary === [(treasuryInstrumentName, deliveryQuantity, True)]
+  buyerSummary === [(paymentInstrumentName, paymentAmount, True)]
+  assertNoAssetsMoved fixture
+
+lockedBackingHolding : Fixture -> ContractId Allocation -> Script (ContractId Holding)
+lockedBackingHolding fixture allocationCid = do
+  Some allocationView <- queryInterfaceContractId @Allocation fixture.venue allocationCid
+  case allocationView.holdingCids of
+    [holdingCid] -> pure holdingCid
+    _ -> abort "Expected exactly one backing holding"

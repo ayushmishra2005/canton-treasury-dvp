@@ -1,0 +1,122 @@
+module Tests.Stablecoin.MintBurn where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Stablecoin.Holding
+import Stablecoin.Instrument
+
+setup : Script (Party, Party, ContractId StablecoinInstrument)
+setup = do
+  cashRegistry <- allocateParty "CashRegistry"
+  buyer <- allocateParty "Buyer"
+  instrumentCid <- submit cashRegistry $ createCmd StablecoinInstrument with
+    cashRegistry
+    id = "USD-C"
+    description = "Regulated USD payment stablecoin"
+  pure (cashRegistry, buyer, instrumentCid)
+
+registryCreatesStablecoinInstrument : Script ()
+registryCreatesStablecoinInstrument = do
+  (cashRegistry, _, instrumentCid) <- setup
+  Some instrument <- queryContractId cashRegistry instrumentCid
+  instrument.cashRegistry === cashRegistry
+  instrument.id === "USD-C"
+  instrument.description === "Regulated USD payment stablecoin"
+
+registryMintsHoldingToOwner : Script ()
+registryMintsHoldingToOwner = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  holdingCid <- submit cashRegistry $ exerciseCmd instrumentCid Mint with
+    owner = buyer
+    amount = 250.0
+  Some holding <- queryContractId buyer holdingCid
+  holding.owner === buyer
+  holding.amount === 250.0
+  holding.lock === None
+  holding.instrumentId === InstrumentId with admin = cashRegistry, id = "USD-C"
+
+nonRegistryCannotMint : Script ()
+nonRegistryCannotMint = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  submitMustFail (actAs buyer <> readAs cashRegistry) $
+    exerciseCmd instrumentCid Mint with
+      owner = buyer
+      amount = 250.0
+
+mintRejectsNonPositiveAmounts : Script ()
+mintRejectsNonPositiveAmounts = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  submitMustFail cashRegistry $ exerciseCmd instrumentCid Mint with owner = buyer, amount = 0.0
+  submitMustFail cashRegistry $ exerciseCmd instrumentCid Mint with owner = buyer, amount = -250.0
+
+ownerQueriesHoldingThroughInterface : Script ()
+ownerQueriesHoldingThroughInterface = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  holdingCid <- submit cashRegistry $ exerciseCmd instrumentCid Mint with
+    owner = buyer
+    amount = 250.0
+  holdings <- queryInterface @Holding buyer
+  map fst holdings === [toInterfaceContractId @Holding holdingCid]
+
+holdingViewExposesStandardFields : Script ()
+holdingViewExposesStandardFields = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  holdingCid <- submit cashRegistry $ exerciseCmd instrumentCid Mint with
+    owner = buyer
+    amount = 250.0
+  Some holdingView <-
+    queryInterfaceContractId @Holding buyer (toInterfaceContractId @Holding holdingCid)
+  holdingView === HoldingView with
+    owner = buyer
+    instrumentId = InstrumentId with admin = cashRegistry, id = "USD-C"
+    amount = 250.0
+    lock = None
+    meta = emptyMetadata
+
+registryBurnsHolding : Script ()
+registryBurnsHolding = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  holdingCid <- submit cashRegistry $ exerciseCmd instrumentCid Mint with
+    owner = buyer
+    amount = 250.0
+  submit cashRegistry $ exerciseCmd holdingCid Burn
+  burnedHolding <- queryContractId buyer holdingCid
+  burnedHolding === None
+
+ownerCannotBurnHolding : Script ()
+ownerCannotBurnHolding = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  holdingCid <- submit cashRegistry $ exerciseCmd instrumentCid Mint with
+    owner = buyer
+    amount = 250.0
+  submitMustFail buyer $ exerciseCmd holdingCid Burn
+
+burnRemovesOnlyTheSelectedHolding : Script ()
+burnRemovesOnlyTheSelectedHolding = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  burnedCid <- submit cashRegistry $ exerciseCmd instrumentCid Mint with
+    owner = buyer
+    amount = 250.0
+  retainedCid <- submit cashRegistry $ exerciseCmd instrumentCid Mint with
+    owner = buyer
+    amount = 100.0
+  submit cashRegistry $ exerciseCmd burnedCid Burn
+  holdings <- queryInterface @Holding buyer
+  map fst holdings === [toInterfaceContractId @Holding retainedCid]
+
+partialBurnSplitsThenBurnsTheSelectedOutput : Script ()
+partialBurnSplitsThenBurnsTheSelectedOutput = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  holdingCid <- submit cashRegistry $ exerciseCmd instrumentCid Mint with
+    owner = buyer
+    amount = 250.0
+  (burnedCid, remainderCid) <- submit buyer $ exerciseCmd holdingCid Split with splitAmount = 90.0
+  submit cashRegistry $ exerciseCmd burnedCid Burn
+  Some remainder <- queryContractId buyer remainderCid
+  remainder.amount === 160.0
+  holdings <- queryInterface @Holding buyer
+  map fst holdings === [toInterfaceContractId @Holding remainderCid]

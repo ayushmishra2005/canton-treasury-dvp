@@ -1,0 +1,28 @@
+module Stablecoin.Instrument where
+
+import Splice.Api.Token.HoldingV1
+
+import Stablecoin.Holding
+
+template StablecoinInstrument
+  with
+    cashRegistry : Party
+    id : Text
+    description : Text
+  where
+    signatory cashRegistry
+
+    ensure id /= ""
+
+    nonconsuming choice Mint : ContractId StablecoinHolding
+      with
+        owner : Party
+        amount : Decimal
+      controller cashRegistry
+      do
+        assertMsg "Mint amount must be positive" (amount > 0.0)
+        create StablecoinHolding with
+          instrumentId = InstrumentId with admin = cashRegistry, id
+          owner
+          amount
+          lock = None

@@ -1,0 +1,100 @@
+module Tests.Stablecoin.SplitMerge where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1
+
+import Stablecoin.Holding
+import Stablecoin.Instrument
+
+setup : Script (Party, Party, ContractId StablecoinInstrument)
+setup = do
+  cashRegistry <- allocateParty "CashRegistry"
+  buyer <- allocateParty "Buyer"
+  instrumentCid <- submit cashRegistry $ createCmd StablecoinInstrument with
+    cashRegistry
+    id = "USD-C"
+    description = "Regulated USD payment stablecoin"
+  pure (cashRegistry, buyer, instrumentCid)
+
+mint : Party -> ContractId StablecoinInstrument -> Party -> Decimal -> Script (ContractId StablecoinHolding)
+mint cashRegistry instrumentCid owner amount =
+  submit cashRegistry $ exerciseCmd instrumentCid Mint with owner, amount
+
+ownedAmount : Party -> Script Decimal
+ownedAmount owner = do
+  holdings <- queryInterface @Holding owner
+  pure $ sum [holdingView.amount | (_, Some holdingView) <- holdings]
+
+ownerSplitsHolding : Script ()
+ownerSplitsHolding = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  holdingCid <- mint cashRegistry instrumentCid buyer 250.0
+  (splitCid, remainderCid) <- submit buyer $ exerciseCmd holdingCid Split with splitAmount = 90.0
+  Some split <- queryContractId buyer splitCid
+  Some remainder <- queryContractId buyer remainderCid
+  split.amount === 90.0
+  remainder.amount === 160.0
+  split.owner === buyer
+  remainder.owner === buyer
+  originalHolding <- queryContractId buyer holdingCid
+  originalHolding === None
+
+splitConservesAmount : Script ()
+splitConservesAmount = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  holdingCid <- mint cashRegistry instrumentCid buyer 250.0
+  _ <- submit buyer $ exerciseCmd holdingCid Split with splitAmount = 90.0
+  total <- ownedAmount buyer
+  total === 250.0
+
+splitRejectsAmountOutsideHolding : Script ()
+splitRejectsAmountOutsideHolding = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  holdingCid <- mint cashRegistry instrumentCid buyer 250.0
+  submitMustFail buyer $ exerciseCmd holdingCid Split with splitAmount = 0.0
+  submitMustFail buyer $ exerciseCmd holdingCid Split with splitAmount = -10.0
+  submitMustFail buyer $ exerciseCmd holdingCid Split with splitAmount = 250.0
+  submitMustFail buyer $ exerciseCmd holdingCid Split with splitAmount = 400.0
+
+ownerMergesHoldings : Script ()
+ownerMergesHoldings = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  firstCid <- mint cashRegistry instrumentCid buyer 90.0
+  secondCid <- mint cashRegistry instrumentCid buyer 160.0
+  mergedCid <- submit buyer $ exerciseCmd firstCid Merge with otherHoldingCid = secondCid
+  Some merged <- queryContractId buyer mergedCid
+  merged.amount === 250.0
+  merged.owner === buyer
+  holdings <- queryInterface @Holding buyer
+  map fst holdings === [toInterfaceContractId @Holding mergedCid]
+
+mergeConservesAmount : Script ()
+mergeConservesAmount = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  firstCid <- mint cashRegistry instrumentCid buyer 90.0
+  secondCid <- mint cashRegistry instrumentCid buyer 160.0
+  _ <- submit buyer $ exerciseCmd firstCid Merge with otherHoldingCid = secondCid
+  total <- ownedAmount buyer
+  total === 250.0
+
+mergeRejectsDifferentOwners : Script ()
+mergeRejectsDifferentOwners = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  seller <- allocateParty "Seller"
+  buyerHoldingCid <- mint cashRegistry instrumentCid buyer 90.0
+  sellerHoldingCid <- mint cashRegistry instrumentCid seller 160.0
+  submitMustFail (actAs buyer <> readAs seller) $
+    exerciseCmd buyerHoldingCid Merge with otherHoldingCid = sellerHoldingCid
+
+mergeRejectsDifferentInstruments : Script ()
+mergeRejectsDifferentInstruments = do
+  (cashRegistry, buyer, instrumentCid) <- setup
+  otherInstrumentCid <- submit cashRegistry $ createCmd StablecoinInstrument with
+    cashRegistry
+    id = "EUR-C"
+    description = "Regulated EUR payment stablecoin"
+  firstCid <- mint cashRegistry instrumentCid buyer 90.0
+  secondCid <- mint cashRegistry otherInstrumentCid buyer 160.0
+  submitMustFail buyer $ exerciseCmd firstCid Merge with otherHoldingCid = secondCid

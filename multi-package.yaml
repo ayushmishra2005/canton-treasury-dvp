@@ -1,3 +1,4 @@
 packages:
   - ./daml/treasury-registry
+  - ./daml/stablecoin-registry
   - ./daml/tests

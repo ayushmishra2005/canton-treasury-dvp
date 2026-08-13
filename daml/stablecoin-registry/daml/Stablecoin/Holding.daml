@@ -1,0 +1,55 @@
+module Stablecoin.Holding where
+
+import DA.Optional (isNone)
+
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+template StablecoinHolding
+  with
+    instrumentId : InstrumentId
+    owner : Party
+    amount : Decimal
+    lock : Optional Lock
+  where
+    signatory instrumentId.admin
+    observer owner
+
+    ensure amount > 0.0
+
+    choice Burn : ()
+      controller instrumentId.admin
+      do pure ()
+
+    choice Split : (ContractId StablecoinHolding, ContractId StablecoinHolding)
+      with
+        splitAmount : Decimal
+      controller owner
+      do
+        assertMsg "Holding must be unlocked" (isNone lock)
+        assertMsg "Split amount must be positive" (splitAmount > 0.0)
+        assertMsg "Split amount must be below the holding amount" (splitAmount < amount)
+        splitCid <- create this with amount = splitAmount
+        remainderCid <- create this with amount = amount - splitAmount
+        pure (splitCid, remainderCid)
+
+    choice Merge : ContractId StablecoinHolding
+      with
+        otherHoldingCid : ContractId StablecoinHolding
+      controller owner
+      do
+        assertMsg "Holding must be unlocked" (isNone lock)
+        other <- fetch otherHoldingCid
+        assertMsg "Holdings must share the same instrument" (other.instrumentId == instrumentId)
+        assertMsg "Holdings must share the same owner" (other.owner == owner)
+        assertMsg "Other holding must be unlocked" (isNone other.lock)
+        archive otherHoldingCid
+        create this with amount = amount + other.amount
+
+    interface instance Holding for StablecoinHolding where
+      view = HoldingView with
+        owner
+        instrumentId
+        amount
+        lock
+        meta = emptyMetadata

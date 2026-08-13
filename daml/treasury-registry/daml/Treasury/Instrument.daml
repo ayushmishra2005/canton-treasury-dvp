@@ -1,0 +1,29 @@
+module Treasury.Instrument where
+
+import Splice.Api.Token.HoldingV1
+
+import Treasury.Holding
+
+template TreasuryInstrument
+  with
+    treasuryRegistry : Party
+    id : Text
+    description : Text
+    faceValue : Decimal
+    maturityDate : Date
+  where
+    signatory treasuryRegistry
+
+    ensure id /= "" && faceValue > 0.0
+
+    nonconsuming choice Issue : ContractId TreasuryHolding
+      with
+        owner : Party
+        amount : Decimal
+      controller treasuryRegistry
+      do
+        create TreasuryHolding with
+          instrumentId = InstrumentId with admin = treasuryRegistry, id
+          owner
+          amount
+          lock = None

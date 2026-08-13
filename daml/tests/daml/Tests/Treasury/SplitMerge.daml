@@ -1,0 +1,105 @@
+module Tests.Treasury.SplitMerge where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1
+
+import Treasury.Holding
+import Treasury.Instrument
+
+setup : Script (Party, Party, ContractId TreasuryInstrument)
+setup = do
+  treasuryRegistry <- allocateParty "TreasuryRegistry"
+  seller <- allocateParty "Seller"
+  instrumentCid <- submit treasuryRegistry $ createCmd TreasuryInstrument with
+    treasuryRegistry
+    id = "UST-2028-11"
+    description = "US Treasury Note 1.5% due 2028-11-15"
+    faceValue = 1000.0
+    maturityDate = date 2028 Nov 15
+  pure (treasuryRegistry, seller, instrumentCid)
+
+issue : Party -> ContractId TreasuryInstrument -> Party -> Decimal -> Script (ContractId TreasuryHolding)
+issue treasuryRegistry instrumentCid owner amount =
+  submit treasuryRegistry $ exerciseCmd instrumentCid Issue with owner, amount
+
+ownedAmount : Party -> Script Decimal
+ownedAmount owner = do
+  holdings <- queryInterface @Holding owner
+  pure $ sum [holdingView.amount | (_, Some holdingView) <- holdings]
+
+ownerSplitsHolding : Script ()
+ownerSplitsHolding = do
+  (treasuryRegistry, seller, instrumentCid) <- setup
+  holdingCid <- issue treasuryRegistry instrumentCid seller 100.0
+  (splitCid, remainderCid) <- submit seller $ exerciseCmd holdingCid Split with splitAmount = 40.0
+  Some split <- queryContractId seller splitCid
+  Some remainder <- queryContractId seller remainderCid
+  split.amount === 40.0
+  remainder.amount === 60.0
+  split.owner === seller
+  remainder.owner === seller
+  originalHolding <- queryContractId seller holdingCid
+  originalHolding === None
+
+splitConservesAmount : Script ()
+splitConservesAmount = do
+  (treasuryRegistry, seller, instrumentCid) <- setup
+  holdingCid <- issue treasuryRegistry instrumentCid seller 100.0
+  _ <- submit seller $ exerciseCmd holdingCid Split with splitAmount = 40.0
+  total <- ownedAmount seller
+  total === 100.0
+
+splitRejectsAmountOutsideHolding : Script ()
+splitRejectsAmountOutsideHolding = do
+  (treasuryRegistry, seller, instrumentCid) <- setup
+  holdingCid <- issue treasuryRegistry instrumentCid seller 100.0
+  submitMustFail seller $ exerciseCmd holdingCid Split with splitAmount = 0.0
+  submitMustFail seller $ exerciseCmd holdingCid Split with splitAmount = -10.0
+  submitMustFail seller $ exerciseCmd holdingCid Split with splitAmount = 100.0
+  submitMustFail seller $ exerciseCmd holdingCid Split with splitAmount = 150.0
+
+ownerMergesHoldings : Script ()
+ownerMergesHoldings = do
+  (treasuryRegistry, seller, instrumentCid) <- setup
+  firstCid <- issue treasuryRegistry instrumentCid seller 40.0
+  secondCid <- issue treasuryRegistry instrumentCid seller 60.0
+  mergedCid <- submit seller $ exerciseCmd firstCid Merge with otherHoldingCid = secondCid
+  Some merged <- queryContractId seller mergedCid
+  merged.amount === 100.0
+  merged.owner === seller
+  holdings <- queryInterface @Holding seller
+  map fst holdings === [toInterfaceContractId @Holding mergedCid]
+
+mergeConservesAmount : Script ()
+mergeConservesAmount = do
+  (treasuryRegistry, seller, instrumentCid) <- setup
+  firstCid <- issue treasuryRegistry instrumentCid seller 40.0
+  secondCid <- issue treasuryRegistry instrumentCid seller 60.0
+  _ <- submit seller $ exerciseCmd firstCid Merge with otherHoldingCid = secondCid
+  total <- ownedAmount seller
+  total === 100.0
+
+mergeRejectsDifferentOwners : Script ()
+mergeRejectsDifferentOwners = do
+  (treasuryRegistry, seller, instrumentCid) <- setup
+  buyer <- allocateParty "Buyer"
+  sellerHoldingCid <- issue treasuryRegistry instrumentCid seller 40.0
+  buyerHoldingCid <- issue treasuryRegistry instrumentCid buyer 60.0
+  submitMustFail (actAs seller <> readAs buyer) $
+    exerciseCmd sellerHoldingCid Merge with otherHoldingCid = buyerHoldingCid
+
+mergeRejectsDifferentInstruments : Script ()
+mergeRejectsDifferentInstruments = do
+  (treasuryRegistry, seller, instrumentCid) <- setup
+  otherInstrumentCid <- submit treasuryRegistry $ createCmd TreasuryInstrument with
+    treasuryRegistry
+    id = "UST-2030-05"
+    description = "US Treasury Note 2.0% due 2030-05-15"
+    faceValue = 1000.0
+    maturityDate = date 2030 May 15
+  firstCid <- issue treasuryRegistry instrumentCid seller 40.0
+  secondCid <- issue treasuryRegistry otherInstrumentCid seller 60.0
+  submitMustFail seller $ exerciseCmd firstCid Merge with otherHoldingCid = secondCid

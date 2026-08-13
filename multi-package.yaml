@@ -1,0 +1,3 @@
+packages:
+  - ./daml/treasury-registry
+  - ./daml/tests

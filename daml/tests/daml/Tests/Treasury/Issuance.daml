@@ -1,0 +1,75 @@
+module Tests.Treasury.Issuance where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Treasury.Instrument
+
+setup : Script (Party, Party, ContractId TreasuryInstrument)
+setup = do
+  treasuryRegistry <- allocateParty "TreasuryRegistry"
+  seller <- allocateParty "Seller"
+  instrumentCid <- submit treasuryRegistry $ createCmd TreasuryInstrument with
+    treasuryRegistry
+    id = "UST-2028-11"
+    description = "US Treasury Note 1.5% due 2028-11-15"
+    faceValue = 1000.0
+    maturityDate = date 2028 Nov 15
+  pure (treasuryRegistry, seller, instrumentCid)
+
+registryCreatesTreasuryInstrument : Script ()
+registryCreatesTreasuryInstrument = do
+  (treasuryRegistry, _, instrumentCid) <- setup
+  Some instrument <- queryContractId treasuryRegistry instrumentCid
+  instrument.treasuryRegistry === treasuryRegistry
+  instrument.id === "UST-2028-11"
+  instrument.faceValue === 1000.0
+  instrument.maturityDate === date 2028 Nov 15
+
+registryIssuesHoldingToOwner : Script ()
+registryIssuesHoldingToOwner = do
+  (treasuryRegistry, seller, instrumentCid) <- setup
+  holdingCid <- submit treasuryRegistry $ exerciseCmd instrumentCid Issue with
+    owner = seller
+    amount = 100.0
+  Some holding <- queryContractId seller holdingCid
+  holding.owner === seller
+  holding.amount === 100.0
+  holding.lock === None
+  holding.instrumentId === InstrumentId with admin = treasuryRegistry, id = "UST-2028-11"
+
+nonRegistryCannotIssueHolding : Script ()
+nonRegistryCannotIssueHolding = do
+  (treasuryRegistry, seller, instrumentCid) <- setup
+  submitMustFail (actAs seller <> readAs treasuryRegistry) $
+    exerciseCmd instrumentCid Issue with
+      owner = seller
+      amount = 100.0
+
+ownerQueriesHoldingThroughInterface : Script ()
+ownerQueriesHoldingThroughInterface = do
+  (treasuryRegistry, seller, instrumentCid) <- setup
+  holdingCid <- submit treasuryRegistry $ exerciseCmd instrumentCid Issue with
+    owner = seller
+    amount = 100.0
+  holdings <- queryInterface @Holding seller
+  map fst holdings === [toInterfaceContractId @Holding holdingCid]
+
+holdingViewExposesStandardFields : Script ()
+holdingViewExposesStandardFields = do
+  (treasuryRegistry, seller, instrumentCid) <- setup
+  holdingCid <- submit treasuryRegistry $ exerciseCmd instrumentCid Issue with
+    owner = seller
+    amount = 100.0
+  Some holdingView <-
+    queryInterfaceContractId @Holding seller (toInterfaceContractId @Holding holdingCid)
+  holdingView === HoldingView with
+    owner = seller
+    instrumentId = InstrumentId with admin = treasuryRegistry, id = "UST-2028-11"
+    amount = 100.0
+    lock = None
+    meta = emptyMetadata

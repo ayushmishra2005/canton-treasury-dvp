@@ -1,0 +1,96 @@
+module Integration.Assets where
+
+import DA.List (sort)
+import DA.Optional (isSome)
+import DA.TextMap qualified as TextMap
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV1
+import Splice.Api.Token.AllocationRequestV1
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Dvp.Trade
+
+import Integration.Topology
+
+treasuryInstrumentName : Text
+treasuryInstrumentName = "UST-2028-11"
+
+paymentInstrumentName : Text
+paymentInstrumentName = "USD-C"
+
+deliveryQuantity : Decimal
+deliveryQuantity = 100.0
+
+paymentAmount : Decimal
+paymentAmount = 100000.0
+
+attestationReference : Text
+attestationReference = "attestation-000"
+
+treasuryInstrumentIdOf : Topology -> InstrumentId
+treasuryInstrumentIdOf topology = InstrumentId with
+  admin = topology.treasuryRegistry
+  id = treasuryInstrumentName
+
+paymentInstrumentIdOf : Topology -> InstrumentId
+paymentInstrumentIdOf topology = InstrumentId with
+  admin = topology.cashRegistry
+  id = paymentInstrumentName
+
+noExtraArgs : ExtraArgs
+noExtraArgs = ExtraArgs with
+  context = emptyChoiceContext
+  meta = emptyMetadata
+
+completedAllocation : AllocationInstructionResult -> Script (ContractId Allocation)
+completedAllocation result = case result.output of
+  AllocationInstructionResult_Completed allocationCid -> pure allocationCid
+  _ -> abort "Allocation did not complete"
+
+onlyBackingHolding : [ContractId Holding] -> Script (ContractId Holding)
+onlyBackingHolding holdingCids = case holdingCids of
+  [holdingCid] -> pure holdingCid
+  _ -> abort "Expected exactly one backing holding"
+
+legSpec : AllocationRequestView -> Text -> Script AllocationSpecification
+legSpec requestView transferLegId =
+  case TextMap.lookup transferLegId requestView.transferLegs of
+    Some transferLeg -> pure AllocationSpecification with
+      settlement = requestView.settlement
+      transferLegId
+      transferLeg
+    None -> abort ("Unknown transfer leg " <> transferLegId)
+
+requestViewAs : Party -> ContractId DvpTrade -> Script AllocationRequestView
+requestViewAs party tradeCid = do
+  Some requestView <- queryInterfaceContractId @AllocationRequest party
+    (toInterfaceContractId @AllocationRequest tradeCid)
+  pure requestView
+
+holdingSummary : Party -> Script [(Text, Decimal, Bool)]
+holdingSummary party = do
+  holdings <- queryInterface @Holding party
+  pure $ sort
+    [ (holdingView.instrumentId.id, holdingView.amount, isSome holdingView.lock)
+    | (_, Some holdingView) <- holdings
+    ]
+
+instrumentTotal : Party -> Script Decimal
+instrumentTotal admin = do
+  holdings <- queryInterface @Holding admin
+  pure (sum [holdingView.amount | (_, Some holdingView) <- holdings])
+
+disclosureOf : Template t => Party -> ContractId t -> Script Disclosure
+disclosureOf party contractId = do
+  disclosure <- queryDisclosure party contractId
+  case disclosure of
+    Some found -> pure found
+    None -> abort "Expected a disclosure for an already visible contract"
+
+onlyContract : Text -> [(ContractId t, t)] -> Script (ContractId t, t)
+onlyContract label contracts = case contracts of
+  [found] -> pure found
+  _ -> abort ("Expected exactly one " <> label)

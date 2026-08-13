@@ -1,59 +1,177 @@
+import com.digitalasset.canton.topology.admin.grpc.TopologyStoreId
 import java.nio.file.{Files, Paths}
 
-val synchronizerAlias = "settlement-sync"
+val settlementAlias = "settlement-sync"
+val treasuryAlias = "treasury-sync"
 
-val sequencer = sequencers.local.find(_.name == "settlement-sequencer").getOrElse(sys.error("missing sequencer"))
-val mediator = mediators.local.find(_.name == "settlement-mediator").getOrElse(sys.error("missing mediator"))
+val settlementSequencer =
+  sequencers.local.find(_.name == "settlement-sequencer").getOrElse(sys.error("missing settlement sequencer"))
+val settlementMediator =
+  mediators.local.find(_.name == "settlement-mediator").getOrElse(sys.error("missing settlement mediator"))
+val treasurySequencer =
+  sequencers.local.find(_.name == "treasury-sequencer").getOrElse(sys.error("missing treasury sequencer"))
+val treasuryMediator =
+  mediators.local.find(_.name == "treasury-mediator").getOrElse(sys.error("missing treasury mediator"))
 
 bootstrap.synchronizer(
-  synchronizerName = synchronizerAlias,
-  sequencers = Seq(sequencer),
-  mediators = Seq(mediator),
-  synchronizerOwners = Seq(sequencer),
+  synchronizerName = settlementAlias,
+  sequencers = Seq(settlementSequencer),
+  mediators = Seq(settlementMediator),
+  synchronizerOwners = Seq(settlementSequencer),
   synchronizerThreshold = PositiveInt.one,
   staticSynchronizerParameters =
-    StaticSynchronizerParameters.defaults(sequencer.config.crypto, ProtocolVersion.latest),
+    StaticSynchronizerParameters.defaults(settlementSequencer.config.crypto, ProtocolVersion.latest),
 )
 
-val participantNames =
-  Seq("p-treasury", "p-cash", "p-seller", "p-buyer", "p-venue", "p-outsider")
+bootstrap.synchronizer(
+  synchronizerName = treasuryAlias,
+  sequencers = Seq(treasurySequencer),
+  mediators = Seq(treasuryMediator),
+  synchronizerOwners = Seq(treasurySequencer),
+  synchronizerThreshold = PositiveInt.one,
+  staticSynchronizerParameters =
+    StaticSynchronizerParameters.defaults(treasurySequencer.config.crypto, ProtocolVersion.latest),
+)
+
+val settlementOnly = Seq("p-cash", "p-buyer", "p-venue", "p-outsider")
+val bothSynchronizers = Seq("p-treasury", "p-seller")
+val participantNames = bothSynchronizers ++ settlementOnly
 
 val hosts = participantNames.map { name =>
   participants.local.find(_.name == name).getOrElse(sys.error(s"missing participant $name"))
 }
 
-hosts.foreach(_.synchronizers.connect_local(sequencer, alias = synchronizerAlias))
-
-hosts.foreach { host =>
-  val connected = host.synchronizers.list_connected().map(_.synchronizerAlias.unwrap)
-  if (!connected.contains(synchronizerAlias))
-    sys.error(s"${host.name} is not connected to $synchronizerAlias")
-  println(s"CONNECTED ${host.name} ${connected.mkString(",")}")
+hosts.foreach(_.synchronizers.connect_local(settlementSequencer, alias = settlementAlias, priority = 10))
+bothSynchronizers.foreach { name =>
+  participants.local
+    .find(_.name == name)
+    .getOrElse(sys.error(s"missing participant $name"))
+    .synchronizers
+    .connect_local(treasurySequencer, alias = treasuryAlias, priority = 0)
 }
 
-val darPaths = Seq(
-  "daml/treasury-registry/.daml/dist/treasury-registry-0.1.0.dar",
+val expectedConnections = participantNames.map { name =>
+  name -> (if (bothSynchronizers.contains(name)) Set(settlementAlias, treasuryAlias) else Set(settlementAlias))
+}.toMap
+
+hosts.foreach { host =>
+  val connected = host.synchronizers.list_connected().map(_.synchronizerAlias.unwrap).toSet
+  if (connected != expectedConnections(host.name))
+    sys.error(s"${host.name} connected to ${connected.mkString(",")} but expected ${expectedConnections(host.name).mkString(",")}")
+  println(s"CONNECTED ${host.name} ${connected.toSeq.sorted.mkString(",")}")
+}
+
+val settlementSynchronizerId =
+  hosts.head.synchronizers.list_connected().find(_.synchronizerAlias.unwrap == settlementAlias).get.synchronizerId
+val treasurySynchronizerId =
+  hosts.head.synchronizers.list_connected().find(_.synchronizerAlias.unwrap == treasuryAlias).get.synchronizerId
+
+val treasuryDars = Seq("daml/treasury-registry/.daml/dist/treasury-registry-0.1.0.dar")
+val settlementDars = Seq(
   "daml/stablecoin-registry/.daml/dist/stablecoin-registry-0.1.0.dar",
   "daml/dvp-settlement/.daml/dist/dvp-settlement-0.1.0.dar",
   "daml/integration-control/.daml/dist/canton-treasury-dvp-integration-control-0.1.0.dar",
 )
 
-val uploaded = hosts.map { host =>
-  host.name -> darPaths.map(path => host.dars.upload(path))
+val settlementPackageIds = hosts.map { host =>
+  host.name -> (treasuryDars ++ settlementDars).map { path =>
+    host.dars.upload(path, synchronizerId = Some(settlementSynchronizerId))
+  }
 }.toMap
 
-hosts.foreach { host =>
-  val vetted = host.topology.vetted_packages
-    .list(filterParticipant = host.id.filterString)
+val treasuryPackageIds = bothSynchronizers.map { name =>
+  val host = participants.local.find(_.name == name).get
+  name -> treasuryDars.map { path =>
+    host.dars.upload(path, synchronizerId = Some(treasurySynchronizerId))
+  }
+}.toMap
+
+def vettedOn(host: com.digitalasset.canton.console.LocalParticipantReference, synchronizerId: com.digitalasset.canton.topology.SynchronizerId): Set[String] =
+  host.topology.vetted_packages
+    .list(store = Some(TopologyStoreId.Synchronizer(synchronizerId)), filterParticipant = host.id.filterString)
     .flatMap(_.item.packages.map(_.packageId.toString))
     .toSet
-  val missing = uploaded(host.name).filterNot(vetted.contains)
-  if (missing.nonEmpty) sys.error(s"${host.name} has unvetted packages ${missing.mkString(",")}")
-  println(s"VETTED ${host.name} ${uploaded(host.name).mkString(",")}")
+
+hosts.foreach { host =>
+  val vetted = vettedOn(host, settlementSynchronizerId)
+  val missing = settlementPackageIds(host.name).filterNot(vetted.contains)
+  if (missing.nonEmpty)
+    sys.error(s"${host.name} is missing settlement-side vetting on $settlementAlias: ${missing.mkString(",")}")
+  println(s"VETTED ${host.name} $settlementAlias packages=${settlementPackageIds(host.name).size}")
+}
+
+bothSynchronizers.foreach { name =>
+  val host = participants.local.find(_.name == name).get
+  val vetted = vettedOn(host, treasurySynchronizerId)
+  val missing = treasuryPackageIds(name).filterNot(vetted.contains)
+  if (missing.nonEmpty)
+    sys.error(s"$name is missing treasury package vetting on $treasuryAlias: ${missing.mkString(",")}")
+  println(s"VETTED $name $treasuryAlias packages=${treasuryPackageIds(name).size}")
+}
+
+val partyPlacement = Seq(
+  ("treasuryRegistry", "p-treasury"),
+  ("cashRegistry", "p-cash"),
+  ("seller", "p-seller"),
+  ("buyer", "p-buyer"),
+  ("venue", "p-venue"),
+  ("outsider", "p-outsider"),
+)
+
+val allocatedParties = partyPlacement.map { case (name, participantName) =>
+  val host = participants.local.find(_.name == participantName).get
+  val partyId = host.parties.enable(name, synchronizer = Some(SynchronizerAlias.tryCreate(settlementAlias)))
+  if (bothSynchronizers.contains(participantName))
+    host.parties.enable(name, synchronizer = Some(SynchronizerAlias.tryCreate(treasuryAlias)))
+  println(s"PARTY $name $participantName ${partyId.toProtoPrimitive}")
+  (name, participantName, partyId)
+}
+
+partyPlacement.foreach { case (name, participantName) =>
+  val partyId = allocatedParties.find(_._1 == name).get._3
+  hosts.foreach { host =>
+    val hostsParty = host.parties.hosted(filterParty = partyId.filterString).nonEmpty
+    if (host.name == participantName && !hostsParty)
+      sys.error(s"$name is not hosted on $participantName")
+    if (host.name != participantName && hostsParty)
+      sys.error(s"$name must not be hosted on ${host.name}")
+  }
+  println(s"HOSTED_EXCLUSIVELY $name $participantName")
 }
 
 val runDir = Paths.get(sys.env.getOrElse("CANTON_RUN_DIR", "canton/.run"))
 Files.createDirectories(runDir)
+
+val participantEntries = participantNames.map { name =>
+  val host = participants.local.find(_.name == name).get
+  s""""$name": { "host": "127.0.0.1", "port": ${host.config.ledgerApi.port.unwrap} }"""
+}
+val partyEntries = allocatedParties.map { case (_, participantName, partyId) =>
+  s""""${partyId.toProtoPrimitive}": "$participantName""""
+}
+val defaultPort = participants.local.find(_.name == "p-treasury").get.config.ledgerApi.port.unwrap
+Files.write(
+  runDir.resolve("participants.json"),
+  s"""{
+     |  "default_participant": { "host": "127.0.0.1", "port": $defaultPort },
+     |  "participants": {
+     |    ${participantEntries.mkString(",\n    ")}
+     |  },
+     |  "party_participants": {
+     |    ${partyEntries.mkString(",\n    ")}
+     |  }
+     |}""".stripMargin.getBytes("UTF-8"),
+)
+
+Files.write(
+  runDir.resolve("synchronizers.txt"),
+  Seq(
+    s"$settlementAlias=${settlementSynchronizerId.toProtoPrimitive}",
+    s"$treasuryAlias=${treasurySynchronizerId.toProtoPrimitive}",
+  ).mkString("\n").getBytes("UTF-8"),
+)
+println(s"SYNCHRONIZER $settlementAlias ${settlementSynchronizerId.toProtoPrimitive}")
+println(s"SYNCHRONIZER $treasuryAlias ${treasurySynchronizerId.toProtoPrimitive}")
 
 val checkpoints = hosts.map(host => s"${host.name}=${host.ledger_api.state.end()}")
 Files.write(runDir.resolve("checkpoints.txt"), checkpoints.mkString("\n").getBytes("UTF-8"))

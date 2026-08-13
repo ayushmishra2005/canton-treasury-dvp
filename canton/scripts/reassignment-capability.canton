@@ -1,0 +1,53 @@
+import com.digitalasset.canton.topology.SynchronizerId
+import com.digitalasset.canton.topology.transaction.SynchronizerTrustCertificate
+
+val settlementAlias = "settlement-sync"
+val treasuryAlias = "treasury-sync"
+val multiSynchronizer = SynchronizerTrustCertificate.ParticipantTopologyFeatureFlag.EnableMultiSynchronizer
+
+val requested = sys.env.getOrElse("REASSIGNMENT_CAPABILITY", "")
+val granted = requested match {
+  case "granted" => true
+  case "revoked" => false
+  case other => sys.error(s"REASSIGNMENT_CAPABILITY must be granted or revoked but was '$other'")
+}
+
+val reassigningParticipants = Seq("p-treasury", "p-seller")
+
+val pTreasury = participants.remote.find(_.name == "p-treasury").getOrElse(sys.error("missing p-treasury"))
+
+def synchronizerIdOf(alias: String): SynchronizerId =
+  pTreasury.synchronizers
+    .list_connected()
+    .find(_.synchronizerAlias.unwrap == alias)
+    .getOrElse(sys.error(s"p-treasury is not connected to $alias"))
+    .synchronizerId
+
+val synchronizerIds =
+  Seq(treasuryAlias -> synchronizerIdOf(treasuryAlias), settlementAlias -> synchronizerIdOf(settlementAlias))
+
+def eventually(label: String)(condition: => Boolean): Unit = {
+  val deadline = System.currentTimeMillis() + 60000
+  while (!condition && System.currentTimeMillis() < deadline) Thread.sleep(250)
+  if (!condition) sys.error(s"timed out waiting for $label")
+}
+
+reassigningParticipants.foreach { name =>
+  val host = participants.remote.find(_.name == name).getOrElse(sys.error(s"missing $name"))
+  synchronizerIds.foreach { case (alias, synchronizerId) =>
+    host.topology.synchronizer_trust_certificates.propose(
+      participantId = host.id,
+      synchronizerId = synchronizerId,
+      featureFlags = if (granted) Seq(multiSynchronizer) else Seq.empty,
+    )
+    eventually(s"$name multi-synchronizer support on $alias to become $requested") {
+      host.topology.synchronizer_trust_certificates
+        .list(filterUid = host.id.filterString)
+        .filter(_.item.synchronizerId == synchronizerId)
+        .exists(_.item.featureFlags.contains(multiSynchronizer)) == granted
+    }
+    println(s"REASSIGNMENT_CAPABILITY_$requested $name $alias")
+  }
+}
+
+println(s"REASSIGNMENT_CAPABILITY $requested")

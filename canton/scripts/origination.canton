@@ -1,0 +1,175 @@
+import com.daml.ledger.api.v2.commands.{Command, CreateCommand, ExerciseCommand}
+import com.daml.ledger.api.v2.value.{Identifier, Record, RecordField, Value}
+import com.digitalasset.canton.console.CommandFailure
+import java.nio.file.{Files, Paths}
+import java.time.LocalDate
+
+val settlementAlias = "settlement-sync"
+val treasuryAlias = "treasury-sync"
+
+val pTreasury = participants.remote.find(_.name == "p-treasury").getOrElse(sys.error("missing p-treasury"))
+val pSeller = participants.remote.find(_.name == "p-seller").getOrElse(sys.error("missing p-seller"))
+
+def synchronizerIdOf(alias: String) =
+  pTreasury.synchronizers
+    .list_connected()
+    .find(_.synchronizerAlias.unwrap == alias)
+    .getOrElse(sys.error(s"p-treasury is not connected to $alias"))
+    .synchronizerId
+
+val treasurySynchronizerId = synchronizerIdOf(treasuryAlias)
+val settlementSynchronizerId = synchronizerIdOf(settlementAlias)
+
+def partyOf(node: com.digitalasset.canton.console.RemoteParticipantReference, hint: String) =
+  node.parties
+    .hosted()
+    .map(_.party)
+    .find(_.filterString.startsWith(hint + "::"))
+    .getOrElse(sys.error(s"party $hint is not hosted on ${node.name}"))
+
+val treasuryRegistry = partyOf(pTreasury, "treasuryRegistry")
+val seller = partyOf(pSeller, "seller")
+
+val instrumentTemplate = Identifier("#treasury-registry", "Treasury.Instrument", "TreasuryInstrument")
+val holdingTemplate = Identifier("#treasury-registry", "Treasury.Holding", "TreasuryHolding")
+
+def partyValue(party: com.digitalasset.canton.topology.PartyId) = Value(Value.Sum.Party(party.toProtoPrimitive))
+def textValue(text: String) = Value(Value.Sum.Text(text))
+def numericValue(number: String) = Value(Value.Sum.Numeric(number))
+def dateValue(day: LocalDate) = Value(Value.Sum.Date(day.toEpochDay.toInt))
+def recordValue(fields: Seq[(String, Value)]) =
+  Record(fields = fields.map { case (name, value) => RecordField(name, Some(value)) })
+
+val createInstrument = Command.defaultInstance.withCreate(
+  CreateCommand(
+    templateId = Some(instrumentTemplate),
+    createArguments = Some(
+      recordValue(
+        Seq(
+          "treasuryRegistry" -> partyValue(treasuryRegistry),
+          "id" -> textValue("UST-2028-11"),
+          "description" -> textValue("US Treasury Note 1.5% due 2028-11-15"),
+          "faceValue" -> numericValue("1000.0000000000"),
+          "maturityDate" -> dateValue(LocalDate.of(2028, 11, 15)),
+        )
+      )
+    ),
+  )
+)
+
+val instrumentTx = pTreasury.ledger_api.commands.submit(
+  actAs = Seq(treasuryRegistry),
+  commands = Seq(createInstrument),
+  synchronizerId = Some(treasurySynchronizerId),
+)
+val instrumentCid = instrumentTx.events
+  .flatMap(_.event.created)
+  .find(_.templateId.exists(_.entityName == "TreasuryInstrument"))
+  .getOrElse(sys.error("instrument was not created"))
+  .contractId
+println(s"ORIGINATION_INSTRUMENT $instrumentCid")
+
+val issueHolding = Command.defaultInstance.withExercise(
+  ExerciseCommand(
+    templateId = Some(instrumentTemplate),
+    contractId = instrumentCid,
+    choice = "Issue",
+    choiceArgument = Some(
+      Value(
+        Value.Sum.Record(
+          recordValue(Seq("owner" -> partyValue(seller), "amount" -> numericValue("100.0000000000")))
+        )
+      )
+    ),
+  )
+)
+
+val holdingTx = pTreasury.ledger_api.commands.submit(
+  actAs = Seq(treasuryRegistry),
+  commands = Seq(issueHolding),
+  synchronizerId = Some(treasurySynchronizerId),
+)
+val holdingCid = holdingTx.events
+  .flatMap(_.event.created)
+  .find(_.templateId.exists(_.entityName == "TreasuryHolding"))
+  .getOrElse(sys.error("holding was not created"))
+  .contractId
+println(s"ORIGINATION_HOLDING $holdingCid")
+
+def placementOf(
+    node: com.digitalasset.canton.console.RemoteParticipantReference,
+    party: com.digitalasset.canton.topology.PartyId,
+    contractId: String,
+): Option[String] =
+  node.ledger_api.state.acs
+    .of_party(party = party, limit = PositiveInt.tryCreate(1000))
+    .filter(_.entry.isActiveContract)
+    .find(_.contractId == contractId)
+    .flatMap(_.synchronizerId).map(_.toProtoPrimitive)
+
+def requirePlacement(
+    label: String,
+    node: com.digitalasset.canton.console.RemoteParticipantReference,
+    party: com.digitalasset.canton.topology.PartyId,
+    contractId: String,
+    expected: com.digitalasset.canton.topology.SynchronizerId,
+): Unit =
+  placementOf(node, party, contractId) match {
+    case Some(actual) if actual == expected.toProtoPrimitive =>
+      println(s"PLACEMENT $label $actual")
+    case other => sys.error(s"$label expected on ${expected.toProtoPrimitive} but found $other")
+  }
+
+requirePlacement("treasury-instrument", pTreasury, treasuryRegistry, instrumentCid, treasurySynchronizerId)
+requirePlacement("treasury-holding", pSeller, seller, holdingCid, treasurySynchronizerId)
+
+val splitOnWrongSynchronizer = Command.defaultInstance.withExercise(
+  ExerciseCommand(
+    templateId = Some(holdingTemplate),
+    contractId = holdingCid,
+    choice = "Split",
+    choiceArgument = Some(Value(Value.Sum.Record(recordValue(Seq("splitAmount" -> numericValue("10.0000000000")))))),
+  )
+)
+
+val prescribedFailure =
+  try {
+    pSeller.ledger_api.commands.submit(
+      actAs = Seq(seller),
+      commands = Seq(splitOnWrongSynchronizer),
+      synchronizerId = Some(settlementSynchronizerId),
+    )
+    None
+  } catch {
+    case failure: CommandFailure => Some(failure.getMessage)
+  }
+
+prescribedFailure match {
+  case Some(_) => println("WRONG_SYNCHRONIZER_PRESCRIPTION_REJECTED")
+  case None => sys.error("prescribing settlement-sync for a treasury-sync contract must fail")
+}
+
+requirePlacement("treasury-holding-after-rejection", pSeller, seller, holdingCid, treasurySynchronizerId)
+
+val holdingAfter = pSeller.ledger_api.state.acs
+  .of_party(party = seller, limit = PositiveInt.tryCreate(1000))
+  .filter(_.entry.isActiveContract)
+  .find(_.contractId == holdingCid)
+  .getOrElse(sys.error("treasury holding is no longer active on the source synchronizer"))
+val holdingFields = holdingAfter.event.createArguments.map(_.fields).getOrElse(Seq.empty)
+def fieldText(name: String): String =
+  holdingFields.find(_.label == name).flatMap(_.value).map(_.sum.value.toString).getOrElse("")
+if (fieldText("owner") != seller.toProtoPrimitive)
+  sys.error(s"treasury holding owner changed to ${fieldText("owner")}")
+if (BigDecimal(fieldText("amount")) != BigDecimal(100))
+  sys.error(s"treasury holding amount changed to ${fieldText("amount")}")
+println(s"ORIGINATION_HOLDING_UNCHANGED owner=${fieldText("owner")} amount=${fieldText("amount")}")
+
+val runDir = Paths.get(sys.env.getOrElse("CANTON_RUN_DIR", "canton/.run"))
+Files.createDirectories(runDir)
+Files.write(
+  runDir.resolve("origination.txt"),
+  Seq(s"instrument=$instrumentCid", s"holding=$holdingCid").mkString("\n").getBytes("UTF-8"),
+)
+
+println("ORIGINATION_COMPLETE")

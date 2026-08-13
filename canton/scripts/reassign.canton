@@ -1,0 +1,166 @@
+import com.digitalasset.canton.admin.api.client.commands.LedgerApiTypeWrappers
+import com.digitalasset.canton.admin.api.client.commands.LedgerApiTypeWrappers
+import com.digitalasset.canton.admin.api.client.commands.LedgerApiTypeWrappers.WrappedContractEntry
+import com.digitalasset.daml.lf.value.Value.ContractId
+import com.digitalasset.canton.console.RemoteParticipantReference
+import com.digitalasset.canton.topology.{PartyId, SynchronizerId}
+import java.nio.file.{Files, Paths}
+
+val settlementAlias = "settlement-sync"
+val treasuryAlias = "treasury-sync"
+
+val pTreasury = participants.remote.find(_.name == "p-treasury").getOrElse(sys.error("missing p-treasury"))
+val pSeller = participants.remote.find(_.name == "p-seller").getOrElse(sys.error("missing p-seller"))
+val pCash = participants.remote.find(_.name == "p-cash").getOrElse(sys.error("missing p-cash"))
+val pVenue = participants.remote.find(_.name == "p-venue").getOrElse(sys.error("missing p-venue"))
+
+def synchronizerIdOf(alias: String): SynchronizerId =
+  pTreasury.synchronizers
+    .list_connected()
+    .find(_.synchronizerAlias.unwrap == alias)
+    .getOrElse(sys.error(s"p-treasury is not connected to $alias"))
+    .synchronizerId
+
+val treasurySynchronizerId = synchronizerIdOf(treasuryAlias)
+val settlementSynchronizerId = synchronizerIdOf(settlementAlias)
+
+def partyOf(node: RemoteParticipantReference, hint: String): PartyId =
+  node.parties
+    .hosted()
+    .map(_.party)
+    .find(_.filterString.startsWith(hint + "::"))
+    .getOrElse(sys.error(s"party $hint is not hosted on ${node.name}"))
+
+val treasuryRegistry = partyOf(pTreasury, "treasuryRegistry")
+val cashRegistry = partyOf(pCash, "cashRegistry")
+val seller = partyOf(pSeller, "seller")
+val venue = partyOf(pVenue, "venue")
+
+def acsOf(node: RemoteParticipantReference, party: PartyId): Seq[WrappedContractEntry] =
+  node.ledger_api.state.acs.of_party(party = party, limit = PositiveInt.tryCreate(1000))
+    .filter(_.entry.isActiveContract)
+
+def templateOf(entry: WrappedContractEntry): String =
+  entry.event.templateId.map(id => s"${id.moduleName}:${id.entityName}").getOrElse("")
+
+def entriesOf(node: RemoteParticipantReference, party: PartyId, template: String): Seq[WrappedContractEntry] =
+  acsOf(node, party).filter(templateOf(_) == template)
+
+def onlyEntry(node: RemoteParticipantReference, party: PartyId, template: String): WrappedContractEntry =
+  entriesOf(node, party, template) match {
+    case Seq(entry) => entry
+    case other => sys.error(s"expected exactly one $template but found ${other.size}")
+  }
+
+def synchronizerOf(entry: WrappedContractEntry): String =
+  entry.synchronizerId.map(_.toProtoPrimitive).getOrElse("")
+
+def eventually(label: String)(condition: => Boolean): Unit = {
+  val deadline = System.currentTimeMillis() + 60000
+  while (!condition && System.currentTimeMillis() < deadline) Thread.sleep(250)
+  if (!condition) sys.error(s"timed out waiting for $label")
+}
+
+def requirePlacement(
+    label: String,
+    node: RemoteParticipantReference,
+    party: PartyId,
+    template: String,
+    expected: SynchronizerId,
+): Unit = {
+  val actual = onlyEntry(node, party, template)
+  if (synchronizerOf(actual) != expected.toProtoPrimitive)
+    sys.error(s"$label expected on ${expected.toProtoPrimitive} but found ${synchronizerOf(actual)}")
+  println(s"PLACEMENT $label ${synchronizerOf(actual)}")
+}
+
+requirePlacement("treasury-rules", pTreasury, treasuryRegistry, "Treasury.Rules:TreasuryRules", settlementSynchronizerId)
+requirePlacement("stablecoin-rules", pCash, cashRegistry, "Stablecoin.Rules:StablecoinRules", settlementSynchronizerId)
+requirePlacement("stablecoin-holding", pCash, cashRegistry, "Stablecoin.Holding:StablecoinHolding", settlementSynchronizerId)
+requirePlacement("dvp-trade", pVenue, venue, "Dvp.Trade:DvpTrade", settlementSynchronizerId)
+
+val treasuryEligibilities = entriesOf(pTreasury, treasuryRegistry, "Treasury.Eligibility:TreasuryEligibility")
+if (treasuryEligibilities.size != 2) sys.error("expected two treasury eligibility attestations")
+treasuryEligibilities.foreach { entry =>
+  if (synchronizerOf(entry) != settlementSynchronizerId.toProtoPrimitive)
+    sys.error(s"treasury eligibility is on ${synchronizerOf(entry)}")
+}
+println(s"PLACEMENT treasury-eligibility ${settlementSynchronizerId.toProtoPrimitive}")
+
+val holdingTemplate = "Treasury.Holding:TreasuryHolding"
+val sourceEntry = onlyEntry(pSeller, seller, holdingTemplate)
+if (synchronizerOf(sourceEntry) != treasurySynchronizerId.toProtoPrimitive)
+  sys.error(s"treasury holding must start on $treasuryAlias but is on ${synchronizerOf(sourceEntry)}")
+
+val holdingCid = sourceEntry.contractId
+val counterBefore = sourceEntry.reassignmentCounter
+val payloadBefore = sourceEntry.event.createArguments
+println(s"REASSIGNMENT_SOURCE_ACTIVE $holdingCid counter=$counterBefore synchronizer=${synchronizerOf(sourceEntry)}")
+
+val unassigned = pSeller.ledger_api.commands.submit_unassign(
+  submitter = seller,
+  contractIds = Seq(ContractId.assertFromString(holdingCid)),
+  source = treasurySynchronizerId,
+  target = settlementSynchronizerId,
+)
+val reassignmentId = unassigned.reassignmentId
+val unassignedCounter = unassigned.events.map(_.reassignmentCounter).headOption.getOrElse(-1L)
+println(s"REASSIGNMENT_UNASSIGNED id=$reassignmentId counter=$unassignedCounter updateId=${unassigned.updateId}")
+
+def pendingEntries(): Seq[LedgerApiTypeWrappers.WrappedIncompleteUnassigned] =
+  pSeller.ledger_api.state.acs
+    .incomplete_unassigned_of_party(party = seller, limit = PositiveInt.tryCreate(1000))
+    .filter(_.contractId == holdingCid)
+
+eventually("the treasury holding to enter pending assignment")(pendingEntries().nonEmpty)
+println(s"REASSIGNMENT_PENDING entries=${pendingEntries().size}")
+
+eventually("the treasury holding to leave the source synchronizer")(
+  acsOf(pSeller, seller).forall(_.contractId != holdingCid)
+)
+println("REASSIGNMENT_INACTIVE_ON_SOURCE")
+
+val assigned = pSeller.ledger_api.commands.submit_assign(
+  submitter = seller,
+  reassignmentId = reassignmentId,
+  source = treasurySynchronizerId,
+  target = settlementSynchronizerId,
+)
+println(s"REASSIGNMENT_ASSIGNED updateId=${assigned.updateId}")
+
+eventually("the treasury holding to become active on the target synchronizer")(
+  acsOf(pSeller, seller).exists(entry =>
+    entry.contractId == holdingCid && synchronizerOf(entry) == settlementSynchronizerId.toProtoPrimitive)
+)
+
+val targetEntry = onlyEntry(pSeller, seller, holdingTemplate)
+if (targetEntry.contractId != holdingCid)
+  sys.error(s"contract id changed from $holdingCid to ${targetEntry.contractId}")
+if (synchronizerOf(targetEntry) != settlementSynchronizerId.toProtoPrimitive)
+  sys.error(s"treasury holding is on ${synchronizerOf(targetEntry)} after assignment")
+println(s"REASSIGNMENT_TARGET_ACTIVE $holdingCid synchronizer=${synchronizerOf(targetEntry)}")
+
+if (targetEntry.event.createArguments != payloadBefore)
+  sys.error("treasury holding payload changed during reassignment")
+println("REASSIGNMENT_PAYLOAD_UNCHANGED")
+
+val counterAfter = targetEntry.reassignmentCounter
+if (counterAfter != counterBefore + 1)
+  sys.error(s"reassignment counter moved from $counterBefore to $counterAfter")
+println(s"REASSIGNMENT_COUNTER_INCREMENT before=$counterBefore after=$counterAfter")
+
+val runDir = Paths.get(sys.env.getOrElse("CANTON_RUN_DIR", "canton/.run"))
+Files.createDirectories(runDir)
+Files.write(
+  runDir.resolve("reassignment.txt"),
+  Seq(
+    s"holding=$holdingCid",
+    s"reassignmentId=$reassignmentId",
+    s"counterBefore=$counterBefore",
+    s"counterAfter=$counterAfter",
+    s"unassignUpdateId=${unassigned.updateId}",
+    s"assignUpdateId=${assigned.updateId}",
+  ).mkString("\n").getBytes("UTF-8"),
+)
+
+println("REASSIGNMENT_COMPLETE")

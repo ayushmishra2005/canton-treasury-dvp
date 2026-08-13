@@ -1,8 +1,10 @@
 import com.daml.ledger.api.v2.transaction_filter.TransactionShape
+import com.digitalasset.canton.admin.api.client.commands.LedgerApiCommands
 import com.daml.ledger.api.v2.value.Value
 import java.nio.file.{Files, Paths}
 
 val synchronizerAlias = "settlement-sync"
+val treasuryAlias = "treasury-sync"
 
 val partyHints = Seq(
   "p-treasury" -> "treasuryRegistry",
@@ -14,8 +16,9 @@ val partyHints = Seq(
 )
 
 val runDir = Paths.get(sys.env.getOrElse("CANTON_RUN_DIR", "canton/.run"))
-val checkpoints = Files
-  .readString(runDir.resolve("checkpoints.txt"))
+
+def offsetsFrom(fileName: String): Map[String, Long] = Files
+  .readString(runDir.resolve(fileName))
   .split("\n")
   .map(_.trim)
   .filter(_.nonEmpty)
@@ -24,6 +27,28 @@ val checkpoints = Files
     parts(0) -> parts(1).toLong
   }
   .toMap
+
+val checkpoints = offsetsFrom("checkpoints.txt")
+val probeStart = offsetsFrom("probe-start.txt")
+
+def propertiesFrom(fileName: String): Map[String, String] = Files
+  .readString(runDir.resolve(fileName))
+  .split("\n")
+  .map(_.trim)
+  .filter(_.nonEmpty)
+  .map { line =>
+    val parts = line.split("=", 2)
+    parts(0) -> parts(1)
+  }
+  .toMap
+
+val reassignmentFacts = propertiesFrom("reassignment.txt")
+val reassignedHoldingCid = reassignmentFacts("holding")
+val recordedReassignmentId = reassignmentFacts("reassignmentId")
+
+val synchronizerIds = propertiesFrom("synchronizers.txt")
+val settlementSynchronizerId = synchronizerIds(synchronizerAlias)
+val treasurySynchronizerId = synchronizerIds(treasuryAlias)
 
 var failures = Vector.empty[String]
 
@@ -47,11 +72,19 @@ def numerics(value: Value): Set[BigDecimal] = value.sum match {
 
 case class CreatedFact(template: String, cid: String, amounts: Set[BigDecimal], updateId: String)
 case class ExercisedFact(template: String, choice: String, cid: String, updateId: String)
+case class ReassignmentFact(
+  reassignmentId: String,
+  unassignment: Boolean,
+  source: String,
+  target: String,
+  contractIds: Set[String],
+)
 case class Projection(
   participant: String,
   party: String,
   created: Seq[CreatedFact],
   exercised: Seq[ExercisedFact],
+  reassignments: Seq[ReassignmentFact],
 )
 
 def projectionOf(participantName: String, hint: String): Projection = {
@@ -66,7 +99,7 @@ def projectionOf(participantName: String, hint: String): Projection = {
     .find(_.filterString.startsWith(hint + "::"))
     .getOrElse(sys.error(s"party $hint is not hosted on $participantName"))
   val begin = checkpoints.getOrElse(participantName, sys.error(s"no checkpoint for $participantName"))
-  val end = node.ledger_api.state.end()
+  val end = probeStart.getOrElse(participantName, sys.error(s"no probe checkpoint for $participantName"))
   val transactions = node.ledger_api.updates.transactions(
     partyIds = Set(party),
     completeAfter = PositiveInt.tryCreate(1000),
@@ -74,6 +107,32 @@ def projectionOf(participantName: String, hint: String): Projection = {
     endOffsetInclusive = Some(end),
     transactionShape = TransactionShape.TRANSACTION_SHAPE_LEDGER_EFFECTS,
   )
+  val reassignments = node.ledger_api.updates
+    .reassignments(
+      partyIds = Set(party),
+      completeAfter = PositiveInt.tryCreate(1000),
+      filterTemplates = Seq.empty,
+      beginOffsetExclusive = begin,
+      endOffsetInclusive = Some(end),
+    )
+    .map {
+      case unassigned: LedgerApiCommands.UpdateService.UnassignedWrapper =>
+        ReassignmentFact(
+          unassigned.reassignmentId,
+          true,
+          unassigned.source,
+          unassigned.target,
+          unassigned.events.map(_.contractId).toSet,
+        )
+      case assigned: LedgerApiCommands.UpdateService.AssignedWrapper =>
+        ReassignmentFact(
+          assigned.reassignmentId,
+          false,
+          assigned.source,
+          assigned.target,
+          assigned.createEvents.map(_.contractId).toSet,
+        )
+    }
   val created = transactions.flatMap { wrapper =>
     wrapper.transaction.events.flatMap(_.event.created).map { event =>
       val id = event.templateId.getOrElse(sys.error("created event without template id"))
@@ -96,7 +155,7 @@ def projectionOf(participantName: String, hint: String): Projection = {
       )
     }
   }
-  Projection(participantName, party.filterString, created, exercised)
+  Projection(participantName, party.filterString, created, exercised, reassignments)
 }
 
 val projections = partyHints.map { case (participantName, hint) =>
@@ -269,9 +328,51 @@ check("p-venue-does-not-see-the-buyer-original-stablecoin-holding",
 check("p-venue-does-not-see-the-outsider-control-contract",
   !createdTemplates("p-venue").contains("Integration.Control:ControlPing"))
 
+check("reassigned-holding-is-the-seller-original-treasury-holding",
+  reassignedHoldingCid == treasuryIssuedCid)
+
+val treasurySideParticipants = Seq("p-treasury", "p-seller")
+val settlementOnlyParticipants = Seq("p-cash", "p-buyer", "p-venue", "p-outsider")
+
+treasurySideParticipants.foreach { participant =>
+  val node = participants.remote.find(_.name == participant).get
+  val connected = node.synchronizers.list_connected().map(_.synchronizerAlias.unwrap)
+  check(s"$participant-connected-to-$treasuryAlias", connected.contains(treasuryAlias))
+
+  val facts = projections(participant).reassignments.filter(_.contractIds.contains(reassignedHoldingCid))
+  val unassignments = facts.filter(_.unassignment)
+  val assignments = facts.filterNot(_.unassignment)
+  check(s"$participant-receives-treasury-unassignment", unassignments.size == 1)
+  check(s"$participant-receives-treasury-assignment", assignments.size == 1)
+  check(s"$participant-reassignment-id-matches-the-submitted-one",
+    facts.forall(_.reassignmentId == recordedReassignmentId))
+  check(s"$participant-reassignment-moves-treasury-sync-to-settlement-sync",
+    facts.forall(fact =>
+      fact.source == treasurySynchronizerId && fact.target == settlementSynchronizerId))
+}
+
+settlementOnlyParticipants.foreach { participant =>
+  val node = participants.remote.find(_.name == participant).get
+  val connected = node.synchronizers.list_connected().map(_.synchronizerAlias.unwrap)
+  check(s"$participant-is-not-connected-to-$treasuryAlias", !connected.contains(treasuryAlias))
+  check(s"$participant-receives-no-reassignment-event",
+    projections(participant).reassignments.isEmpty)
+  check(s"$participant-never-sees-the-reassigned-treasury-holding-payload",
+    !createdCids(participant).contains(reassignedHoldingCid))
+}
+
+check("p-cash-learns-no-treasury-reassignment-history",
+  projections("p-cash").reassignments.isEmpty &&
+    !createdTemplates("p-cash").exists(_.startsWith("Treasury.")))
+check("p-outsider-sees-no-reassignment-and-no-dvp",
+  projections("p-outsider").reassignments.isEmpty &&
+    createdTemplates("p-outsider") == Set("Integration.Control:ControlPing"))
+
 println(s"PRIVACY_SETTLEMENT_UPDATE_ID $settlementUpdateId")
+println(s"PRIVACY_REASSIGNED_HOLDING $reassignedHoldingCid")
+println(s"PRIVACY_REASSIGNMENT_ID $recordedReassignmentId")
 projections.toSeq.sortBy(_._1).foreach { case (name, projection) =>
-  println(s"PRIVACY_PROJECTION $name party=${projection.party} created=${projection.created.size} exercised=${projection.exercised.size}")
+  println(s"PRIVACY_PROJECTION $name party=${projection.party} created=${projection.created.size} exercised=${projection.exercised.size} reassignments=${projection.reassignments.size}")
 }
 
 if (failures.nonEmpty) sys.error(s"privacy assertions failed: ${failures.mkString(", ")}")

@@ -1,6 +1,8 @@
 module Integration.Topology where
 
 import DA.Foldable (forA_)
+import DA.List (sortOn)
+import DA.Text qualified as Text
 import Daml.Script
 
 data Topology = Topology with
@@ -41,6 +43,29 @@ allocateTopology = do
   buyer <- allocateOn "buyer" buyerParticipant
   venue <- allocateOn "venue" venueParticipant
   outsider <- allocateOn "outsider" outsiderParticipant
+  pure Topology with ..
+
+lookupOn : Text -> Text -> Script Party
+lookupOn hint participant = do
+  known <- listKnownPartiesOn (ParticipantName participant)
+  let matches =
+        [ details.party
+        | details <- known
+        , details.isLocal
+        , Text.isPrefixOf (hint <> "::") (partyToText details.party)
+        ]
+  case sortOn partyToText matches of
+    [party] -> pure party
+    _ -> abort ("Expected exactly one party " <> hint <> " hosted on " <> participant)
+
+lookupTopology : Script Topology
+lookupTopology = do
+  treasuryRegistry <- lookupOn "treasuryRegistry" treasuryParticipant
+  cashRegistry <- lookupOn "cashRegistry" cashParticipant
+  seller <- lookupOn "seller" sellerParticipant
+  buyer <- lookupOn "buyer" buyerParticipant
+  venue <- lookupOn "venue" venueParticipant
+  outsider <- lookupOn "outsider" outsiderParticipant
   pure Topology with ..
 
 hostingMap : Topology -> [(Text, Party)]

@@ -29,8 +29,8 @@ That combination is what Canton provides and what a single shared global ledger 
 
 ## The atomic DvP invariant
 
-> Either the buyer receives the Treasury units **and** the seller receives the stablecoins, or
-> neither transfer happens and every input remains exactly as it was.
+> There must never be a committed final state in which the buyer paid without receiving the Treasury
+> asset, or the seller delivered the Treasury asset without receiving payment.
 
 There is no intermediate state in which one leg has settled and the other has not, and no window in
 which a party is exposed to the other side's performance. Both legs execute as consequences of a
@@ -232,10 +232,15 @@ The atomic unit is **one Daml transaction on one synchronizer**. `DvpTrade_Settl
 legs and executes both `Allocation_ExecuteTransfer` choices as consequences of that single choice.
 Canton commits or rejects the whole transaction.
 
-**Reassignment is outside this boundary.** Moving a contract between synchronizers is a separate
-Canton protocol step that happens *before* settlement, never inside the settlement transaction. An
-atomic trade cannot span two synchronizers in one transaction; the inputs must first be brought onto
-a common synchronizer, and only then can they be settled atomically.
+**Reassignment is outside this boundary.**
+
+> Reassignment is a separate, non-atomic, value-neutral preparation step. Atomicity begins only when
+> both allocations are available on `settlement-sync` and `DvpTrade_Settle` executes both transfer
+> legs in one Daml transaction.
+
+An atomic trade cannot span two synchronizers in one transaction, and the two synchronizers never
+jointly execute anything. The inputs must first be brought onto a common synchronizer, and only then
+can they be settled atomically.
 
 This is why the two steps must not be confused. Reassignment is non-atomic and moves no value;
 settlement is atomic and moves all of it. By the time `DvpTrade_Settle` runs, every input is
@@ -255,10 +260,14 @@ nothing.
 ## Repository structure
 
 ```
+Makefile                       build, test, lint, validate, integration, verify, clean
+docs/
+  architecture.md              packages, placement, reassignment and allocation sequences
+  privacy.md                   visibility matrix and what the privacy tests do and do not prove
+  testing.md                   every test level and the command that runs it
 canton/
   settlement-topology.conf     node definitions for both synchronizers and six participants
   remote-console.conf          remote console handles used by the console phases
-  participants.json            Daml Script participant mapping
   run-integration.sh           one-command integration run
   scripts/
     bootstrap.canton           both synchronizers, connections, parties, per-synchronizer vetting
@@ -276,6 +285,7 @@ daml/
   integration/                 multi-participant scenario, split into pre- and post-reassignment
   integration-control/         test-only control template for stream verification
 lib/                           vendored Canton Token Standard V1 DARs
+  CHECKSUMS.sha256             pinned digests of the vendored DARs
 ```
 
 ## Prerequisites
@@ -283,29 +293,52 @@ lib/                           vendored Canton Token Standard V1 DARs
 - Daml SDK 3.5.5 via `dpm`, with `dpm` on `PATH`
 - JDK 21
 - The Canton runtime, which `dpm` installs under `~/.dpm/cache/components/canton-open-source`
+- `make` and a POSIX shell, for the one-command entry points
 
 No database, container runtime, or authentication service is required. All nodes use in-memory
 storage.
 
-## Build
+## Quick start
+
+Everything the project claims is checked by one command:
 
 ```bash
-dpm build --all
+make verify
 ```
+
+It builds every package, runs the 194 Daml Script tests, lints every module, validates every DAR and
+checks the vendored Token Standard DARs against their pinned digests, runs the full two-synchronizer
+integration suite, and checks whitespace. It takes roughly three minutes from a clean checkout, needs no database or container
+runtime, and leaves no process running.
+
+Individual targets:
+
+| Command | What it does |
+|---|---|
+| `make help` | list the targets (default) |
+| `make build` | `dpm build --all` across `multi-package.yaml` |
+| `make test` | the 194 Daml Script tests, failing if the count changes |
+| `make lint` | `damlc lint` over every module in every package |
+| `make validate` | validate every project DAR, and validate and digest-check the vendored DARs |
+| `make integration` | the two-synchronizer Canton suite |
+| `make clean` | remove `.daml` build output, `canton/.run`, and `log` |
+
+`make clean` deletes only generated artifacts. Source, configuration, documentation, and the
+vendored DARs under `lib/` are never touched, and `make verify` regenerates everything it needs.
 
 ## Daml Script tests
 
 The unit suite runs on the in-memory ledger and needs no Canton node:
 
 ```bash
-cd daml/tests && dpm test
+make test
 ```
 
 Expected: **194 tests pass**. These cover holdings, mint and burn, eligibility, allocation
 lifecycle, exact-leg validation, settlement-reference isolation, and the no-partial-settlement
 invariant.
 
-## M6 integration test
+## Integration test
 
 The integration test starts both synchronizers, originates Treasury assets on `treasury-sync`,
 proves the holding cannot be used on `settlement-sync` before it is moved, reassigns it explicitly,
@@ -313,8 +346,7 @@ settles the trade atomically, exercises the pending-assignment scenario, and ver
 each participant's update stream:
 
 ```bash
-dpm build --all
-./canton/run-integration.sh
+make integration
 ```
 
 The run refuses to start if any of the eighteen required ports is already bound, waits
@@ -408,9 +440,30 @@ is accepted, the unassignment or assignment does not produce the expected reassi
 or payload, a pending contract is usable or lost, final holdings are wrong, any participant
 observes data it should not, or any Canton process or port survives shutdown.
 
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `dpm not found on PATH` | The Daml toolchain is not installed or its `bin` directory is not exported. Install the SDK and add `~/.dpm/bin` to `PATH`. |
+| `java not found on PATH` | Canton needs a JDK. Install JDK 21 and put `java` on `PATH`. |
+| `canton runtime not found under ...` | The Canton component has not been fetched yet. Run `make build` once; `dpm` downloads it into `~/.dpm/cache/components/canton-open-source`. |
+| `ports already in use: 5001 ...` | Another process holds a topology port, usually a Canton node from an interrupted run. Stop it, then re-run. The suite refuses to start rather than attach to a foreign node. |
+| Stale runtime state, or a run that behaves unlike a fresh checkout | `make clean` removes `.daml`, `canton/.run`, and `log`, after which `make verify` rebuilds everything. All nodes are in-memory, so there is no database to reset. |
+| `expected 194 passing Daml Script tests but counted ...` | A test module failed to load or was not compiled. Run `make build` and read the `dpm test` output. |
+| A `CHECKSUMS.sha256` mismatch | A vendored Token Standard DAR under `lib/` was modified or replaced. Restore it from the Splice `v0.6.14` bundle; the digests are pinned deliberately. |
+
+## Further documentation
+
+- [docs/architecture.md](docs/architecture.md): package boundaries, party and participant mapping,
+  contract placement, the reassignment and allocation sequences, and failure behavior.
+- [docs/privacy.md](docs/privacy.md): the visibility matrix, the difference between the five
+  mechanisms that decide who sees what, and what the privacy tests do and do not prove.
+- [docs/testing.md](docs/testing.md): every test level, what each one establishes, and the command
+  that runs it.
+
 ## Status
 
-**Complete through M6.**
+**Complete.**
 
 - M1: Treasury instrument and standard-compatible holdings
 - M2: independently governed stablecoin package with registry-controlled mint and burn
@@ -420,10 +473,8 @@ observes data it should not, or any Canton process or port survives shutdown.
 - M6: a second synchronizer (`treasury-sync`), Treasury origination there, explicit unassign and
   assign onto `settlement-sync` before allocation, wrong-synchronizer and pending-assignment
   scenarios, and reassignment privacy
-
-**Remaining:**
-
-- **M7**: final reproducibility and documentation polish.
+- M7: one-command verification, pinned vendored DAR digests, reproducibility from a clean checkout,
+  and finalized documentation
 
 ## Non-goals
 

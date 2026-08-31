@@ -2,6 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::canton_history::{connect_canton_history, parse_canton_history_facts};
+
 pub struct CantonClient {
     dar: PathBuf,
     participants: PathBuf,
@@ -114,7 +116,25 @@ impl CantonClient {
                     return Err(anyhow!("Canton ledger evidence cannot be read: {err}"));
                 }
                 if text.contains("CANTON_VERIFY_FAIL") || text.contains("missing") {
-                    return Ok(parse_canton_ledger_evidence(&format!("{acs}\n{text}")));
+                    let facts = parse_canton_history_facts(&text).unwrap_or_default();
+                    if !facts.is_empty() {
+                        return match connect_canton_history(&facts, expected) {
+                            Ok(evidence) => Ok(evidence),
+                            Err(connect_err) => {
+                                let connect_text = connect_err.to_string();
+                                if connect_text.contains("another operation")
+                                    || connect_text.contains("not connected")
+                                {
+                                    Err(anyhow!(
+                                        "Canton ledger evidence belongs to another operation"
+                                    ))
+                                } else {
+                                    Ok(CantonLedgerEvidence::default())
+                                }
+                            }
+                        };
+                    }
+                    return Ok(CantonLedgerEvidence::default());
                 }
                 return Err(anyhow!("Canton ledger evidence cannot be read: {err}"));
             }
@@ -129,7 +149,28 @@ impl CantonClient {
                 "Canton ledger evidence belongs to another operation"
             ));
         }
-        Ok(parse_canton_ledger_evidence(&combined))
+        let facts = parse_canton_history_facts(&combined)?;
+        if facts.is_empty() {
+            if combined.contains("CANTON_VERIFY_FAIL") || combined.contains("missing") {
+                return Ok(CantonLedgerEvidence::default());
+            }
+            return Err(anyhow!("Canton ledger evidence cannot be read"));
+        }
+        match connect_canton_history(&facts, expected) {
+            Ok(evidence) => Ok(evidence),
+            Err(err) => {
+                let text = err.to_string();
+                if text.contains("another operation") || text.contains("not connected") {
+                    return Err(anyhow!(
+                        "Canton ledger evidence belongs to another operation"
+                    ));
+                }
+                if text.contains("cannot be read") {
+                    return Err(anyhow!("Canton ledger evidence cannot be read: {err}"));
+                }
+                Ok(CantonLedgerEvidence::default())
+            }
+        }
     }
 
     pub fn redeem(
@@ -292,6 +333,16 @@ pub struct CantonLedgerEvidence {
     pub instrument_id: String,
     pub settle_seen: bool,
     pub redeem_seen: bool,
+    pub payment_allocation: String,
+    pub payment_locked: String,
+    pub allocate_update: String,
+    pub settle_update: String,
+    pub redeem_update: String,
+    pub buyer: String,
+    pub seller: String,
+    pub payment_admin: String,
+    pub treasury_instrument: String,
+    pub treasury_admin: String,
 }
 
 pub fn require_canton_ledger_evidence(
@@ -319,6 +370,16 @@ pub fn require_canton_ledger_evidence(
         || evidence.seller_payment.is_empty()
         || evidence.redeemed_lock.is_empty()
         || evidence.payout_destination.is_empty()
+        || evidence.payment_allocation.is_empty()
+        || evidence.payment_locked.is_empty()
+        || evidence.allocate_update.is_empty()
+        || evidence.settle_update.is_empty()
+        || evidence.redeem_update.is_empty()
+        || evidence.buyer.is_empty()
+        || evidence.seller.is_empty()
+        || evidence.payment_admin.is_empty()
+        || evidence.treasury_instrument.is_empty()
+        || evidence.treasury_admin.is_empty()
         || !evidence.mint_consumed
         || !evidence.seller_burned
         || !evidence.settle_seen
@@ -342,7 +403,11 @@ pub fn require_canton_ledger_evidence(
     if !canton_amounts_match(&evidence.treasury_amount, &expected.treasury_amount) {
         return Err(anyhow!("Canton Treasury amount does not match"));
     }
-    if evidence.instrument_id != "USD-C" {
+    if evidence.instrument_id != "USD-C"
+        || evidence.treasury_instrument != "UST-2028-11"
+        || evidence.payment_admin.is_empty()
+        || evidence.treasury_admin.is_empty()
+    {
         return Err(anyhow!("Canton instrument does not match"));
     }
     Ok(evidence)
@@ -377,6 +442,7 @@ fn decimal_to_base6(raw: &str) -> Option<u128> {
         .checked_add(frac.parse().ok()?)
 }
 
+#[cfg(test)]
 fn parse_canton_ledger_evidence(stdout: &str) -> CantonLedgerEvidence {
     CantonLedgerEvidence {
         lock_id: optional_marker(stdout, "CANTON_HISTORY_LOCK")
@@ -409,6 +475,24 @@ fn parse_canton_ledger_evidence(stdout: &str) -> CantonLedgerEvidence {
         redeem_seen: optional_marker(stdout, "CANTON_HISTORY_REDEEM")
             .or_else(|| optional_marker(stdout, "CANTON_ACS_REDEEM"))
             .is_some(),
+        payment_allocation: optional_marker(stdout, "CANTON_HISTORY_PAYMENT_ALLOCATION")
+            .unwrap_or_default(),
+        payment_locked: optional_marker(stdout, "CANTON_HISTORY_PAYMENT_LOCKED")
+            .unwrap_or_default(),
+        allocate_update: optional_marker(stdout, "CANTON_HISTORY_ALLOCATE").unwrap_or_default(),
+        settle_update: optional_marker(stdout, "CANTON_HISTORY_SETTLE").unwrap_or_default(),
+        redeem_update: optional_marker(stdout, "CANTON_HISTORY_REDEEM_UPDATE").unwrap_or_default(),
+        buyer: optional_marker(stdout, "CANTON_HISTORY_BUYER")
+            .or_else(|| optional_marker(stdout, "CANTON_ACS_BUYER"))
+            .unwrap_or_default(),
+        seller: optional_marker(stdout, "CANTON_HISTORY_SELLER")
+            .or_else(|| optional_marker(stdout, "CANTON_ACS_SELLER"))
+            .unwrap_or_default(),
+        payment_admin: optional_marker(stdout, "CANTON_HISTORY_PAYMENT_ADMIN").unwrap_or_default(),
+        treasury_instrument: optional_marker(stdout, "CANTON_HISTORY_TREASURY_INSTRUMENT")
+            .unwrap_or_default(),
+        treasury_admin: optional_marker(stdout, "CANTON_HISTORY_TREASURY_ADMIN")
+            .unwrap_or_default(),
     }
 }
 
@@ -558,6 +642,16 @@ mod tests {
             instrument_id: "USD-C".to_string(),
             settle_seen: true,
             redeem_seen: true,
+            payment_allocation: "alloc-a".to_string(),
+            payment_locked: "locked-a".to_string(),
+            allocate_update: "upd-alloc-a".to_string(),
+            settle_update: "upd-1".to_string(),
+            redeem_update: "upd-redeem-a".to_string(),
+            buyer: "buyer::party".to_string(),
+            seller: "seller::party".to_string(),
+            payment_admin: "cashRegistry::party".to_string(),
+            treasury_instrument: "UST-2028-11".to_string(),
+            treasury_admin: "treasuryRegistry::party".to_string(),
         }
     }
 
@@ -635,7 +729,7 @@ mod tests {
         assert!(!parsed.settle_seen);
         assert!(require_canton_ledger_evidence(Ok(parsed), &expected_completion()).is_err());
         let parsed = parse_canton_ledger_evidence(
-            "CANTON_HISTORY_LOCK lock-a\nCANTON_HISTORY_MINT_HOLDING holding-a\nCANTON_HISTORY_MINT_CONSUMED holding-a\nCANTON_HISTORY_SETTLE upd-1\nCANTON_HISTORY_BUYER_TREASURY treasury-a\nCANTON_HISTORY_SELLER_PAYMENT payment-a\nCANTON_HISTORY_SELLER_BURN payment-a\nCANTON_HISTORY_REDEEM redeem-a\nCANTON_HISTORY_PAYOUT dest\nCANTON_HISTORY_PAYMENT_AMOUNT 100000.000000\nCANTON_HISTORY_TREASURY_AMOUNT 100.000000\nCANTON_HISTORY_INSTRUMENT USD-C",
+            "CANTON_HISTORY_LOCK lock-a\nCANTON_HISTORY_MINT_HOLDING holding-a\nCANTON_HISTORY_MINT_CONSUMED holding-a\nCANTON_HISTORY_SETTLE upd-1\nCANTON_HISTORY_BUYER_TREASURY treasury-a\nCANTON_HISTORY_SELLER_PAYMENT payment-a\nCANTON_HISTORY_SELLER_BURN payment-a\nCANTON_HISTORY_REDEEM redeem-a\nCANTON_HISTORY_PAYOUT dest\nCANTON_HISTORY_PAYMENT_AMOUNT 100000.000000\nCANTON_HISTORY_TREASURY_AMOUNT 100.000000\nCANTON_HISTORY_INSTRUMENT USD-C\nCANTON_HISTORY_PAYMENT_ALLOCATION alloc-a\nCANTON_HISTORY_PAYMENT_LOCKED locked-a\nCANTON_HISTORY_ALLOCATE upd-alloc-a\nCANTON_HISTORY_REDEEM_UPDATE upd-redeem-a\nCANTON_HISTORY_BUYER buyer::party\nCANTON_HISTORY_SELLER seller::party\nCANTON_HISTORY_PAYMENT_ADMIN cashRegistry::party\nCANTON_HISTORY_TREASURY_INSTRUMENT UST-2028-11\nCANTON_HISTORY_TREASURY_ADMIN treasuryRegistry::party",
         );
         require_canton_ledger_evidence(Ok(parsed), &expected_completion()).unwrap();
     }

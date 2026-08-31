@@ -568,8 +568,37 @@ if journal.get("base_units") != 100_000_000_000:
 verified = re.findall(r"CANTON_VERIFY_MINT_CONSUMED (\S+)", log)
 if not verified or verified[-1] != consumed[-1] or verified[-1] != journal.get("mint_holding"):
     raise SystemExit(f"ledger verify did not consume recorded holding {journal.get('mint_holding')!r}: {verified!r}")
+allocation = re.findall(r"CANTON_VERIFY_PAYMENT_ALLOCATION (\S+)", log)
+locked = re.findall(r"CANTON_VERIFY_PAYMENT_LOCKED (\S+)", log)
+allocate_upd = re.findall(r"CANTON_VERIFY_ALLOCATE_UPDATE (\S+)", log)
+settle_upd = re.findall(r"CANTON_VERIFY_SETTLE_UPDATE (\S+)", log)
+redeem_upd = re.findall(r"CANTON_VERIFY_REDEEM_UPDATE (\S+)", log)
+treasury = re.findall(r"CANTON_VERIFY_BUYER_TREASURY (\S+)", log)
+payment = re.findall(r"CANTON_VERIFY_SELLER_PAYMENT (\S+)", log)
+instrument = re.findall(r"CANTON_VERIFY_INSTRUMENT (\S+)", log)
+payment_admin = re.findall(r"CANTON_VERIFY_PAYMENT_ADMIN (\S+)", log)
+treasury_instrument = re.findall(r"CANTON_VERIFY_TREASURY_INSTRUMENT (\S+)", log)
+treasury_admin = re.findall(r"CANTON_VERIFY_TREASURY_ADMIN (\S+)", log)
+if not allocation or not locked or allocation[-1] == verified[-1]:
+    raise SystemExit(f"payment allocation was not traced from the minted holding: {allocation!r} {locked!r}")
+if not allocate_upd or not settle_upd or allocate_upd[-1] == settle_upd[-1]:
+    raise SystemExit(f"allocation and settlement must be distinct connected updates: {allocate_upd!r} {settle_upd!r}")
+if not redeem_upd or not treasury or not payment:
+    raise SystemExit("connected settlement or redemption IDs are missing")
+if not instrument or instrument[-1] != "USD-C" or not treasury_instrument or treasury_instrument[-1] != "UST-2028-11":
+    raise SystemExit(f"connected instruments were not extracted: {instrument!r} {treasury_instrument!r}")
+if not payment_admin or not treasury_admin or "::" not in payment_admin[-1] or "::" not in treasury_admin[-1]:
+    raise SystemExit(f"connected instrument admins were not extracted: {payment_admin!r} {treasury_admin!r}")
 if log.count("CANTON_VERIFY_OK") < 2:
     raise SystemExit("completed resumes did not verify Canton from ledger history twice")
+print("CONNECTED_MINT_HOLDING " + verified[-1])
+print("CONNECTED_PAYMENT_ALLOCATION " + allocation[-1])
+print("CONNECTED_PAYMENT_LOCKED " + locked[-1])
+print("CONNECTED_ALLOCATE_UPDATE " + allocate_upd[-1])
+print("CONNECTED_SETTLE_UPDATE " + settle_upd[-1])
+print("CONNECTED_BUYER_TREASURY " + treasury[-1])
+print("CONNECTED_SELLER_PAYMENT " + payment[-1])
+print("CONNECTED_REDEEM_UPDATE " + redeem_upd[-1])
 print("LEDGER_HOLDING_FUNDED_DVP " + consumed[-1])
 print("LEDGER_JOURNAL_COMPLETE")
 PY

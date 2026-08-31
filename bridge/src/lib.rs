@@ -1,6 +1,7 @@
 pub mod attest;
 pub mod canonical;
 pub mod canton;
+pub mod canton_history;
 pub mod confidential;
 pub mod journal;
 pub mod program;

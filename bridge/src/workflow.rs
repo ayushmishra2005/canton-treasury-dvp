@@ -561,14 +561,30 @@ impl Workflow {
         println!("CANTON_VERIFY_LOCK {}", evidence.lock_id);
         println!("CANTON_VERIFY_MINT_HOLDING {}", evidence.mint_holding);
         println!("CANTON_VERIFY_MINT_CONSUMED {}", evidence.mint_holding);
+        println!(
+            "CANTON_VERIFY_PAYMENT_ALLOCATION {}",
+            evidence.payment_allocation
+        );
+        println!("CANTON_VERIFY_PAYMENT_LOCKED {}", evidence.payment_locked);
+        println!("CANTON_VERIFY_ALLOCATE_UPDATE {}", evidence.allocate_update);
+        println!("CANTON_VERIFY_SETTLE_UPDATE {}", evidence.settle_update);
         println!("CANTON_VERIFY_BUYER_TREASURY {}", evidence.buyer_treasury);
         println!("CANTON_VERIFY_SELLER_PAYMENT {}", evidence.seller_payment);
         println!("CANTON_VERIFY_SELLER_BURN {}", evidence.seller_payment);
         println!("CANTON_VERIFY_REDEEM {}", evidence.redeemed_lock);
+        println!("CANTON_VERIFY_REDEEM_UPDATE {}", evidence.redeem_update);
         println!("CANTON_VERIFY_PAYOUT {}", evidence.payout_destination);
         println!("CANTON_VERIFY_PAYMENT_AMOUNT {}", evidence.payment_amount);
         println!("CANTON_VERIFY_TREASURY_AMOUNT {}", evidence.treasury_amount);
         println!("CANTON_VERIFY_INSTRUMENT {}", evidence.instrument_id);
+        println!("CANTON_VERIFY_PAYMENT_ADMIN {}", evidence.payment_admin);
+        println!(
+            "CANTON_VERIFY_TREASURY_INSTRUMENT {}",
+            evidence.treasury_instrument
+        );
+        println!("CANTON_VERIFY_TREASURY_ADMIN {}", evidence.treasury_admin);
+        println!("CANTON_VERIFY_BUYER {}", evidence.buyer);
+        println!("CANTON_VERIFY_SELLER {}", evidence.seller);
         println!("CANTON_VERIFY_OK");
         let decision = completed_operation_decision(
             self.zama.status(reservation_hex),

@@ -2,6 +2,8 @@ packages:
   - ./daml/treasury-registry
   - ./daml/stablecoin-registry
   - ./daml/dvp-settlement
+  - ./daml/bridge-gateway
   - ./daml/tests
+  - ./daml/bridge-tests
   - ./daml/integration-control
   - ./daml/integration

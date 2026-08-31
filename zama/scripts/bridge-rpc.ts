@@ -15,6 +15,12 @@ async function main() {
   const artifact = await import("../artifacts/contracts/ConfidentialRiskEngine.sol/ConfidentialRiskEngine.json");
   const engine = new ethers.Contract(engineAddress, artifact.abi, signer);
 
+  if (method === "status") {
+    const status = await engine.reservationStatus(args[0]);
+    console.log("ZAMA_RESULT " + JSON.stringify({ status: Number(status) }));
+    return;
+  }
+
   if (method === "reserve") {
     const [reservationId, clientId, amount] = args;
     const encrypted = await fhevm

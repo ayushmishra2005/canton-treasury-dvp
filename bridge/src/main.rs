@@ -6,6 +6,7 @@ use solana_sdk::signature::Keypair;
 use std::path::PathBuf;
 
 use canton_treasury_dvp_bridge::canton::CantonClient;
+use canton_treasury_dvp_bridge::journal::{OperationStore, Step};
 use canton_treasury_dvp_bridge::relayer::RelayerClient;
 use canton_treasury_dvp_bridge::workflow::Workflow;
 use canton_treasury_dvp_bridge::zama::ZamaClient;
@@ -18,19 +19,55 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    Workflow,
+    Workflow {
+        #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        journal: Option<PathBuf>,
+        #[arg(long)]
+        stop_after: Option<String>,
+        #[arg(long)]
+        expiry_recovery: bool,
+        #[arg(long)]
+        reuse_from: Option<PathBuf>,
+    },
     RelayerProof,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    match args.command {
-        Command::Workflow => run_workflow(true),
-        Command::RelayerProof => run_workflow(false),
+    match args {
+        Args {
+            command:
+                Command::Workflow {
+                    resume,
+                    journal,
+                    stop_after,
+                    expiry_recovery,
+                    reuse_from,
+                },
+        } => run_workflow(
+            true,
+            resume,
+            journal,
+            stop_after,
+            expiry_recovery,
+            reuse_from,
+        ),
+        Args {
+            command: Command::RelayerProof,
+        } => run_workflow(false, false, None, None, false, None),
     }
 }
 
-fn run_workflow(full: bool) -> Result<()> {
+fn run_workflow(
+    full: bool,
+    _resume: bool,
+    journal: Option<PathBuf>,
+    stop_after: Option<String>,
+    expiry_recovery: bool,
+    reuse_from: Option<PathBuf>,
+) -> Result<()> {
     let rpc =
         RpcClient::new_with_commitment(required("SOLANA_RPC_URL"), CommitmentConfig::confirmed());
     let relayer = RelayerClient::new(
@@ -61,6 +98,10 @@ fn run_workflow(full: bool) -> Result<()> {
     if full {
         canton.prepare()?;
     }
+    let journal_dir = journal.unwrap_or_else(|| {
+        PathBuf::from(optional_env("BRIDGE_JOURNAL_DIR", "bridge/.run/current"))
+    });
+    let store = OperationStore::open(journal_dir)?;
     let workflow = Workflow {
         rpc,
         relayer,
@@ -70,12 +111,19 @@ fn run_workflow(full: bool) -> Result<()> {
         attester_a: optional_keypair("ATTESTER_A").unwrap_or_else(Keypair::new),
         attester_b: optional_keypair("ATTESTER_B").unwrap_or_else(Keypair::new),
         attester_c: optional_keypair("ATTESTER_C").unwrap_or_else(Keypair::new),
+        store,
+        stop_after: stop_after
+            .or_else(|| std::env::var("BRIDGE_STOP_AFTER").ok())
+            .map(|name| Step::parse(&name))
+            .transpose()?,
+        expiry_recovery,
+        reuse_from,
     };
-    let amount = required("BRIDGE_AMOUNT").parse()?;
+    let tokens = required("BRIDGE_AMOUNT").parse()?;
     if full {
-        workflow.run(amount)?;
+        workflow.run(tokens)?;
     } else {
-        workflow.prove_relayer(amount)?;
+        workflow.prove_relayer(tokens)?;
     }
     Ok(())
 }

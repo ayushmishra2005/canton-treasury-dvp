@@ -40,6 +40,7 @@ pub struct OperationApproval {
     pub signer_bitmap: u8,
     pub consumed: bool,
     pub bump: u8,
+    pub expiry: i64,
 }
 
 impl BridgeConfig {
@@ -69,6 +70,7 @@ mod tests {
             signer_bitmap: bitmap,
             consumed: false,
             bump: 0,
+            expiry: 0,
         }
     }
 

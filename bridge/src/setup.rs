@@ -19,6 +19,7 @@ use spl_token_2022::instruction::{
 };
 use spl_token_2022::state::{Account as TokenAccount, Mint};
 use spl_token_confidential_transfer_proof_extraction::instruction::{ProofData, ProofLocation};
+use std::convert::TryInto;
 use std::num::NonZeroI8;
 use std::thread;
 use std::time::Duration;
@@ -200,6 +201,9 @@ pub fn create_bridge_accounts(
         amount,
     )?;
 
+    let decimals = read_mint_decimals(rpc, &mint.pubkey())?;
+    crate::units::require_mint_decimals(decimals, DECIMALS)?;
+
     Ok(BridgeAccounts {
         mint: mint.pubkey(),
         source: ConfidentialOwner {
@@ -363,6 +367,54 @@ pub fn decrypt_available(rpc: &RpcClient, token: &Pubkey, aes: &AeKey) -> Result
 
 pub fn vault_elgamal_pubkey(accounts: &BridgeAccounts) -> ElGamalPubkey {
     *accounts.vault_elgamal.pubkey()
+}
+
+pub fn read_mint_decimals(rpc: &RpcClient, mint: &Pubkey) -> Result<u8> {
+    let account = rpc.get_account(mint)?;
+    let state = StateWithExtensions::<Mint>::unpack(&account.data)?;
+    Ok(state.base.decimals)
+}
+
+pub fn config_is_initialized(rpc: &RpcClient) -> Result<bool> {
+    let (config, _) = crate::program::config_pda();
+    match rpc.get_account(&config) {
+        Ok(account) => Ok(account.owner == crate::program::PROGRAM_ID),
+        Err(_) => Ok(false),
+    }
+}
+
+pub fn encode_keypair(keypair: &Keypair) -> String {
+    hex::encode(keypair.to_bytes())
+}
+
+pub fn decode_keypair(text: &str) -> Result<Keypair> {
+    let bytes = hex::decode(text).context("keypair hex")?;
+    Keypair::try_from(bytes.as_slice()).context("keypair bytes")
+}
+
+pub fn encode_elgamal(keypair: &ElGamalKeypair) -> String {
+    hex::encode(keypair.secret().as_bytes())
+}
+
+pub fn decode_elgamal(text: &str) -> Result<ElGamalKeypair> {
+    let bytes = hex::decode(text).context("elgamal hex")?;
+    let secret = solana_zk_sdk::encryption::elgamal::ElGamalSecretKey::try_from(bytes.as_slice())
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    Ok(ElGamalKeypair::new(secret))
+}
+
+pub fn encode_aes(key: &AeKey) -> String {
+    let bytes: [u8; 16] = key.clone().into();
+    hex::encode(bytes)
+}
+
+pub fn decode_aes(text: &str) -> Result<AeKey> {
+    let bytes = hex::decode(text).context("aes hex")?;
+    let arr: [u8; 16] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("aes key must be 16 bytes"))?;
+    Ok(AeKey::from(arr))
 }
 
 pub fn airdrop(rpc: &RpcClient, pubkey: &Pubkey) -> Result<()> {

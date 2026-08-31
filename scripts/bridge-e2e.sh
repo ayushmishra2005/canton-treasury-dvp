@@ -124,7 +124,7 @@ for _ in $(seq 1 60); do
 done
 curl -sf -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://127.0.0.1:8545 >/dev/null \
   || fail "hardhat node did not start"
-(cd zama && npx hardhat run scripts/deploy.ts --network localhost | tee /tmp/ctd-zama-deploy.log)
+(cd zama && ZAMA_CAPACITY=200000000000 npx hardhat run scripts/deploy.ts --network localhost | tee /tmp/ctd-zama-deploy.log)
 grep -q 'ZAMA_ENGINE ' /tmp/ctd-zama-deploy.log || fail "Zama deploy did not print ZAMA_ENGINE"
 grep -q 'ZAMA_CLIENT ' /tmp/ctd-zama-deploy.log || fail "Zama deploy did not print ZAMA_CLIENT"
 
@@ -150,26 +150,65 @@ java -jar "$canton_jar" run canton/scripts/bridge-bootstrap.canton \
   --no-tty --log-level-stdout WARN >"$run_dir/bridge-bootstrap.log" 2>&1 \
   || { tail -40 "$run_dir/bridge-bootstrap.log" >&2; fail "bridge bootstrap failed"; }
 grep -q BRIDGE_BOOTSTRAP_COMPLETE "$run_dir/bridge-bootstrap.log" || fail "bridge bootstrap did not complete"
+java -jar "$canton_jar" run canton/scripts/origination.canton \
+  -c canton/remote-console.conf \
+  --no-tty --log-level-stdout WARN >"$run_dir/origination.log" 2>&1 \
+  || { tail -40 "$run_dir/origination.log" >&2; fail "treasury origination failed"; }
+grep -q ORIGINATION_COMPLETE "$run_dir/origination.log" || fail "treasury origination did not complete"
 
 echo "RELAYER_PROOF_REQUIRED confidential PDA release through Relayer 1.5.0"
-set +e
-SOLANA_RPC_URL=http://127.0.0.1:8899 \
-RELAYER_URL=http://127.0.0.1:18080 \
-RELAYER_API_KEY="$RELAYER_API_KEY" \
-RELAYER_ID=solana-local \
-ZAMA_RPC_URL=http://127.0.0.1:8545 \
-ZAMA_ENGINE="$(awk '/ZAMA_ENGINE /{print $2}' /tmp/ctd-zama-deploy.log | tail -1)" \
-ZAMA_CLIENT="$(awk '/ZAMA_CLIENT /{print $2}' /tmp/ctd-zama-deploy.log | tail -1)" \
-ZAMA_REQUESTER_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-ZAMA_SETTLER_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-CANTON_PARTICIPANTS="$run_dir/participants.json" \
-BRIDGE_AMOUNT=100000 \
-cargo run --manifest-path bridge/Cargo.toml --quiet -- workflow | tee /tmp/ctd-workflow.log
-workflow_status=${PIPESTATUS[0]}
-set -e
-if [[ "$workflow_status" -ne 0 ]]; then
-  fail "bridge workflow failed; last sizes: $(grep TX_SIZE /tmp/ctd-workflow.log || true)"
-fi
+expiry_dir="$run_dir/bridge-expiry"
+journal_dir="$run_dir/bridge-op"
+rm -rf "$expiry_dir" "$journal_dir"
+: > /tmp/ctd-workflow.log
+workflow_env=(
+  SOLANA_RPC_URL=http://127.0.0.1:8899
+  RELAYER_URL=http://127.0.0.1:18080
+  RELAYER_API_KEY="$RELAYER_API_KEY"
+  RELAYER_ID=solana-local
+  ZAMA_RPC_URL=http://127.0.0.1:8545
+  ZAMA_ENGINE="$(awk '/ZAMA_ENGINE /{print $2}' /tmp/ctd-zama-deploy.log | tail -1)"
+  ZAMA_CLIENT="$(awk '/ZAMA_CLIENT /{print $2}' /tmp/ctd-zama-deploy.log | tail -1)"
+  ZAMA_REQUESTER_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+  ZAMA_SETTLER_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+  CANTON_PARTICIPANTS="$run_dir/participants.json"
+  CANTON_RUN_DIR="$run_dir"
+  CANTON_JAR="$canton_jar"
+  BRIDGE_AMOUNT=100000
+)
+run_workflow() {
+  local extra=("$@")
+  set +e
+  env "${workflow_env[@]}" cargo run --manifest-path bridge/Cargo.toml --quiet -- workflow "${extra[@]}" | tee -a /tmp/ctd-workflow.log
+  local status=${PIPESTATUS[0]}
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    fail "bridge workflow failed at ${extra[*]:-complete}; last sizes: $(grep TX_SIZE /tmp/ctd-workflow.log || true)"
+  fi
+}
+
+echo "BRIDGE_EXPIRY_RECOVERY"
+BRIDGE_MINT_EXPIRY_SECS=20 BRIDGE_JOURNAL_DIR="$expiry_dir" \
+  run_workflow --journal "$expiry_dir" --resume --expiry-recovery
+grep -q EXPIRY_RECOVERY_MINT_REJECTED /tmp/ctd-workflow.log \
+  || fail "mint approval was not rejected after the original deadline"
+grep -q EXPIRY_RECOVERY_CANCEL_CONFIRMED /tmp/ctd-workflow.log \
+  || fail "expiry recovery did not cancel through Relayer"
+grep -q EXPIRY_RECOVERY_COMPLETE /tmp/ctd-workflow.log \
+  || fail "expiry recovery did not complete"
+
+for step in accounts reserved locked mint_approved canton_minted trade_prepared reassigned settled redeemed release_approved released zama_redeemed; do
+  echo "BRIDGE_RESUME_AFTER $step"
+  BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+    run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after "$step"
+done
+
+grep -q CANTON_MINT_HOLDING /tmp/ctd-workflow.log || fail "Canton mint holding was not recorded"
+grep -q DVP_BUYER_TREASURY /tmp/ctd-workflow.log || fail "buyer did not receive Treasury"
+grep -q DVP_SELLER_STABLECOIN /tmp/ctd-workflow.log || fail "seller did not receive stablecoins"
+grep -q DVP_PAYMENT_AMOUNT /tmp/ctd-workflow.log || fail "DvP payment amount was not asserted"
+grep -q CANTON_REDEEM /tmp/ctd-workflow.log || fail "seller redemption was not recorded"
 grep -q RELAYER_RELEASE_CONFIRMED /tmp/ctd-workflow.log || fail "confidential release through Relayer did not confirm"
 grep -q ZAMA_REDEEM_OK /tmp/ctd-workflow.log || fail "Zama redemption did not succeed"
+grep -q EXPIRY_RECOVERY_COMPLETE /tmp/ctd-workflow.log || fail "expiry recovery evidence is missing"
 echo "BRIDGE_E2E_COMPLETE"

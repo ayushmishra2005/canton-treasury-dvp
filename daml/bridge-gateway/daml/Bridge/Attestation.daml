@@ -1,5 +1,7 @@
 module Bridge.Attestation where
 
+import Splice.Api.Token.HoldingV1
+
 import Bridge.Types
 
 template BridgeAttestation
@@ -11,6 +13,8 @@ template BridgeAttestation
     beneficiary : Party
     digestHex : Text
     direction : BridgeDirection
+    instrumentId : InstrumentId
+    payoutDestination : Text
   where
     signatory attester
     observer cashRegistry

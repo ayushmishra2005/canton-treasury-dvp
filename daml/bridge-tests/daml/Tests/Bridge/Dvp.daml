@@ -70,6 +70,8 @@ bridgedHoldingFundsAtomicDvp = do
     beneficiary = buyer
     digestHex = "digest-dvp"
     direction = MintAttestation
+    instrumentId = paymentInstrumentId
+    payoutDestination = ""
   secondCid <- submit attesterB $ createCmd BridgeAttestation with
     attester = attesterB
     cashRegistry
@@ -78,6 +80,8 @@ bridgedHoldingFundsAtomicDvp = do
     beneficiary = buyer
     digestHex = "digest-dvp"
     direction = MintAttestation
+    instrumentId = paymentInstrumentId
+    payoutDestination = ""
   (_nextGateway, paymentHoldingCid) <- submit cashRegistry $ exerciseCmd gatewayCid Gateway_Mint with firstCid, secondCid
   treasuryHoldingCid <- submit treasuryRegistry $ exerciseCmd treasuryInstrumentCid Issue with
     owner = seller

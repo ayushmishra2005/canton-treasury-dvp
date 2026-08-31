@@ -257,10 +257,147 @@ nothing.
 | JDK | 21 |
 | Canton Token Standard | V1 (CIP-0056) |
 
+## Completed baseline and the two new phases
+
+M1–M7 remain the completed Canton-only MVP. This repository is still a negotiated
+Treasury Delivery-versus-Payment system. It is not an AMM and does not add pools,
+LP tokens, swap curves, or AMM pricing.
+
+| Phase | Status |
+|---|---|
+| M1–M7 Canton atomic DvP, two synchronizers, verified privacy | **Complete** |
+| Phase 1 confidential settlement rail | **Complete (local only).** Encrypted capacity, confidential Solana custody, 2-of-3 mint/release approvals, live Treasury DvP funded by the minted holding, seller redemption, Relayer release, Zama redeem, and journal resume including after mint-deadline expiry. |
+| Phase 2 extended security testing, operational hardening, benchmarks, and publication | **Not started.** |
+
+Phase 1 workflow, all asynchronous except the existing Canton settle:
+
+1. Zama checks and reserves encrypted bridge capacity.
+2. Solana tokens move confidentially into PDA custody.
+3. Two of three attesters authorize the matching Canton mint.
+4. The gateway mints an ordinary V1 `StablecoinHolding`.
+5. That exact holding funds the buyer's payment allocation.
+6. The coordinator creates and approves the Treasury trade, reassigns the Treasury holding, and exercises `DvpTrade_Settle`.
+7. The seller burns the resulting stablecoins through the gateway.
+8. Solana releases the backing tokens confidentially to the destination authorized for that redemption.
+9. Zama reduces active exposure.
+
+Only `DvpTrade_Settle` on `settlement-sync` is atomic. Zama is a separate EVM
+environment. It is not inside Solana or Canton.
+
+```mermaid
+flowchart LR
+  subgraph Canton
+    T[Treasury origination on treasury-sync]
+    R[Explicit unassign/assign]
+    G[Bridge gateway]
+    H[Ordinary V1 StablecoinHolding]
+    S[Atomic DvpTrade_Settle on settlement-sync]
+    T --> R --> S
+    G --> H --> S
+  end
+  subgraph Solana
+    V[Token-2022 confidential vault PDA]
+  end
+  subgraph Relayer["OpenZeppelin Relayer 1.5.0"]
+    C[Rust coordinator]
+  end
+  subgraph Zama["Zama FHEVM, separate EVM"]
+    E[ConfidentialRiskEngine]
+  end
+  C -->|async reserve / redeem| E
+  C -->|async lock / approve / release| Relayer
+  Relayer -->|legacy transactions| V
+  C -->|async mint / burn| G
+```
+
+Cross-chain arrows are asynchronous. There is no single transaction that spans
+Canton, Solana, and Zama.
+
+### Roles
+
+- **Canton** keeps Token Standard V1, independent registries, and atomic DvP.
+- **Solana** holds Token-2022 confidential custody. Two distinct configured
+  attesters must sign. Approvals are recorded in separate legacy transactions.
+- **OpenZeppelin Relayer 1.5.0** is the accepted Solana submission path.
+  Measured legacy sizes on the local validator, including the Relayer fee payer
+  and the approval account, stayed under 1232 bytes: lock 1010, approve 725,
+  release 844.
+- **Zama** keeps capacity, exposure, and limits encrypted. Local Hardhat tests
+  are **mock FHE execution**, not production cryptographic confidentiality.
+
+The Daml gateway does not recompute the Solana canonical digest. Two attester
+contracts must agree on lock, amount, beneficiary, and digest. The gateway does
+not remove the stablecoin issuer's existing mint authority.
+
+Amount commitments are `SHA-256(domain || amount || blinding)`. The blinding
+value is not placed in public transactions or logs. Cross-scheme equality is
+2-of-3 attested equality, not a cryptographic proof between Token-2022 and Zama
+ciphertexts.
+
+### Exact dependency pins
+
+| Component | Pin |
+|---|---|
+| Daml SDK / Canton / Token Standard | 3.5.5 / 3.5.12 / V1 from Splice v0.6.14 |
+| Node | 22 |
+| Anchor | 0.31.1 |
+| Solana CLI / Agave | 3.1.10 |
+| Token-2022 (local zk-ops) | official `program@v7.0.0` (`ed6f74f960a3c06cf681c6b0a31552f2f4956df3`) |
+| OpenZeppelin Relayer | 1.5.0 (`v1.5.0`, commit `3db7d38c34ca05ab5f51dd74817889a1e388eec6`) |
+| OpenZeppelin Confidential Contracts | 0.5.1 |
+| OpenZeppelin Contracts | 5.6.1 |
+| `@fhevm/solidity` | 0.11.1 |
+| `@fhevm/hardhat-plugin` / mock-utils | 0.4.2 |
+| `@zama-fhe/relayer-sdk` | 0.4.1 |
+
+### Bridge setup and tests
+
+Original demo: `make verify` (194 Daml tests and the two-synchronizer suite).
+
+Bridge prerequisites, in addition to the original demo: Node 22, Rust, Solana
+CLI 3.1.10, Anchor 0.31.1, Docker, and `cd zama && npm ci`. Agave 3.1.10 ships
+Token-2022 without `zk-ops`; `scripts/build-token-2022-zk-ops.sh` builds the
+official `program@v7.0.0` source and the local validator loads that program.
+
+```bash
+make verify
+make bridge-test
+scripts/bridge-e2e.sh
+make bridge-verify
+```
+
+`scripts/bridge-e2e.sh` starts only the local validator, Relayer 1.5.0, Hardhat,
+and related processes it created. Occupied ports fail the run. Missing services
+fail the run. `BRIDGE_E2E_COMPLETE` is printed only after expiry recovery on a locked
+operation, coordinator restart after each remaining step, the minted holding
+funds atomic Treasury DvP, the seller's stablecoin is redeemed, confidential
+release through Relayer confirms to the redemption destination, and Zama
+redemption succeeds.
+
+Amounts use one convention: Solana and Zama carry integer base units; Canton
+carries whole-token Decimals. With six decimals, 1 token is 1,000,000 base
+units, so the demo is 100,000.000000 Canton units and 100,000,000,000
+Solana/Zama base units. The Daml gateway does not recompute the Solana digest.
+
+### Trust and privacy limitations
+
+- Local-only and unaudited.
+- Relayer, attesters, and the coordinator are trusted to submit the bound
+  digest and to wait for confirmation.
+- Token-2022 and Zama ciphertexts are not proven equal; attesters bind them.
+- Local Zama tests use the FHEVM mock. Do not treat those results as production
+  confidentiality.
+- Recovery uses a local operation journal. Resume reads chain state and
+  continues the unfinished step. It must not repeat mint, burn, release, or
+  reservation. Cancellation and redemption approvals have their own deadlines,
+  separate from the original mint deadline. A later 2-of-3 can recover an
+  eligible locked operation after that mint deadline. Epoch on the Zama engine
+  is a policy version and does not erase reserved or active exposure.
+
 ## Repository structure
 
 ```
-Makefile                       build, test, lint, validate, integration, verify, clean
+Makefile                       build, test, lint, validate, integration, verify, bridge-*, clean
 docs/
   architecture.md              packages, placement, reassignment and allocation sequences
   privacy.md                   visibility matrix and what the privacy tests do and do not prove
@@ -277,6 +414,12 @@ canton/
     reassign.canton            explicit unassign and assign with counter and payload evidence
     probe-pending.canton       pending-assignment scenario and reassignment round trip
     verify-privacy.canton      per-participant update-stream privacy assertions
+    bridge-bootstrap.canton    extra attesters and bridge-gateway vetting
+solana/                        Token-2022 confidential escrow program
+zama/                          ConfidentialRiskEngine (FHEVM, mock in local tests)
+bridge/                        Rust coordinator and Relayer 1.5.0 local config
+daml/bridge-gateway/           Canton mint/redemption gateway
+daml/bridge-tests/             gateway and bridged DvP scripts
 daml/
   treasury-registry/           Treasury instrument, holdings, eligibility, allocation
   stablecoin-registry/         stablecoin instrument, holdings, eligibility, allocation
@@ -290,13 +433,21 @@ lib/                           vendored Canton Token Standard V1 DARs
 
 ## Prerequisites
 
+Original Canton demo:
+
 - Daml SDK 3.5.5 via `dpm`, with `dpm` on `PATH`
 - JDK 21
 - The Canton runtime, which `dpm` installs under `~/.dpm/cache/components/canton-open-source`
 - `make` and a POSIX shell, for the one-command entry points
 
-No database, container runtime, or authentication service is required. All nodes use in-memory
-storage.
+No database is required for the original demo. All Canton nodes use in-memory storage.
+
+Bridge Phase 1, in addition:
+
+- Node 22
+- Rust, Solana CLI, Anchor 0.31.1
+- Docker, for stock OpenZeppelin Relayer 1.5.0 and Redis
+- `cd zama && npm ci` before `make bridge-test`
 
 ## Quick start
 
@@ -463,7 +614,8 @@ observes data it should not, or any Canton process or port survives shutdown.
 
 ## Status
 
-**Complete.**
+**M1–M7 complete.** Phase 1 of the confidential rail is **complete** on the
+local stack. Phase 2 has not started.
 
 - M1: Treasury instrument and standard-compatible holdings
 - M2: independently governed stablecoin package with registry-controlled mint and burn
@@ -480,12 +632,12 @@ observes data it should not, or any Canton process or port survives shutdown.
 
 This repository is a protocol and modelling demonstration. It does not include, and does not claim:
 
-- No Solana integration, bridge, or any other chain
-- No frontend, backend service, or REST API
-- No PostgreSQL, Docker, or authentication infrastructure
+- No AMM, pool, LP token, swap curve, or AMM pricing
+- No frontend, backend service, or public REST API
+- No PostgreSQL or authentication infrastructure
 - No Canton Network or Global Synchronizer deployment
 - No Token Standard V2
-- No production deployment or operational hardening
+- No production deployment, audit, or Phase 2 hardening
 
 The local topology demonstrates **protocol behavior**: how Canton enforces atomicity, authorization,
 and need-to-know visibility across independently governed applications. It does not demonstrate

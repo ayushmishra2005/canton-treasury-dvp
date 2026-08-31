@@ -30,6 +30,7 @@ contract ConfidentialRiskEngine is AccessControl, Pausable {
 
     mapping(bytes32 clientId => euint64 limit) private clientLimit;
     mapping(bytes32 clientId => euint64 usage) private clientUsage;
+    mapping(bytes32 clientId => bool configured) private clientConfigured;
     mapping(bytes32 reservationId => ReservationStatus) public reservationStatus;
     mapping(bytes32 reservationId => bytes32) public reservationClient;
     mapping(bytes32 reservationId => euint64) private reservationAmount;
@@ -70,6 +71,7 @@ contract ConfidentialRiskEngine is AccessControl, Pausable {
         _unpause();
     }
 
+    /// Epoch is a policy version. Rolling it does not clear reserved, active, or client usage.
     function rolloverEpoch() external onlyRole(POLICY_ADMIN_ROLE) {
         unchecked {
             epoch += 1;
@@ -93,9 +95,12 @@ contract ConfidentialRiskEngine is AccessControl, Pausable {
     {
         euint64 limit = FHE.fromExternal(encryptedLimit, inputProof);
         clientLimit[clientId] = limit;
-        clientUsage[clientId] = FHE.asEuint64(0);
         FHE.allowThis(clientLimit[clientId]);
-        FHE.allowThis(clientUsage[clientId]);
+        if (!clientConfigured[clientId]) {
+            clientUsage[clientId] = FHE.asEuint64(0);
+            FHE.allowThis(clientUsage[clientId]);
+            clientConfigured[clientId] = true;
+        }
         emit ClientLimitConfigured(clientId);
     }
 
@@ -118,7 +123,8 @@ contract ConfidentialRiskEngine is AccessControl, Pausable {
 
         reservedExposure = FHE.select(approved, nextReserved, reservedExposure);
         clientUsage[clientId] = FHE.select(approved, nextUsage, clientUsage[clientId]);
-        reservationAmount[reservationId] = amount;
+        euint64 effectiveAmount = FHE.select(approved, amount, FHE.asEuint64(0));
+        reservationAmount[reservationId] = effectiveAmount;
         reservationApproved[reservationId] = approved;
         reservationClient[reservationId] = clientId;
         reservationStatus[reservationId] = ReservationStatus.Reserved;
@@ -135,10 +141,9 @@ contract ConfidentialRiskEngine is AccessControl, Pausable {
     function finalize(bytes32 reservationId) external onlyRole(SETTLER_ROLE) whenNotPaused {
         _requireStatus(reservationId, ReservationStatus.Reserved);
         euint64 amount = reservationAmount[reservationId];
-        ebool approved = reservationApproved[reservationId];
         (ebool reservedOk, euint64 nextReserved) = FHESafeMath.tryDecrease(reservedExposure, amount);
         (ebool activeOk, euint64 nextActive) = FHESafeMath.tryIncrease(activeExposure, amount);
-        ebool ok = FHE.and(FHE.and(approved, reservedOk), activeOk);
+        ebool ok = FHE.and(reservedOk, activeOk);
         reservedExposure = FHE.select(ok, nextReserved, reservedExposure);
         activeExposure = FHE.select(ok, nextActive, activeExposure);
         reservationStatus[reservationId] = ReservationStatus.Finalized;
@@ -151,10 +156,9 @@ contract ConfidentialRiskEngine is AccessControl, Pausable {
         _requireStatus(reservationId, ReservationStatus.Reserved);
         euint64 amount = reservationAmount[reservationId];
         bytes32 clientId = reservationClient[reservationId];
-        ebool approved = reservationApproved[reservationId];
         (ebool reservedOk, euint64 nextReserved) = FHESafeMath.tryDecrease(reservedExposure, amount);
         (ebool usageOk, euint64 nextUsage) = FHESafeMath.tryDecrease(clientUsage[clientId], amount);
-        ebool ok = FHE.and(FHE.and(approved, reservedOk), usageOk);
+        ebool ok = FHE.and(reservedOk, usageOk);
         reservedExposure = FHE.select(ok, nextReserved, reservedExposure);
         clientUsage[clientId] = FHE.select(ok, nextUsage, clientUsage[clientId]);
         reservationStatus[reservationId] = ReservationStatus.Cancelled;

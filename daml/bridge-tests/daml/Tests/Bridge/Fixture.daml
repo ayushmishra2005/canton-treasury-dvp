@@ -1,5 +1,7 @@
 module Tests.Bridge.Fixture where
 
+import DA.Assert ((===))
+import DA.Optional (isNone)
 import Daml.Script
 
 import Splice.Api.Token.HoldingV1
@@ -45,6 +47,12 @@ setup = do
 
 attest : Fixture -> Party -> Text -> Decimal -> Text -> BridgeDirection -> Script (ContractId BridgeAttestation)
 attest fixture attester lockId amount digestHex direction =
+  attestFull fixture attester lockId amount digestHex direction fixture.instrumentId ""
+
+attestFull :
+  Fixture -> Party -> Text -> Decimal -> Text -> BridgeDirection -> InstrumentId -> Text ->
+  Script (ContractId BridgeAttestation)
+attestFull fixture attester lockId amount digestHex direction instrumentId payoutDestination =
   submit attester $ createCmd BridgeAttestation with
     attester
     cashRegistry = fixture.cashRegistry
@@ -53,6 +61,23 @@ attest fixture attester lockId amount digestHex direction =
     beneficiary = fixture.holder
     digestHex
     direction
+    instrumentId
+    payoutDestination
+
+attestFor :
+  Fixture -> Party -> Party -> Text -> Decimal -> Text -> BridgeDirection -> Text ->
+  Script (ContractId BridgeAttestation)
+attestFor fixture attester beneficiary lockId amount digestHex direction payoutDestination =
+  submit attester $ createCmd BridgeAttestation with
+    attester
+    cashRegistry = fixture.cashRegistry
+    lockId
+    amount
+    beneficiary
+    digestHex
+    direction
+    instrumentId = fixture.instrumentId
+    payoutDestination
 
 currentGateway : Fixture -> Script (ContractId BridgeGateway)
 currentGateway fixture = do
@@ -60,6 +85,13 @@ currentGateway fixture = do
   case found of
     [(cid, _)] -> pure cid
     _ -> abort "expected one bridge gateway"
+
+currentMintedLock : Fixture -> Text -> Script (ContractId MintedLock)
+currentMintedLock fixture lockId = do
+  found <- query @MintedLock fixture.cashRegistry
+  case [cid | (cid, minted) <- found, minted.lockId == lockId] of
+    [cid] -> pure cid
+    _ -> abort ("expected one minted lock " <> lockId)
 
 mintWith : Fixture -> Party -> Party -> Text -> Decimal -> Text -> Script (ContractId StablecoinHolding)
 mintWith fixture first second lockId amount digestHex = do
@@ -70,3 +102,14 @@ mintWith fixture first second lockId amount digestHex = do
     firstCid
     secondCid
   pure holdingCid
+
+holdingUnchanged : Party -> ContractId StablecoinHolding -> Decimal -> Script ()
+holdingUnchanged owner holdingCid amount = do
+  Some holding <- queryContractId owner holdingCid
+  holding.amount === amount
+  isNone holding.lock === True
+
+gatewayUnchanged : Fixture -> ContractId BridgeGateway -> Script ()
+gatewayUnchanged fixture expected = do
+  actual <- currentGateway fixture
+  actual === expected

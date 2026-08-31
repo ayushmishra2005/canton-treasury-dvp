@@ -37,11 +37,18 @@ template RedemptionRequest
     lockId : Text
     holdingCid : ContractId StablecoinHolding
     amount : Decimal
+    digestHex : Text
+    instrumentId : InstrumentId
+    payoutDestination : Text
   where
     signatory holder
     observer cashRegistry
 
-    ensure lockId /= "" && amount > 0.0
+    ensure
+      lockId /= ""
+        && amount > 0.0
+        && digestHex /= ""
+        && payoutDestination /= ""
 
 template BridgeGateway
   with
@@ -79,6 +86,8 @@ template BridgeGateway
         assertMsg "Attestations must agree on the beneficiary" (first.beneficiary == second.beneficiary)
         assertMsg "Attestations must agree on the digest" (first.digestHex == second.digestHex)
         assertMsg "Lock has already been minted" (first.lockId `notElem` mintedLocks)
+        assertMsg "Attestations must name this instrument"
+          (first.instrumentId == instrumentId && second.instrumentId == instrumentId)
         holdingCid <- exercise instrumentCid Mint with
           owner = first.beneficiary
           amount = first.amount
@@ -96,21 +105,26 @@ template BridgeGateway
         requestCid : ContractId RedemptionRequest
         firstCid : ContractId BridgeAttestation
         secondCid : ContractId BridgeAttestation
+        mintedLockCid : ContractId MintedLock
       controller cashRegistry
       do
         request <- fetch requestCid
         first <- fetch firstCid
         second <- fetch secondCid
+        minted <- fetch mintedLockCid
         holding <- fetch request.holdingCid
         assertMsg "Redemption must name this registry" (request.cashRegistry == cashRegistry)
         assertMsg "Holding must belong to the requesting holder" (holding.owner == request.holder)
         assertMsg "Holding must use the gateway instrument" (holding.instrumentId == instrumentId)
+        assertMsg "Request must name this instrument" (request.instrumentId == instrumentId)
         assertMsg "Holding must be unlocked" (isNone holding.lock)
         assertMsg "Holding amount must match the redemption" (holding.amount == request.amount)
         assertMsg "Attestations must be distinct contracts" (firstCid /= secondCid)
         assertMsg "Attesters must be distinct" (first.attester /= second.attester)
         assertMsg "First attester is not configured" (first.attester `elem` attesters)
         assertMsg "Second attester is not configured" (second.attester `elem` attesters)
+        assertMsg "Attestations must target this registry"
+          (first.cashRegistry == cashRegistry && second.cashRegistry == cashRegistry)
         assertMsg "Attestations must be redeem attestations"
           (first.direction == RedeemAttestation && second.direction == RedeemAttestation)
         assertMsg "Attestations must agree on the lock"
@@ -119,7 +133,22 @@ template BridgeGateway
           (first.amount == second.amount && first.amount == request.amount)
         assertMsg "Attestations must name the holder"
           (first.beneficiary == request.holder && second.beneficiary == request.holder)
-        assertMsg "Lock must have been minted before redemption" (request.lockId `elem` mintedLocks)
+        assertMsg "Attestations must agree on the digest"
+          (first.digestHex == second.digestHex && first.digestHex == request.digestHex)
+        assertMsg "Attestations must name this instrument"
+          (first.instrumentId == instrumentId && second.instrumentId == instrumentId)
+        assertMsg "Request instrument must match the attestations"
+          (request.instrumentId == first.instrumentId)
+        assertMsg "Attestations must agree on the payout destination"
+          ( first.payoutDestination == second.payoutDestination
+              && first.payoutDestination == request.payoutDestination
+              && request.payoutDestination /= ""
+          )
+        assertMsg "Minted lock must belong to this registry" (minted.cashRegistry == cashRegistry)
+        assertMsg "Minted lock must match the redemption lock"
+          (minted.lockId == request.lockId && minted.lockId `elem` mintedLocks)
+        assertMsg "Burn must match the lock's authorized backing"
+          (minted.amount == request.amount && minted.amount == holding.amount)
         assertMsg "Lock has already been redeemed" (request.lockId `notElem` redeemedLocks)
         exercise request.holdingCid Burn
         redeemedCid <- create RedeemedLock with

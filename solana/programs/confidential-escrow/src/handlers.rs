@@ -186,17 +186,19 @@ pub fn approve_operation(ctx: Context<ApproveOperation>, args: ApproveArgs) -> R
         receipt.previous_operation == args.previous_operation,
         EscrowError::PreviousOperationMismatch
     );
-    require!(receipt.expiry == args.expiry, EscrowError::ReceiptMismatch);
-    if args.direction != DIRECTION_MINT {
+    let now = Clock::get()?.unix_timestamp;
+    if args.direction == DIRECTION_MINT {
+        require!(now < receipt.expiry, EscrowError::Expired);
+        require!(args.expiry == receipt.expiry, EscrowError::ReceiptMismatch);
+    } else {
+        require!(now < args.expiry, EscrowError::Expired);
+    }
+    if args.direction == DIRECTION_CANCEL {
         require!(
             receipt.destination == args.destination,
             EscrowError::WrongDestination
         );
     }
-    require!(
-        Clock::get()?.unix_timestamp < args.expiry,
-        EscrowError::Expired
-    );
     let expected = operation_digest(
         &config.chain_id,
         ctx.program_id,
@@ -217,14 +219,20 @@ pub fn approve_operation(ctx: Context<ApproveOperation>, args: ApproveArgs) -> R
         .attester_index(&signed.attester)
         .ok_or(error!(EscrowError::UnknownAttester))?;
     let approval = &mut ctx.accounts.approval;
-    if approval.signer_bitmap == 0 && approval.digest == [0u8; 32] {
+    let empty = approval.signer_bitmap == 0 && approval.digest == [0u8; 32];
+    let expired = !empty && now >= approval.expiry;
+    if empty || (expired && !approval.consumed) {
+        require!(!approval.consumed, EscrowError::ApprovalConsumed);
         approval.operation = args.operation;
         approval.direction = args.direction;
         approval.digest = expected;
         approval.consumed = false;
+        approval.signer_bitmap = 0;
+        approval.expiry = args.expiry;
         approval.bump = ctx.bumps.approval;
     } else {
         require!(!approval.consumed, EscrowError::ApprovalConsumed);
+        require!(!expired, EscrowError::Expired);
         require!(
             approval.digest == expected,
             EscrowError::ApprovalDigestMismatch
@@ -235,6 +243,10 @@ pub fn approve_operation(ctx: Context<ApproveOperation>, args: ApproveArgs) -> R
         );
         require!(
             approval.operation == args.operation,
+            EscrowError::ReceiptMismatch
+        );
+        require!(
+            approval.expiry == args.expiry,
             EscrowError::ReceiptMismatch
         );
     }
@@ -281,9 +293,12 @@ fn move_vault_tokens(
         args.destination,
         EscrowError::WrongDestination
     );
+    let now = Clock::get()?.unix_timestamp;
+    require!(now < args.expiry, EscrowError::Expired);
+    require!(now < approval.expiry, EscrowError::Expired);
     require!(
-        Clock::get()?.unix_timestamp < args.expiry,
-        EscrowError::Expired
+        approval.expiry == args.expiry,
+        EscrowError::ReceiptMismatch
     );
     require!(!approval.consumed, EscrowError::ApprovalConsumed);
     require!(
@@ -329,7 +344,12 @@ fn move_vault_tokens(
         receipt.previous_operation == args.previous_operation,
         EscrowError::PreviousOperationMismatch
     );
-    require!(receipt.expiry == args.expiry, EscrowError::ReceiptMismatch);
+    if direction == DIRECTION_CANCEL {
+        require!(
+            receipt.destination == args.destination,
+            EscrowError::WrongDestination
+        );
+    }
     require_confidential_account(
         &config.token_program,
         &config.mint,

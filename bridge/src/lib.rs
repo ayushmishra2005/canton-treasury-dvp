@@ -2,10 +2,12 @@ pub mod attest;
 pub mod canonical;
 pub mod canton;
 pub mod confidential;
+pub mod journal;
 pub mod program;
 pub mod relayer;
 pub mod setup;
 pub mod txsize;
+pub mod units;
 pub mod workflow;
 pub mod zama;
 

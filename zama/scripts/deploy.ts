@@ -8,7 +8,7 @@ async function main() {
   const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
   const engine = await factory.deploy(admin.address, requester, settler, admin.address);
   await engine.waitForDeployment();
-  const capacity = process.env.ZAMA_CAPACITY ?? "1000000";
+  const capacity = process.env.ZAMA_CAPACITY ?? "200000000000";
   const client = process.env.ZAMA_CLIENT ?? ethers.id("bridge-client");
   const address = await engine.getAddress();
   const cap = await fhevm.createEncryptedInput(address, admin.address).add64(BigInt(capacity)).encrypt();

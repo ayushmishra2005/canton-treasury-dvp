@@ -186,17 +186,9 @@ impl CantonClient {
         payout_destination: &str,
     ) -> Result<PathBuf> {
         let path = std::env::temp_dir().join(format!("bridge-canton-{lock_id}.json"));
-        let amount_value = serde_json::from_str::<serde_json::Value>(amount)
-            .unwrap_or_else(|_| serde_json::Value::String(amount.to_string()));
         fs_write_atomic(
             &path,
-            serde_json::json!({
-                "lockId": lock_id,
-                "amount": amount_value,
-                "digestHex": digest_hex,
-                "payoutDestination": payout_destination,
-            })
-            .to_string(),
+            script_input_json(lock_id, amount, digest_hex, payout_destination),
         )?;
         Ok(path)
     }
@@ -269,9 +261,51 @@ fn fs_write_atomic(path: &Path, body: String) -> Result<()> {
     Ok(())
 }
 
+pub fn script_input_json(
+    lock_id: &str,
+    amount: &str,
+    digest_hex: &str,
+    payout_destination: &str,
+) -> String {
+    serde_json::json!({
+        "lockId": lock_id,
+        "amount": amount,
+        "digestHex": digest_hex,
+        "payoutDestination": payout_destination,
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_json_keeps_exact_decimal_strings() {
+        for (amount, base) in [
+            ("0.000001", 1u64),
+            ("1.000000", 1_000_000),
+            ("100000.000000", 100_000_000_000),
+            ("9007199254.740993", 9_007_199_254_740_993),
+        ] {
+            let json = script_input_json("lock-1", amount, "aa", "dest");
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let field = value.get("amount").expect("amount field");
+            assert!(
+                field.is_string(),
+                "amount must stay a decimal string through JSON, got {field}"
+            );
+            assert_eq!(field.as_str(), Some(amount));
+            assert!(
+                !json.contains("9007199254.740992"),
+                "JSON must not round 9007199254.740993 to 9007199254.740992: {json}"
+            );
+            assert_eq!(
+                crate::units::canton_decimal_to_base_units(field.as_str().unwrap(), 6).unwrap(),
+                base
+            );
+        }
+    }
 
     #[test]
     fn reads_daml_debug_quoted_markers() {

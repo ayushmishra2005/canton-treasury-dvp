@@ -59,6 +59,23 @@ impl ZamaClient {
     }
 
     pub fn status(&self, reservation_hex: &str) -> Result<u8> {
+        let value = self.query("status", reservation_hex)?;
+        value
+            .get("status")
+            .and_then(|v| v.as_u64())
+            .map(|status| status as u8)
+            .ok_or_else(|| anyhow!("zama status did not return status"))
+    }
+
+    pub fn approved(&self, reservation_hex: &str) -> Result<bool> {
+        let value = self.query("approved", reservation_hex)?;
+        value
+            .get("approved")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| anyhow!("zama approved did not return approved"))
+    }
+
+    fn query(&self, method: &str, reservation_hex: &str) -> Result<Value> {
         let script = std::env::var("ZAMA_BRIDGE_RPC")
             .unwrap_or_else(|_| "scripts/bridge-rpc.ts".to_string());
         let output = Command::new("npx")
@@ -67,13 +84,13 @@ impl ZamaClient {
             .env("ZAMA_RPC_URL", &self.rpc_url)
             .env("ZAMA_ENGINE", &self.engine)
             .env("ZAMA_KEY", &self.settler_key)
-            .env("ZAMA_METHOD", "status")
+            .env("ZAMA_METHOD", method)
             .env("ZAMA_ARGS", reservation_hex)
             .output()
-            .context("zama status")?;
+            .with_context(|| format!("zama {method}"))?;
         if !output.status.success() {
             return Err(anyhow!(
-                "zama status failed: {} {}",
+                "zama {method} failed: {} {}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ));
@@ -81,13 +98,10 @@ impl ZamaClient {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines().rev() {
             if let Some(rest) = line.strip_prefix("ZAMA_RESULT ") {
-                let value: Value = serde_json::from_str(rest)?;
-                if let Some(status) = value.get("status").and_then(|v| v.as_u64()) {
-                    return Ok(status as u8);
-                }
+                return Ok(serde_json::from_str(rest)?);
             }
         }
-        Err(anyhow!("zama status did not print ZAMA_RESULT"))
+        Err(anyhow!("zama {method} did not print ZAMA_RESULT"))
     }
 
     fn cast(&self, method: &str, key: &str, args: &[String]) -> Result<bool> {

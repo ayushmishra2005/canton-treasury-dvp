@@ -30,6 +30,10 @@ enum Command {
         expiry_recovery: bool,
         #[arg(long)]
         reuse_from: Option<PathBuf>,
+        #[arg(long)]
+        omit_journal_save: bool,
+        #[arg(long)]
+        halt_after_first_approval: bool,
     },
     RelayerProof,
 }
@@ -45,6 +49,8 @@ fn main() -> Result<()> {
                     stop_after,
                     expiry_recovery,
                     reuse_from,
+                    omit_journal_save,
+                    halt_after_first_approval,
                 },
         } => run_workflow(
             true,
@@ -53,13 +59,16 @@ fn main() -> Result<()> {
             stop_after,
             expiry_recovery,
             reuse_from,
+            omit_journal_save,
+            halt_after_first_approval,
         ),
         Args {
             command: Command::RelayerProof,
-        } => run_workflow(false, false, None, None, false, None),
+        } => run_workflow(false, false, None, None, false, None, false, false),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_workflow(
     full: bool,
     _resume: bool,
@@ -67,6 +76,8 @@ fn run_workflow(
     stop_after: Option<String>,
     expiry_recovery: bool,
     reuse_from: Option<PathBuf>,
+    omit_journal_save: bool,
+    halt_after_first_approval: bool,
 ) -> Result<()> {
     let rpc =
         RpcClient::new_with_commitment(required("SOLANA_RPC_URL"), CommitmentConfig::confirmed());
@@ -118,6 +129,8 @@ fn run_workflow(
             .transpose()?,
         expiry_recovery,
         reuse_from,
+        omit_journal_save,
+        halt_after_first_approval,
     };
     let tokens = required("BRIDGE_AMOUNT").parse()?;
     if full {

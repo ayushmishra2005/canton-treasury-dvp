@@ -353,6 +353,13 @@ pub fn apply_pending(
     Ok(())
 }
 
+pub fn pending_credit_counter(rpc: &RpcClient, token: &Pubkey) -> Result<u64> {
+    let account = rpc.get_account(token)?;
+    let state = StateWithExtensions::<TokenAccount>::unpack(&account.data)?;
+    let confidential = state.get_extension::<ConfidentialTransferAccount>()?;
+    Ok(u64::from(confidential.pending_balance_credit_counter))
+}
+
 pub fn decrypt_available(rpc: &RpcClient, token: &Pubkey, aes: &AeKey) -> Result<u64> {
     let account = rpc.get_account(token)?;
     let state = StateWithExtensions::<TokenAccount>::unpack(&account.data)?;

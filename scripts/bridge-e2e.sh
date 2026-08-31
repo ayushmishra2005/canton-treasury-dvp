@@ -197,11 +197,161 @@ grep -q EXPIRY_RECOVERY_CANCEL_CONFIRMED /tmp/ctd-workflow.log \
 grep -q EXPIRY_RECOVERY_COMPLETE /tmp/ctd-workflow.log \
   || fail "expiry recovery did not complete"
 
-for step in accounts reserved locked mint_approved canton_minted trade_prepared reassigned settled redeemed release_approved released zama_redeemed; do
+assert_journal_step() {
+  local dir="$1"
+  local step="$2"
+  python3 - "$dir/journal.json" "$step" <<'PY'
+import json, sys
+journal = json.load(open(sys.argv[1]))
+actual = journal.get("completed")
+expected = sys.argv[2]
+if actual != expected:
+    raise SystemExit(f"journal completed is {actual!r}, expected {expected!r}")
+PY
+}
+
+assert_no_lock_or_mint() {
+  local dir="$1"
+  python3 - "$dir/journal.json" <<'PY'
+import json, sys
+journal = json.load(open(sys.argv[1]))
+if journal.get("lock_signature"):
+    raise SystemExit("rejected reservation produced a Solana lock")
+if journal.get("mint_holding"):
+    raise SystemExit("rejected reservation produced a Canton mint")
+if journal.get("lock_proof_hex"):
+    raise SystemExit("rejected reservation stored a lock proof")
+completed = journal.get("completed")
+if completed not in (None, "accounts"):
+    raise SystemExit(f"rejected reservation advanced to {completed}")
+print("REJECT_JOURNAL_CLEAN")
+PY
+}
+
+last_marker() {
+  grep "$1" /tmp/ctd-workflow.log | tail -1
+}
+
+reject_dir="$run_dir/bridge-reject"
+rm -rf "$reject_dir"
+echo "BRIDGE_REJECT_OVER_CAPACITY"
+set +e
+env "${workflow_env[@]}" BRIDGE_AMOUNT=300000 BRIDGE_JOURNAL_DIR="$reject_dir" \
+  cargo run --manifest-path bridge/Cargo.toml --quiet -- workflow \
+  --journal "$reject_dir" --reuse-from "$expiry_dir" --resume --stop-after reserved \
+  | tee -a /tmp/ctd-workflow.log
+reject_status=${PIPESTATUS[0]}
+set -e
+[[ "$reject_status" -ne 0 ]] || fail "over-capacity reservation should be rejected"
+grep -q ZAMA_RESERVATION_REJECTED /tmp/ctd-workflow.log \
+  || fail "over-capacity rejection was not recorded"
+assert_no_lock_or_mint "$reject_dir"
+if grep -q CANTON_MINT_HOLDING /tmp/ctd-workflow.log; then
+  fail "Canton mint occurred during over-capacity reject"
+fi
+
+echo "BRIDGE_REJECT_RETRY"
+set +e
+env "${workflow_env[@]}" BRIDGE_AMOUNT=300000 BRIDGE_JOURNAL_DIR="$reject_dir" \
+  cargo run --manifest-path bridge/Cargo.toml --quiet -- workflow \
+  --journal "$reject_dir" --resume --stop-after locked \
+  | tee -a /tmp/ctd-workflow.log
+retry_status=${PIPESTATUS[0]}
+set -e
+[[ "$retry_status" -ne 0 ]] || fail "retry of a rejected reservation must fail"
+[[ "$(grep -c ZAMA_RESERVATION_REJECTED /tmp/ctd-workflow.log)" -ge 2 ]] \
+  || fail "rejected reservation was not re-checked on retry"
+assert_no_lock_or_mint "$reject_dir"
+if grep -q RELAYER_RELEASE_CONFIRMED /tmp/ctd-workflow.log; then
+  fail "release ran during rejected reservation"
+fi
+if grep -q CANTON_MINT_HOLDING /tmp/ctd-workflow.log; then
+  fail "Canton mint occurred on rejected reservation retry"
+fi
+
+echo "BRIDGE_RESUME_AFTER accounts"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after accounts
+echo "BRIDGE_RESUME_AFTER reserved"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after reserved
+echo "BRIDGE_RESUME_AFTER locked"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after locked
+assert_journal_step "$journal_dir" locked
+
+echo "BRIDGE_INTERRUPT_AFTER_FIRST_ATTESTATION"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --resume --halt-after-first-approval --omit-journal-save
+assert_journal_step "$journal_dir" locked
+[[ "$(last_marker MINT_APPROVAL_BITMAP)" == "MINT_APPROVAL_BITMAP 1" ]] \
+  || fail "first attestation was not recorded on-chain: $(last_marker MINT_APPROVAL_BITMAP)"
+[[ "$(last_marker RECEIPT_STATUS)" == "RECEIPT_STATUS 1" ]] \
+  || fail "receipt must stay locked after one attestation: $(last_marker RECEIPT_STATUS)"
+
+echo "BRIDGE_SECOND_ATTESTATION_BEFORE_SAVE"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --resume --stop-after mint_approved --omit-journal-save
+assert_journal_step "$journal_dir" locked
+[[ "$(last_marker MINT_APPROVAL_BITMAP)" == "MINT_APPROVAL_BITMAP 3" ]] \
+  || fail "missing attestation was not the only submit: $(last_marker MINT_APPROVAL_BITMAP)"
+[[ "$(last_marker RECEIPT_STATUS)" == "RECEIPT_STATUS 2" ]] \
+  || fail "receipt was not mint-authorized after both attestations: $(last_marker RECEIPT_STATUS)"
+
+echo "BRIDGE_RECOGNISE_EXISTING_MINT_APPROVAL"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --resume --stop-after mint_approved
+assert_journal_step "$journal_dir" mint_approved
+[[ "$(last_marker MINT_APPROVAL_BITMAP)" == "MINT_APPROVAL_BITMAP 3" ]] \
+  || fail "resume did not recognise the existing 2-of-3: $(last_marker MINT_APPROVAL_BITMAP)"
+[[ "$(last_marker RECEIPT_STATUS)" == "RECEIPT_STATUS 2" ]] \
+  || fail "resume changed the mint-authorized receipt: $(last_marker RECEIPT_STATUS)"
+
+for step in canton_minted trade_prepared reassigned settled redeemed; do
   echo "BRIDGE_RESUME_AFTER $step"
   BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
     run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after "$step"
 done
+
+echo "BRIDGE_RELEASE_APPROVAL"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_RELEASE_EXPIRY_SECS=15 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --resume --stop-after release_approved
+assert_journal_step "$journal_dir" release_approved
+
+echo "BRIDGE_RELEASE_APPROVAL_EXPIRED"
+sleep 16
+
+echo "BRIDGE_RELEASE_BEFORE_SAVE"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_RELEASE_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --resume --stop-after released --omit-journal-save
+assert_journal_step "$journal_dir" release_approved
+grep -q RELAYER_RELEASE_CONFIRMED /tmp/ctd-workflow.log \
+  || fail "confidential release through Relayer did not confirm"
+[[ "$(last_marker RELEASE_APPROVAL_BITMAP)" == "RELEASE_APPROVAL_BITMAP 3" ]] \
+  || fail "expired release approval was not replaced with a fresh 2-of-3: $(last_marker RELEASE_APPROVAL_BITMAP)"
+[[ "$(last_marker RECEIPT_STATUS)" == "RECEIPT_STATUS 4" ]] \
+  || fail "release did not land on-chain before the journal save: $(last_marker RECEIPT_STATUS)"
+[[ "$(last_marker DEST_AVAILABLE)" == "DEST_AVAILABLE 100000000000" ]] \
+  || fail "destination available after release/apply is wrong: $(last_marker DEST_AVAILABLE)"
+[[ "$(last_marker DEST_PENDING)" == "DEST_PENDING 0" ]] \
+  || fail "apply-pending did not settle destination credits before the journal save: $(last_marker DEST_PENDING)"
+
+echo "BRIDGE_RESUME_AFTER_RELEASE_WITHOUT_SAVE"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --resume --stop-after released
+assert_journal_step "$journal_dir" released
+[[ "$(grep -c RELAYER_RELEASE_CONFIRMED /tmp/ctd-workflow.log)" -eq 1 ]] \
+  || fail "release was submitted again after the receipt was already released"
+[[ "$(last_marker RECEIPT_STATUS)" == "RECEIPT_STATUS 4" ]] \
+  || fail "resume did not keep the released receipt: $(last_marker RECEIPT_STATUS)"
+[[ "$(last_marker DEST_AVAILABLE)" == "DEST_AVAILABLE 100000000000" ]] \
+  || fail "apply-pending ran twice or corrupted the destination balance: $(last_marker DEST_AVAILABLE)"
+[[ "$(last_marker DEST_PENDING)" == "DEST_PENDING 0" ]] \
+  || fail "destination pending credits were not settled: $(last_marker DEST_PENDING)"
+
+echo "BRIDGE_RESUME_AFTER zama_redeemed"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --resume --stop-after zama_redeemed
 
 grep -q CANTON_MINT_HOLDING /tmp/ctd-workflow.log || fail "Canton mint holding was not recorded"
 grep -q DVP_BUYER_TREASURY /tmp/ctd-workflow.log || fail "buyer did not receive Treasury"

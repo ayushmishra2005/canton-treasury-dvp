@@ -33,10 +33,59 @@ import Treasury.Rules (TreasuryRules(..))
 
 data RuntimeInput = RuntimeInput with
     lockId : Text
-    amount : Decimal
+    amount : Text
     digestHex : Text
     payoutDestination : Text
   deriving (Eq, Show)
+
+parseExactDecimal : Text -> Script Decimal
+parseExactDecimal raw =
+  if raw == "" || Text.isPrefixOf "-" raw
+  then abort "Canton amount must be a positive decimal string"
+  else case Text.splitOn "." raw of
+    [whole] -> fromAmountParts whole "000000"
+    [whole, frac] ->
+      if Text.length frac > 6
+      then abort "Canton amount exceeds 6 decimal places"
+      else if whole == "" || frac == ""
+      then abort "Canton amount is not a decimal string"
+      else fromAmountParts whole (padFrac frac)
+    _ -> abort "Canton amount is not a decimal string"
+
+padFrac : Text -> Text
+padFrac frac = if Text.length frac >= 6 then frac else padFrac (frac <> "0")
+
+fromAmountParts : Text -> Text -> Script Decimal
+fromAmountParts whole frac = do
+  wholeInt <- parseDigits whole
+  fracInt <- parseDigits frac
+  if wholeInt == 0 && fracInt == 0
+  then abort "Canton amount must be greater than zero"
+  else pure (intToDecimal wholeInt + (intToDecimal fracInt / 1000000.0))
+
+parseDigits : Text -> Script Int
+parseDigits raw = parseDigitsAcc 0 (Text.explode raw)
+
+parseDigitsAcc : Int -> [Text] -> Script Int
+parseDigitsAcc acc [] = pure acc
+parseDigitsAcc acc (c :: rest) = do
+  d <- digitValue c
+  let next = acc * 10 + d
+  if next < acc then abort "Canton amount overflows" else parseDigitsAcc next rest
+
+digitValue : Text -> Script Int
+digitValue c = case c of
+  "0" -> pure 0
+  "1" -> pure 1
+  "2" -> pure 2
+  "3" -> pure 3
+  "4" -> pure 4
+  "5" -> pure 5
+  "6" -> pure 6
+  "7" -> pure 7
+  "8" -> pure 8
+  "9" -> pure 9
+  _ -> abort ("Canton amount has a non-digit " <> c)
 
 data Live = Live with
   cashRegistry : Party
@@ -144,6 +193,7 @@ prepare _input = do
 
 mint : RuntimeInput -> Script Text
 mint input = do
+  amount <- parseExactDecimal input.amount
   live <- lookupLive input
   existing <- query @MintedLock live.cashRegistry
   case [minted.holdingCid | (_, minted) <- existing, minted.lockId == input.lockId] of
@@ -155,7 +205,7 @@ mint input = do
         attester = live.attesterA
         cashRegistry = live.cashRegistry
         lockId = input.lockId
-        amount = input.amount
+        amount = amount
         beneficiary = live.buyer
         digestHex = input.digestHex
         direction = MintAttestation
@@ -165,7 +215,7 @@ mint input = do
         attester = live.attesterB
         cashRegistry = live.cashRegistry
         lockId = input.lockId
-        amount = input.amount
+        amount = amount
         beneficiary = live.buyer
         digestHex = input.digestHex
         direction = MintAttestation
@@ -176,7 +226,7 @@ mint input = do
         secondCid
       Some holding <- queryContractId live.buyer holdingCid
       holding.owner === live.buyer
-      holding.amount === input.amount
+      holding.amount === amount
       holding.instrumentId === live.instrumentId
       isNone holding.lock === True
       debug ("CANTON_MINT_HOLDING " <> show holdingCid)
@@ -184,6 +234,7 @@ mint input = do
 
 prepareTrade : RuntimeInput -> Script Text
 prepareTrade input = do
+  amount <- parseExactDecimal input.amount
   live <- lookupLive input
   now <- getTime
   let treasuryInstrumentId = InstrumentId with admin = live.treasuryRegistry, id = "UST-2028-11"
@@ -194,10 +245,10 @@ prepareTrade input = do
       pure ("CANTON_TRADE " <> show tradeCid)
     _ -> do
       (mintedCid, minted) <- mintedFor live input.lockId
-      minted.amount === input.amount
+      minted.amount === amount
       minted.beneficiary === live.buyer
       Some paymentHolding <- queryContractId live.buyer minted.holdingCid
-      paymentHolding.amount === input.amount
+      paymentHolding.amount === amount
       paymentHolding.owner === live.buyer
       (_treasuryHoldingCid, treasuryHolding) <- only "treasury holding" =<< query @TreasuryHolding live.seller
       treasuryHolding.owner === live.seller
@@ -263,7 +314,7 @@ prepareTrade input = do
           paymentLeg = TransferLeg with
             sender = live.buyer
             receiver = live.seller
-            amount = input.amount
+            amount = amount
             instrumentId = live.instrumentId
             meta = emptyMetadata
       proposalCid <- submit live.seller $ createCmd DvpProposal with
@@ -286,6 +337,7 @@ prepareTrade input = do
 
 settle : RuntimeInput -> Script Text
 settle input = do
+  amount <- parseExactDecimal input.amount
   live <- lookupLive input
   now <- getTime
   sellerStable <- query @StablecoinHolding live.seller
@@ -293,7 +345,7 @@ settle input = do
   case (sellerStable, buyerTreasury) of
     ([(paymentCid, payment)], [(treasuryCid, treasury)]) -> do
       payment.owner === live.seller
-      payment.amount === input.amount
+      payment.amount === amount
       treasury.owner === live.buyer
       treasury.amount === 100.0
       let settled =
@@ -309,7 +361,7 @@ settle input = do
       (tradeCid, _) <- only "trade" =<< query @DvpTrade live.venue
       (_mintedCid, minted) <- mintedFor live input.lockId
       Some paymentHolding <- queryContractId live.buyer minted.holdingCid
-      paymentHolding.amount === input.amount
+      paymentHolding.amount === amount
       paymentHolding.owner === live.buyer
       (deliveryHoldingCid, deliveryHolding) <- only "treasury holding" =<< query @TreasuryHolding live.seller
       deliveryHolding.owner === live.seller
@@ -407,7 +459,7 @@ settle input = do
       buyerTreasuryHolding.owner === live.buyer
       buyerTreasuryHolding.amount === 100.0
       sellerPaymentHolding.owner === live.seller
-      sellerPaymentHolding.amount === input.amount
+      sellerPaymentHolding.amount === amount
       buyerStable <- query @StablecoinHolding live.buyer
       sellerTreasury <- query @TreasuryHolding live.seller
       null buyerStable === True
@@ -428,6 +480,7 @@ settle input = do
 
 redeem : RuntimeInput -> Script Text
 redeem input = do
+  amount <- parseExactDecimal input.amount
   live <- lookupLive input
   redeemed <- query @RedeemedLock live.cashRegistry
   case [cid | (cid, lock) <- redeemed, lock.lockId == input.lockId] of
@@ -440,7 +493,7 @@ redeem input = do
       holdings <- query @StablecoinHolding live.seller
       (holdingCid, holding) <- only "seller stablecoin holding" holdings
       holding.amount === minted.amount
-      holding.amount === input.amount
+      holding.amount === amount
       holding.owner === live.seller
       requestCid <- submit live.seller $ createCmd RedemptionRequest with
         holder = live.seller

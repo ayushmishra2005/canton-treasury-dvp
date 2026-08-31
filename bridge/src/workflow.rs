@@ -20,14 +20,21 @@ use crate::canton::CantonClient;
 use crate::confidential::generate_transfer_proofs;
 use crate::journal::{encode_bytes, Journal, OperationStore, Secrets, Step};
 use crate::program::{
-    approve_ix, config_pda, lock_ix, move_ix, receipt_pda, ApproveFields, LockFields,
+    approval_pda, approve_ix, config_pda, lock_ix, move_ix, receipt_pda, ApproveFields, LockFields,
     MovementFields,
 };
+use crate::recovery::{
+    attesters_needed, decode_approval, decode_receipt_status, should_apply_pending,
+    should_refresh_release_materials, should_submit_release, OnChainApproval, RECEIPT_CANCELLED,
+    RECEIPT_MINT_AUTHORIZED, RECEIPT_RELEASED,
+};
 use crate::relayer::{RelayerClient, RelayerInstruction};
+use crate::reservation::{reservation_resume, ReservationAction, RESERVATION_RESERVED};
 use crate::setup::{
     apply_pending, config_is_initialized, create_bridge_accounts, decode_aes, decode_elgamal,
     decode_keypair, decrypt_available, encode_aes, encode_elgamal, encode_keypair,
-    read_mint_decimals, vault_elgamal_pubkey, BridgeAccounts, ConfidentialOwner, DECIMALS,
+    pending_credit_counter, read_mint_decimals, vault_elgamal_pubkey, BridgeAccounts,
+    ConfidentialOwner, DECIMALS,
 };
 use crate::txsize::{report_size, serialize_legacy, LEGACY_LIMIT};
 use crate::units::{require_mint_decimals, TokenUnits};
@@ -46,6 +53,8 @@ pub struct Workflow {
     pub stop_after: Option<Step>,
     pub expiry_recovery: bool,
     pub reuse_from: Option<PathBuf>,
+    pub omit_journal_save: bool,
+    pub halt_after_first_approval: bool,
 }
 
 impl Workflow {
@@ -166,8 +175,9 @@ impl Workflow {
             mint_expiry,
             &lock_proof,
         );
-        if !journal.reached(Step::MintApproved) {
-            self.approve_twice(
+        let mint_receipt = self.read_receipt_status(&receipt)?;
+        if mint_receipt != Some(RECEIPT_MINT_AUTHORIZED) && mint_receipt != Some(RECEIPT_RELEASED) {
+            self.approve_needed(
                 &fee_payer,
                 &attester_a,
                 &attester_b,
@@ -183,6 +193,15 @@ impl Workflow {
                 },
                 &mint_digest,
             )?;
+        }
+        if let Some(approval) = self.read_approval(&approval_pda(&operation, DIRECTION_MINT).0)? {
+            println!("MINT_APPROVAL_BITMAP {}", approval.signer_bitmap);
+        }
+        if let Some(status) = self.read_receipt_status(&receipt)? {
+            println!("RECEIPT_STATUS {status}");
+        }
+        if self.halt_after_first_approval {
+            return Ok(());
         }
         if self.halt(Step::MintApproved, &mut journal)? {
             return Ok(());
@@ -397,23 +416,33 @@ impl Workflow {
         &self,
         reservation_hex: &str,
         amount: u64,
-        journal: &mut Journal,
+        _journal: &mut Journal,
     ) -> Result<()> {
-        if journal.reached(Step::Reserved) {
-            return Ok(());
-        }
-        match self.zama.status(reservation_hex) {
-            Ok(0) | Err(_) => {
+        let status = self.zama.status(reservation_hex);
+        let approved = match &status {
+            Ok(status) if *status == RESERVATION_RESERVED => {
+                Some(self.zama.approved(reservation_hex))
+            }
+            _ => None,
+        };
+        match reservation_resume(status, approved) {
+            Ok(ReservationAction::ResumeApproved) => Ok(()),
+            Ok(ReservationAction::SubmitReserve) => {
                 if !self.zama.reserve(reservation_hex, amount)? {
+                    println!("ZAMA_RESERVATION_REJECTED");
                     anyhow::bail!(
                         "Zama rejected the reservation; no lock or mint will be attempted"
                     );
                 }
+                Ok(())
             }
-            Ok(status) if status >= 1 => {}
-            Ok(status) => anyhow::bail!("unexpected zama reservation status {status}"),
+            Err(err) => {
+                if err.to_string().contains("rejected") {
+                    println!("ZAMA_RESERVATION_REJECTED");
+                }
+                Err(err)
+            }
         }
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -517,12 +546,34 @@ impl Workflow {
         reservation_hex: &str,
         journal: &mut Journal,
     ) -> Result<()> {
-        let dest_before = decrypt_available(
-            &self.rpc,
-            &accounts.destination.token,
-            &accounts.destination.aes,
-        )?;
-        if !journal.reached(Step::Released) {
+        anyhow::ensure!(
+            accounts.destination.token.to_string() == journal.payout_destination,
+            "payout destination changed"
+        );
+        if include_canton_zama {
+            anyhow::ensure!(
+                journal.reached(Step::Redeemed),
+                "release requires redemption evidence"
+            );
+        }
+        let receipt_status = self.read_receipt_status(receipt)?;
+        if let Some(status) = receipt_status {
+            println!("RECEIPT_STATUS {status}");
+            anyhow::ensure!(
+                status != RECEIPT_CANCELLED,
+                "receipt was cancelled; release is not allowed"
+            );
+        }
+        let now = chrono::Utc::now().timestamp();
+        if should_refresh_release_materials(now, journal.release_expiry, receipt_status) {
+            journal.release_expiry = 0;
+            journal.release_proof_hex.clear();
+            journal.release_transfer_hex.clear();
+            journal.release_equality.clear();
+            journal.release_validity.clear();
+            journal.release_range.clear();
+        }
+        if should_submit_release(journal.reached(Step::Released), receipt_status) {
             let materials = self.release_materials(accounts, amount, journal)?;
             let approval_expiry = materials.expiry;
             let release_proof = materials.proof;
@@ -565,23 +616,24 @@ impl Workflow {
                 DIRECTION_RELEASE,
                 &movement,
             )?;
-            if !journal.reached(Step::ReleaseApproved) {
-                self.approve_twice(
-                    fee_payer,
-                    attester_a,
-                    attester_b,
-                    &ApproveFields {
-                        operation,
-                        direction: DIRECTION_RELEASE,
-                        destination: accounts.destination.token,
-                        amount_commitment: commitment,
-                        zama_reservation: reservation,
-                        previous_operation: previous,
-                        expiry: approval_expiry,
-                        proof_commitment: release_proof,
-                    },
-                    &release_digest,
-                )?;
+            self.approve_needed(
+                fee_payer,
+                attester_a,
+                attester_b,
+                &ApproveFields {
+                    operation,
+                    direction: DIRECTION_RELEASE,
+                    destination: accounts.destination.token,
+                    amount_commitment: commitment,
+                    zama_reservation: reservation,
+                    previous_operation: previous,
+                    expiry: approval_expiry,
+                    proof_commitment: release_proof,
+                },
+                &release_digest,
+            )?;
+            if self.halt_after_first_approval {
+                return Ok(());
             }
             if self.halt(Step::ReleaseApproved, journal)? {
                 return Ok(());
@@ -597,17 +649,48 @@ impl Workflow {
                 .wait_confirmed(&release_id, Duration::from_secs(90))?;
             self.confirm_on_chain(&release_sig)?;
             journal.release_signature = release_sig.clone();
+            self.inspect_public_leak(&release, amount)?;
+            println!("RELAYER_RELEASE_CONFIRMED {release_sig}");
+            if let Some(status) = self.read_receipt_status(receipt)? {
+                println!("RECEIPT_STATUS {status}");
+                anyhow::ensure!(
+                    status == RECEIPT_RELEASED,
+                    "release confirmed but receipt status is {status}"
+                );
+            }
+        }
+        let dest_pending = pending_credit_counter(&self.rpc, &accounts.destination.token)?;
+        let dest_available = decrypt_available(
+            &self.rpc,
+            &accounts.destination.token,
+            &accounts.destination.aes,
+        )?;
+        println!("DEST_PENDING {dest_pending}");
+        println!("DEST_AVAILABLE {dest_available}");
+        if should_apply_pending(dest_pending, dest_available, amount)? {
             apply_pending(
                 &self.rpc,
                 &self.payer,
                 &accounts.destination.token,
                 &accounts.destination.authority,
                 &accounts.destination.aes,
-                dest_before + amount,
-                1,
+                amount,
+                dest_pending,
             )?;
-            self.inspect_public_leak(&release, amount)?;
-            println!("RELAYER_RELEASE_CONFIRMED {release_sig}");
+            let dest_after = decrypt_available(
+                &self.rpc,
+                &accounts.destination.token,
+                &accounts.destination.aes,
+            )?;
+            anyhow::ensure!(
+                dest_after == amount,
+                "destination available {dest_after} after apply-pending"
+            );
+            println!(
+                "DEST_PENDING {}",
+                pending_credit_counter(&self.rpc, &accounts.destination.token)?
+            );
+            println!("DEST_AVAILABLE {dest_after}");
         }
         if self.halt(Step::Released, journal)? {
             return Ok(());
@@ -656,7 +739,7 @@ impl Workflow {
             &release_proofs.validity.pubkey(),
             &release_proofs.range.pubkey(),
         );
-        journal.release_expiry = chrono::Utc::now().timestamp() + 3600;
+        journal.release_expiry = chrono::Utc::now().timestamp() + release_deadline_secs();
         journal.release_proof_hex = hex::encode(release_proof);
         journal.release_transfer_hex = hex::encode(release_proofs.transfer_data);
         journal.release_equality = release_proofs.equality.pubkey().to_string();
@@ -850,7 +933,9 @@ impl Workflow {
     fn halt(&self, step: Step, journal: &mut Journal) -> Result<bool> {
         if !journal.reached(step) {
             journal.completed = Some(step);
-            self.store.save_journal(journal)?;
+            if !self.omit_journal_save {
+                self.store.save_journal(journal)?;
+            }
         }
         Ok(self.stop_after == Some(step))
     }
@@ -863,13 +948,37 @@ impl Workflow {
         args: &ApproveFields,
         digest: &[u8; 32],
     ) -> Result<()> {
+        self.approve_needed(fee_payer, attester_a, attester_b, args, digest)
+    }
+
+    fn approve_needed(
+        &self,
+        fee_payer: &Pubkey,
+        attester_a: &Keypair,
+        attester_b: &Keypair,
+        args: &ApproveFields,
+        digest: &[u8; 32],
+    ) -> Result<()> {
+        let (approval, _) = approval_pda(&args.operation, args.direction);
+        let existing = self.read_approval(&approval)?;
+        let now = chrono::Utc::now().timestamp();
+        let needed = attesters_needed(
+            existing.as_ref(),
+            digest,
+            args.expiry,
+            now,
+            args.direction == DIRECTION_RELEASE,
+        )?;
         let approve = approve_ix(*fee_payer, args)?;
         measure_legacy(
             "approve_with_relayer_fee_payer",
             &[ed25519_approve_ix(attester_a, digest)?, approve.clone()],
             fee_payer,
         )?;
-        for attester in [attester_a, attester_b] {
+        for (index, attester) in [attester_a, attester_b].into_iter().enumerate() {
+            if !needed[index] {
+                continue;
+            }
             let ed = ed25519_approve_ix(attester, digest)?;
             let ix = approve_ix(*fee_payer, args)?;
             let id = self
@@ -877,8 +986,42 @@ impl Workflow {
                 .send_instructions(&[to_relayer(&ed), to_relayer(&ix)])?;
             let sig = self.relayer.wait_confirmed(&id, Duration::from_secs(60))?;
             self.confirm_on_chain(&sig)?;
+            if self.halt_after_first_approval {
+                break;
+            }
+        }
+        if let Some(after) = self.read_approval(&approval)? {
+            if args.direction == DIRECTION_MINT {
+                println!("MINT_APPROVAL_BITMAP {}", after.signer_bitmap);
+            } else {
+                println!("RELEASE_APPROVAL_BITMAP {}", after.signer_bitmap);
+            }
+            if !self.halt_after_first_approval {
+                anyhow::ensure!(
+                    after.signer_bitmap.count_ones() >= 2,
+                    "2-of-3 approval is missing"
+                );
+            }
+        } else if !self.halt_after_first_approval {
+            anyhow::bail!("approval account is missing after submit");
         }
         Ok(())
+    }
+
+    fn read_approval(&self, approval: &Pubkey) -> Result<Option<OnChainApproval>> {
+        match self.rpc.get_account(approval) {
+            Ok(account) => Ok(Some(decode_approval(&account.data)?)),
+            Err(err) if account_missing(&err) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn read_receipt_status(&self, receipt: &Pubkey) -> Result<Option<u8>> {
+        match self.rpc.get_account(receipt) {
+            Ok(account) => Ok(Some(decode_receipt_status(&account.data)?)),
+            Err(err) if account_missing(&err) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn send_extra_signer(
@@ -962,11 +1105,24 @@ fn to_relayer(ix: &Instruction) -> RelayerInstruction {
 }
 
 fn mint_deadline_from_env() -> i64 {
-    let secs = std::env::var("BRIDGE_MINT_EXPIRY_SECS")
+    chrono::Utc::now().timestamp() + env_deadline_secs("BRIDGE_MINT_EXPIRY_SECS", 3600)
+}
+
+fn release_deadline_secs() -> i64 {
+    env_deadline_secs("BRIDGE_RELEASE_EXPIRY_SECS", 3600)
+}
+
+fn env_deadline_secs(name: &str, default: i64) -> i64 {
+    std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(3600);
-    chrono::Utc::now().timestamp() + secs.max(5)
+        .unwrap_or(default)
+        .max(5)
+}
+
+fn account_missing(err: &solana_client::client_error::ClientError) -> bool {
+    let text = err.to_string();
+    text.contains("AccountNotFound") || text.contains("could not find account")
 }
 
 fn decode_operation(hex_text: &str) -> Result<[u8; 32]> {

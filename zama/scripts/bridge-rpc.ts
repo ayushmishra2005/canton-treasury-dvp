@@ -21,6 +21,13 @@ async function main() {
     return;
   }
 
+  if (method === "approved") {
+    const handle = await engine.approvalHandle(args[0]);
+    const approved = await fhevm.publicDecryptEbool(handle);
+    console.log("ZAMA_RESULT " + JSON.stringify({ approved }));
+    return;
+  }
+
   if (method === "reserve") {
     const [reservationId, clientId, amount] = args;
     const encrypted = await fhevm

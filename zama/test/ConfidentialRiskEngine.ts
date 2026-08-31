@@ -275,6 +275,53 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
     expect(await fhevm.publicDecryptEbool(await engine.approvalHandle(afterCancelId))).to.equal(true);
   });
 
+  it("capacity probe is rejected while exposure is live and approved after redeem", async function () {
+    const [admin, requester, settler] = await ethers.getSigners();
+    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
+    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const address = await engine.getAddress();
+    const cap = await encrypt64(address, admin.address, 200n);
+    await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();
+    const limit = await encrypt64(address, admin.address, 200n);
+    await (await engine.connect(admin).configureClientLimit(ethers.id("client-a"), limit.handles[0], limit.inputProof)).wait();
+
+    const original = await encrypt64(address, requester.address, 100n);
+    const originalId = ethers.id("capacity-original");
+    await (await engine.connect(requester).reserve(originalId, ethers.id("client-a"), original.handles[0], original.inputProof)).wait();
+    expect(await fhevm.publicDecryptEbool(await engine.approvalHandle(originalId))).to.equal(true);
+    await (await engine.connect(settler).finalize(originalId)).wait();
+
+    const unrelated = await encrypt64(address, requester.address, 100n);
+    const unrelatedId = ethers.id("capacity-unrelated");
+    await (await engine.connect(requester).reserve(unrelatedId, ethers.id("client-a"), unrelated.handles[0], unrelated.inputProof)).wait();
+    expect(await fhevm.publicDecryptEbool(await engine.approvalHandle(unrelatedId))).to.equal(true);
+
+    const liveProbe = await encrypt64(address, requester.address, 100n);
+    const liveProbeId = ethers.id("capacity-probe-live");
+    await (await engine.connect(requester).reserve(liveProbeId, ethers.id("client-a"), liveProbe.handles[0], liveProbe.inputProof)).wait();
+    expect(await fhevm.publicDecryptEbool(await engine.approvalHandle(liveProbeId))).to.equal(false);
+
+    await (await engine.connect(settler).redeem(originalId)).wait();
+
+    const afterProbe = await encrypt64(address, requester.address, 100n);
+    const afterProbeId = ethers.id("capacity-probe-after");
+    await (await engine.connect(requester).reserve(afterProbeId, ethers.id("client-a"), afterProbe.handles[0], afterProbe.inputProof)).wait();
+    expect(await fhevm.publicDecryptEbool(await engine.approvalHandle(afterProbeId))).to.equal(true);
+    expect(await fhevm.publicDecryptEbool(await engine.approvalHandle(unrelatedId))).to.equal(true);
+    expect(await engine.reservationStatus(unrelatedId)).to.equal(1n);
+
+    const leftover = await encrypt64(address, requester.address, 100n);
+    const leftoverId = ethers.id("capacity-probe-leftover");
+    await (await engine.connect(requester).reserve(leftoverId, ethers.id("client-a"), leftover.handles[0], leftover.inputProof)).wait();
+    expect(await fhevm.publicDecryptEbool(await engine.approvalHandle(leftoverId))).to.equal(false);
+
+    await (await engine.connect(settler).cancel(afterProbeId)).wait();
+    await (await engine.connect(settler).cancel(liveProbeId)).wait();
+    await (await engine.connect(settler).cancel(leftoverId)).wait();
+    expect(await fhevm.publicDecryptEbool(await engine.approvalHandle(unrelatedId))).to.equal(true);
+    expect(await engine.reservationStatus(unrelatedId)).to.equal(1n);
+  });
+
   it("does not publicly decrypt amounts or limits in this mock suite", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
     const factory = await ethers.getContractFactory("ConfidentialRiskEngine");

@@ -538,3 +538,51 @@ redeem input = do
               <> "\nCANTON_PAYOUT_DEST " <> input.payoutDestination
       debug redeemed
       pure redeemed
+
+verifyCompletion : RuntimeInput -> Script Text
+verifyCompletion input = do
+  amount <- parseExactDecimal input.amount
+  live <- lookupLive input
+  mintedLocks <- query @MintedLock live.cashRegistry
+  (mintedCid, minted) <- case [(cid, lock) | (cid, lock) <- mintedLocks, lock.lockId == input.lockId] of
+    [found] -> pure found
+    [] -> abort "Canton completion missing minted lock"
+    _ -> abort "Canton completion has more than one minted lock"
+  minted.lockId === input.lockId
+  minted.amount === amount
+  minted.beneficiary === live.buyer
+  stillMinted <- queryContractId live.buyer minted.holdingCid
+  case stillMinted of
+    None -> pure ()
+    Some _ -> abort "Canton completion minted holding is still active"
+  redeemedLocks <- query @RedeemedLock live.cashRegistry
+  (redeemedCid, redeemed) <- case [(cid, lock) | (cid, lock) <- redeemedLocks, lock.lockId == input.lockId] of
+    [found] -> pure found
+    [] -> abort "Canton completion missing redeemed lock"
+    _ -> abort "Canton completion has more than one redeemed lock"
+  redeemed.lockId === input.lockId
+  redeemed.amount === amount
+  redeemed.holder === live.seller
+  sellerPayments <- query @StablecoinHolding live.seller
+  null sellerPayments === True
+  (buyerTreasuryCid, buyerTreasury) <- only "buyer treasury holding" =<< query @TreasuryHolding live.buyer
+  buyerTreasury.owner === live.buyer
+  buyerTreasury.amount === 100.0
+  buyerTreasury.instrumentId === InstrumentId with admin = live.treasuryRegistry, id = "UST-2028-11"
+  live.instrumentId.id === "USD-C"
+  let evidence =
+        "CANTON_ACS_LOCK " <> minted.lockId
+          <> "\nCANTON_ACS_MINT_HOLDING " <> show minted.holdingCid
+          <> "\nCANTON_ACS_MINT_AMOUNT " <> show minted.amount
+          <> "\nCANTON_ACS_REDEEM " <> show redeemedCid
+          <> "\nCANTON_ACS_REDEEM_AMOUNT " <> show redeemed.amount
+          <> "\nCANTON_ACS_BUYER_TREASURY " <> show buyerTreasuryCid
+          <> "\nCANTON_ACS_TREASURY_AMOUNT " <> show buyerTreasury.amount
+          <> "\nCANTON_ACS_BUYER " <> partyToText live.buyer
+          <> "\nCANTON_ACS_SELLER " <> partyToText live.seller
+          <> "\nCANTON_ACS_INSTRUMENT " <> live.instrumentId.id
+          <> "\nCANTON_ACS_OK"
+  debug evidence
+  let _ = mintedCid
+  let _ = input.payoutDestination
+  pure evidence

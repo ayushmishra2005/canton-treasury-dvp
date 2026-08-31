@@ -106,9 +106,6 @@ fn run_workflow(
                 .unwrap_or_else(|_| "canton/.run-bridge/participants.json".to_string()),
         ),
     );
-    if full {
-        canton.prepare()?;
-    }
     let journal_dir = journal.unwrap_or_else(|| {
         PathBuf::from(optional_env("BRIDGE_JOURNAL_DIR", "bridge/.run/current"))
     });

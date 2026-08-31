@@ -16,20 +16,26 @@ use crate::canonical::{
     amount_commitment, operation_digest, proof_commitment, DIRECTION_CANCEL, DIRECTION_MINT,
     DIRECTION_RELEASE,
 };
-use crate::canton::CantonClient;
+use crate::canton::{require_canton_ledger_evidence, CantonClient, CantonLedgerExpectation};
 use crate::confidential::generate_transfer_proofs;
-use crate::journal::{encode_bytes, Journal, OperationStore, Secrets, Step};
+use crate::journal::{
+    encode_bytes, resume_matches_recorded_operation, Journal, OperationStore, Secrets, Step,
+};
 use crate::program::{
     approval_pda, approve_ix, config_pda, lock_ix, move_ix, receipt_pda, ApproveFields, LockFields,
     MovementFields,
 };
 use crate::recovery::{
-    attesters_needed, decode_approval, decode_receipt_status, should_apply_pending,
-    should_refresh_release_materials, should_submit_release, OnChainApproval, RECEIPT_CANCELLED,
-    RECEIPT_MINT_AUTHORIZED, RECEIPT_RELEASED,
+    attesters_needed, completed_operation_decision, decode_approval, decode_receipt_status,
+    should_apply_pending, should_refresh_release_materials, should_submit_release,
+    CompletionDecision, OnChainApproval, RECEIPT_CANCELLED, RECEIPT_MINT_AUTHORIZED,
+    RECEIPT_RELEASED,
 };
 use crate::relayer::{RelayerClient, RelayerInstruction};
-use crate::reservation::{reservation_resume, ReservationAction, RESERVATION_RESERVED};
+use crate::reservation::{
+    reservation_resume, ReservationAction, RESERVATION_FINALIZED, RESERVATION_REDEEMED,
+    RESERVATION_RESERVED,
+};
 use crate::setup::{
     apply_pending, config_is_initialized, create_bridge_accounts, decode_aes, decode_elgamal,
     decode_keypair, decrypt_available, encode_aes, encode_elgamal, encode_keypair,
@@ -71,13 +77,38 @@ impl Workflow {
         let canton_amount = units.canton_decimal()?;
         let amount = units.base_units;
         let fee_payer: Pubkey = self.relayer.address()?.parse()?;
-        crate::setup::airdrop(&self.rpc, &fee_payer)?;
-        crate::setup::airdrop(&self.rpc, &self.payer.pubkey())?;
 
         let journal = self.store.load_journal()?.unwrap_or_default();
         let secrets = self.store.load_secrets()?;
+        if include_canton_zama {
+            if let Some(mut completed) =
+                self.try_completed_resume(amount, journal.clone(), secrets.clone())?
+            {
+                println!("COMPLETED_RESUME_SKIP_SETUP");
+                if let Ok(count) = self.rpc.get_transaction_count() {
+                    println!("SOLANA_TX_COUNT {count}");
+                }
+                self.record_completed_operation(
+                    &completed.accounts,
+                    amount,
+                    &completed.receipt,
+                    &completed.reservation_hex,
+                    &mut completed.journal,
+                )?;
+                return Ok(());
+            }
+        }
+
+        crate::setup::airdrop(&self.rpc, &fee_payer)?;
+        crate::setup::airdrop(&self.rpc, &self.payer.pubkey())?;
+
         let (accounts, mut journal, secrets) =
             self.load_or_create_accounts(amount, journal, secrets)?;
+        resume_matches_recorded_operation(
+            &journal,
+            amount,
+            &accounts.destination.token.to_string(),
+        )?;
         let attester_a = decode_keypair(&secrets.attester_a)?;
         let attester_b = decode_keypair(&secrets.attester_b)?;
         self.persist(&journal, &secrets)?;
@@ -115,7 +146,20 @@ impl Workflow {
         self.persist(&journal, &secrets)?;
 
         if include_canton_zama {
-            self.reserve_once(&reservation_hex, amount, &mut journal)?;
+            self.canton.prepare()?;
+            match self.reserve_once(&reservation_hex, amount)? {
+                ReservationAction::RecordCompleted => {
+                    self.record_completed_operation(
+                        &accounts,
+                        amount,
+                        &receipt,
+                        &reservation_hex,
+                        &mut journal,
+                    )?;
+                    return Ok(());
+                }
+                ReservationAction::SubmitReserve | ReservationAction::ResumeApproved => {}
+            }
             if self.halt(Step::Reserved, &mut journal)? {
                 return Ok(());
             }
@@ -215,11 +259,15 @@ impl Workflow {
                 journal.mint_holding = holding;
                 self.store.save_journal(&journal)?;
                 println!("CANTON_MINT_HOLDING {}", journal.mint_holding);
-                match self.zama.status(&reservation_hex) {
-                    Ok(1) => self.zama.finalize(&reservation_hex)?,
-                    Ok(2) | Ok(4) => {}
-                    Ok(status) => anyhow::bail!("unexpected zama status {status} after mint"),
-                    Err(err) => return Err(err),
+                let zama_status = self.zama.status(&reservation_hex)?;
+                anyhow::ensure!(
+                    self.zama.approved(&reservation_hex)?,
+                    "cannot finalize a rejected reservation"
+                );
+                match zama_status {
+                    1 => self.zama.finalize(&reservation_hex)?,
+                    2 | 4 => {}
+                    status => anyhow::bail!("unexpected zama status {status} after mint"),
                 }
             }
             if self.halt(Step::CantonMinted, &mut journal)? {
@@ -412,29 +460,77 @@ impl Workflow {
         Ok((accounts, journal, secrets))
     }
 
-    fn reserve_once(
+    fn try_completed_resume(
         &self,
-        reservation_hex: &str,
         amount: u64,
-        _journal: &mut Journal,
-    ) -> Result<()> {
+        journal: Journal,
+        secrets: Option<Secrets>,
+    ) -> Result<Option<CompletedResume>> {
+        let Some(secrets) = secrets else {
+            return Ok(None);
+        };
+        if journal.operation_hex.is_empty() || journal.mint.is_empty() {
+            return Ok(None);
+        }
+        if !config_is_initialized(&self.rpc)? {
+            return Ok(None);
+        }
+        resume_matches_recorded_operation(&journal, amount, &journal.payout_destination)?;
+        let accounts = accounts_from_secrets(&journal, &secrets)?;
+        let reservation_hex = if journal.reservation_hex.is_empty() {
+            format!("0x{}", journal.operation_hex)
+        } else {
+            journal.reservation_hex.clone()
+        };
+        let status = self.zama.status(&reservation_hex);
+        let approved = match &status {
+            Ok(status)
+                if *status == RESERVATION_RESERVED
+                    || *status == RESERVATION_FINALIZED
+                    || *status == RESERVATION_REDEEMED =>
+            {
+                Some(self.zama.approved(&reservation_hex))
+            }
+            _ => None,
+        };
+        match reservation_resume(status, approved) {
+            Ok(ReservationAction::RecordCompleted) => {
+                let operation = decode_operation(&journal.operation_hex)?;
+                let (receipt, _) = receipt_pda(&operation);
+                Ok(Some(CompletedResume {
+                    accounts,
+                    journal,
+                    receipt,
+                    reservation_hex,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn reserve_once(&self, reservation_hex: &str, amount: u64) -> Result<ReservationAction> {
         let status = self.zama.status(reservation_hex);
         let approved = match &status {
-            Ok(status) if *status == RESERVATION_RESERVED => {
+            Ok(status)
+                if *status == RESERVATION_RESERVED
+                    || *status == RESERVATION_FINALIZED
+                    || *status == RESERVATION_REDEEMED =>
+            {
                 Some(self.zama.approved(reservation_hex))
             }
             _ => None,
         };
         match reservation_resume(status, approved) {
-            Ok(ReservationAction::ResumeApproved) => Ok(()),
-            Ok(ReservationAction::SubmitReserve) => {
-                if !self.zama.reserve(reservation_hex, amount)? {
+            Ok(action) => {
+                if action == ReservationAction::SubmitReserve
+                    && !self.zama.reserve(reservation_hex, amount)?
+                {
                     println!("ZAMA_RESERVATION_REJECTED");
                     anyhow::bail!(
                         "Zama rejected the reservation; no lock or mint will be attempted"
                     );
                 }
-                Ok(())
+                Ok(action)
             }
             Err(err) => {
                 if err.to_string().contains("rejected") {
@@ -443,6 +539,76 @@ impl Workflow {
                 Err(err)
             }
         }
+    }
+
+    fn record_completed_operation(
+        &self,
+        accounts: &BridgeAccounts,
+        amount: u64,
+        receipt: &Pubkey,
+        reservation_hex: &str,
+        journal: &mut Journal,
+    ) -> Result<()> {
+        let expected = CantonLedgerExpectation {
+            lock_id: journal.lock_id.clone(),
+            canton_amount: journal.canton_amount.clone(),
+            treasury_amount: "100.000000".to_string(),
+            payout_destination: journal.payout_destination.clone(),
+            mint_holding: journal.mint_holding.clone(),
+        };
+        let evidence =
+            require_canton_ledger_evidence(self.canton.verify_completion(&expected), &expected)?;
+        println!("CANTON_VERIFY_LOCK {}", evidence.lock_id);
+        println!("CANTON_VERIFY_MINT_HOLDING {}", evidence.mint_holding);
+        println!("CANTON_VERIFY_MINT_CONSUMED {}", evidence.mint_holding);
+        println!("CANTON_VERIFY_BUYER_TREASURY {}", evidence.buyer_treasury);
+        println!("CANTON_VERIFY_SELLER_PAYMENT {}", evidence.seller_payment);
+        println!("CANTON_VERIFY_SELLER_BURN {}", evidence.seller_payment);
+        println!("CANTON_VERIFY_REDEEM {}", evidence.redeemed_lock);
+        println!("CANTON_VERIFY_PAYOUT {}", evidence.payout_destination);
+        println!("CANTON_VERIFY_PAYMENT_AMOUNT {}", evidence.payment_amount);
+        println!("CANTON_VERIFY_TREASURY_AMOUNT {}", evidence.treasury_amount);
+        println!("CANTON_VERIFY_INSTRUMENT {}", evidence.instrument_id);
+        println!("CANTON_VERIFY_OK");
+        let decision = completed_operation_decision(
+            self.zama.status(reservation_hex),
+            Some(self.zama.approved(reservation_hex)),
+            self.read_receipt_status(receipt),
+            pending_credit_counter(&self.rpc, &accounts.destination.token),
+            decrypt_available(
+                &self.rpc,
+                &accounts.destination.token,
+                &accounts.destination.aes,
+            ),
+            amount,
+            evidence.settle_seen && evidence.mint_consumed,
+            evidence.redeem_seen && evidence.seller_burned,
+            accounts.destination.token.to_string() == journal.payout_destination
+                && evidence.payout_destination == journal.payout_destination,
+        )?;
+        anyhow::ensure!(
+            decision == CompletionDecision::RecordAndExit,
+            "completed reservation did not present matching recovery evidence"
+        );
+        if let Some(status) = self.read_receipt_status(receipt)? {
+            println!("RECEIPT_STATUS {status}");
+        }
+        println!(
+            "DEST_PENDING {}",
+            pending_credit_counter(&self.rpc, &accounts.destination.token)?
+        );
+        println!(
+            "DEST_AVAILABLE {}",
+            decrypt_available(
+                &self.rpc,
+                &accounts.destination.token,
+                &accounts.destination.aes,
+            )?
+        );
+        println!("ZAMA_STATUS {RESERVATION_REDEEMED}");
+        println!("OPERATION_RECORDED_COMPLETE {reservation_hex}");
+        let _ = self.halt(Step::ZamaRedeemed, journal)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -459,7 +625,10 @@ impl Workflow {
         journal: &mut Journal,
     ) -> Result<()> {
         let (receipt, _) = receipt_pda(&operation);
-        if journal.reached(Step::Locked) || self.rpc.get_account(&receipt).is_ok() {
+        if journal.reached(Step::Locked) {
+            return Ok(());
+        }
+        if self.read_receipt_status(&receipt)?.is_some() {
             journal.completed = Some(Step::Locked.max_completed(journal.completed));
             return Ok(());
         }
@@ -697,8 +866,10 @@ impl Workflow {
         }
         if include_canton_zama && !journal.reached(Step::ZamaRedeemed) {
             match self.zama.status(reservation_hex) {
-                Ok(4) => {}
-                _ => self.zama.redeem(reservation_hex)?,
+                Ok(RESERVATION_REDEEMED) => {}
+                Ok(RESERVATION_FINALIZED) => self.zama.redeem(reservation_hex)?,
+                Ok(status) => anyhow::bail!("unexpected zama status {status} before redeem"),
+                Err(err) => return Err(err),
             }
             println!("ZAMA_REDEEM_OK {reservation_hex}");
         }
@@ -1172,6 +1343,13 @@ fn accounts_from_secrets(journal: &Journal, secrets: &Secrets) -> Result<BridgeA
             aes: decode_aes(&secrets.dest_aes)?,
         },
     })
+}
+
+struct CompletedResume {
+    accounts: BridgeAccounts,
+    journal: Journal,
+    receipt: Pubkey,
+    reservation_hex: String,
 }
 
 impl Step {

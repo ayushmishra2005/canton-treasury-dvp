@@ -10,6 +10,20 @@ pub const RESERVATION_REDEEMED: u8 = 4;
 pub enum ReservationAction {
     SubmitReserve,
     ResumeApproved,
+    RecordCompleted,
+}
+
+fn require_approved(approved: Option<Result<bool>>) -> Result<()> {
+    let approved = approved
+        .ok_or_else(|| anyhow!("reservation approval was not read"))?
+        .map_err(|err| anyhow!("failed to read reservation approval: {err}"))?;
+    if approved {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Zama rejected the reservation; no lock or mint will be attempted"
+        ))
+    }
 }
 
 pub fn reservation_resume(
@@ -19,25 +33,17 @@ pub fn reservation_resume(
     let status = status.map_err(|err| anyhow!("failed to read reservation status: {err}"))?;
     match status {
         RESERVATION_EMPTY => Ok(ReservationAction::SubmitReserve),
-        RESERVATION_RESERVED => {
-            let approved = approved
-                .ok_or_else(|| anyhow!("reservation approval was not read"))?
-                .map_err(|err| anyhow!("failed to read reservation approval: {err}"))?;
-            if approved {
-                Ok(ReservationAction::ResumeApproved)
-            } else {
-                Err(anyhow!(
-                    "Zama rejected the reservation; no lock or mint will be attempted"
-                ))
-            }
+        RESERVATION_RESERVED | RESERVATION_FINALIZED => {
+            require_approved(approved)?;
+            Ok(ReservationAction::ResumeApproved)
         }
-        RESERVATION_FINALIZED => Ok(ReservationAction::ResumeApproved),
         RESERVATION_CANCELLED => Err(anyhow!(
             "reservation was cancelled; no lock or mint will be attempted"
         )),
-        RESERVATION_REDEEMED => Err(anyhow!(
-            "reservation already completed; will not start another operation"
-        )),
+        RESERVATION_REDEEMED => {
+            require_approved(approved)?;
+            Ok(ReservationAction::RecordCompleted)
+        }
         other => Err(anyhow!("unexpected zama reservation status {other}")),
     }
 }
@@ -62,11 +68,8 @@ mod tests {
 
     #[test]
     fn completed_reservation_does_not_start_another_operation() {
-        let err = reservation_resume(Ok(RESERVATION_REDEEMED), None).unwrap_err();
-        assert!(
-            err.to_string().contains("completed"),
-            "redeemed reservation must not start another operation: {err}"
-        );
+        assert!(reservation_resume(Ok(RESERVATION_REDEEMED), None).is_err());
+        assert!(reservation_resume(Ok(RESERVATION_REDEEMED), Some(Ok(false))).is_err());
     }
 
     #[test]
@@ -81,6 +84,21 @@ mod tests {
             Some(Err(anyhow!("decrypt failed")))
         )
         .is_err());
+        assert!(reservation_resume(
+            Ok(RESERVATION_FINALIZED),
+            Some(Err(anyhow!("decrypt failed")))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejected_then_finalized_does_not_resume() {
+        let err = reservation_resume(Ok(RESERVATION_FINALIZED), Some(Ok(false))).unwrap_err();
+        assert!(
+            err.to_string().contains("rejected"),
+            "finalized rejected reservation must stop the workflow: {err}"
+        );
+        assert!(reservation_resume(Ok(RESERVATION_FINALIZED), None).is_err());
     }
 
     #[test]
@@ -90,12 +108,26 @@ mod tests {
             ReservationAction::ResumeApproved
         );
         assert_eq!(
-            reservation_resume(Ok(RESERVATION_FINALIZED), None).unwrap(),
+            reservation_resume(Ok(RESERVATION_FINALIZED), Some(Ok(true))).unwrap(),
             ReservationAction::ResumeApproved
         );
         assert_eq!(
             reservation_resume(Ok(RESERVATION_EMPTY), None).unwrap(),
             ReservationAction::SubmitReserve
         );
+    }
+
+    #[test]
+    fn redeemed_approved_operation_is_recorded_not_restarted() {
+        assert_eq!(
+            reservation_resume(Ok(RESERVATION_REDEEMED), Some(Ok(true))).unwrap(),
+            ReservationAction::RecordCompleted
+        );
+        assert!(reservation_resume(Ok(RESERVATION_REDEEMED), Some(Ok(false))).is_err());
+        assert!(reservation_resume(
+            Ok(RESERVATION_REDEEMED),
+            Some(Err(anyhow!("decrypt failed")))
+        )
+        .is_err());
     }
 }

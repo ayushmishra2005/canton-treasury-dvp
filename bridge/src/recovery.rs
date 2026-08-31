@@ -1,5 +1,65 @@
 use anyhow::{anyhow, Result};
 
+use crate::reservation::RESERVATION_REDEEMED;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionDecision {
+    Continue,
+    RecordAndExit,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn completed_operation_decision(
+    zama_status: Result<u8>,
+    zama_approved: Option<Result<bool>>,
+    receipt_status: Result<Option<u8>>,
+    dest_pending: Result<u64>,
+    dest_available: Result<u64>,
+    expected_amount: u64,
+    has_canton_settlement: bool,
+    has_canton_redemption: bool,
+    payout_matches: bool,
+) -> Result<CompletionDecision> {
+    let status = zama_status.map_err(|err| anyhow!("failed to read reservation status: {err}"))?;
+    if status != RESERVATION_REDEEMED {
+        return Ok(CompletionDecision::Continue);
+    }
+    let approved = zama_approved
+        .ok_or_else(|| anyhow!("reservation approval was not read"))?
+        .map_err(|err| anyhow!("failed to read reservation approval: {err}"))?;
+    if !approved {
+        return Err(anyhow!(
+            "Zama rejected the reservation; no lock or mint will be attempted"
+        ));
+    }
+    let receipt = receipt_status.map_err(|err| anyhow!("failed to read receipt status: {err}"))?;
+    if receipt != Some(RECEIPT_RELEASED) {
+        return Err(anyhow!(
+            "Zama redemption is not enough; Solana receipt is not released"
+        ));
+    }
+    let pending =
+        dest_pending.map_err(|err| anyhow!("failed to read destination pending credits: {err}"))?;
+    let available = dest_available
+        .map_err(|err| anyhow!("failed to read destination available balance: {err}"))?;
+    if pending != 0 || available != expected_amount {
+        return Err(anyhow!(
+            "destination balances do not match the completed operation"
+        ));
+    }
+    if !has_canton_settlement || !has_canton_redemption {
+        return Err(anyhow!(
+            "Canton settlement or redemption evidence is missing"
+        ));
+    }
+    if !payout_matches {
+        return Err(anyhow!(
+            "payout destination does not match the recorded operation"
+        ));
+    }
+    Ok(CompletionDecision::RecordAndExit)
+}
+
 pub const RECEIPT_LOCKED: u8 = 1;
 pub const RECEIPT_MINT_AUTHORIZED: u8 = 2;
 pub const RECEIPT_CANCELLED: u8 = 3;
@@ -204,6 +264,108 @@ mod tests {
         assert_eq!(
             attesters_needed(Some(&authorized), &[7u8; 32], 1_500, 2_000, false).unwrap(),
             [false, false]
+        );
+    }
+
+    #[test]
+    fn redeemed_alone_is_not_completion() {
+        let err = completed_operation_decision(
+            Ok(4),
+            Some(Ok(true)),
+            Ok(Some(RECEIPT_MINT_AUTHORIZED)),
+            Ok(0),
+            Ok(0),
+            100_000_000_000,
+            true,
+            true,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not released") || err.to_string().contains("receipt"),
+            "{err}"
+        );
+        assert!(completed_operation_decision(
+            Ok(4),
+            Some(Ok(true)),
+            Ok(Some(RECEIPT_RELEASED)),
+            Ok(0),
+            Ok(100_000_000_000),
+            100_000_000_000,
+            false,
+            true,
+            true,
+        )
+        .is_err());
+        assert!(completed_operation_decision(
+            Ok(4),
+            Some(Ok(false)),
+            Ok(Some(RECEIPT_RELEASED)),
+            Ok(0),
+            Ok(100_000_000_000),
+            100_000_000_000,
+            true,
+            true,
+            true,
+        )
+        .is_err());
+        assert!(completed_operation_decision(
+            Ok(4),
+            Some(Err(anyhow!("decrypt failed"))),
+            Ok(Some(RECEIPT_RELEASED)),
+            Ok(0),
+            Ok(100_000_000_000),
+            100_000_000_000,
+            true,
+            true,
+            true,
+        )
+        .is_err());
+        assert!(completed_operation_decision(
+            Ok(4),
+            Some(Ok(true)),
+            Err(anyhow!("rpc down")),
+            Ok(0),
+            Ok(100_000_000_000),
+            100_000_000_000,
+            true,
+            true,
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn matching_completed_evidence_is_recorded() {
+        assert_eq!(
+            completed_operation_decision(
+                Ok(4),
+                Some(Ok(true)),
+                Ok(Some(RECEIPT_RELEASED)),
+                Ok(0),
+                Ok(100_000_000_000),
+                100_000_000_000,
+                true,
+                true,
+                true,
+            )
+            .unwrap(),
+            CompletionDecision::RecordAndExit
+        );
+        assert_eq!(
+            completed_operation_decision(
+                Ok(2),
+                Some(Ok(true)),
+                Ok(Some(RECEIPT_MINT_AUTHORIZED)),
+                Ok(0),
+                Ok(0),
+                100_000_000_000,
+                false,
+                false,
+                true,
+            )
+            .unwrap(),
+            CompletionDecision::Continue
         );
     }
 

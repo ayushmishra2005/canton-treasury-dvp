@@ -266,7 +266,7 @@ LP tokens, swap curves, or AMM pricing.
 | Phase | Status |
 |---|---|
 | M1–M7 Canton atomic DvP, two synchronizers, verified privacy | **Complete** |
-| Phase 1 confidential settlement rail | **Complete (local only).** Encrypted capacity, confidential Solana custody, 2-of-3 mint/release approvals, live Treasury DvP funded by the minted holding, seller redemption, Relayer release, Zama redeem, journal resume from on-chain state after partial success, rejected-reservation retry without lock or mint, and exact Canton decimal strings. |
+| Phase 1 confidential settlement rail | **Complete (local only).** Encrypted capacity, confidential Solana custody, 2-of-3 mint/release approvals, live Treasury DvP funded by the minted holding, seller redemption, Relayer release, Zama redeem, journal resume from on-chain state after partial success, rejected or finalized-unapproved reservations without lock or mint, post-redemption crash recording, exact Canton decimal strings, Canton completion checked from update history rather than journal fields, and Zama capacity recovery checked with approval-only probes. |
 | Phase 2 extended security testing, operational hardening, benchmarks, and publication | **Not started.** |
 
 Phase 1 workflow, all asynchronous except the existing Canton settle:
@@ -369,13 +369,17 @@ make bridge-verify
 `scripts/bridge-e2e.sh` starts only the local validator, Relayer 1.5.0, Hardhat,
 and related processes it created. Occupied ports fail the run. Missing services
 fail the run. `BRIDGE_E2E_COMPLETE` is printed only after expiry recovery on a locked
-operation, an over-capacity reservation that stays rejected on retry with no
-Solana lock or Canton mint, coordinator restart after on-chain success that was
-not saved locally (including between the two mint attestations and after
-release-approval expiry), the minted holding funds atomic Treasury DvP, the
-seller's stablecoin is redeemed, confidential release through Relayer confirms
-to the redemption destination, destination apply-pending is not applied twice,
-and Zama redemption succeeds.
+operation, an over-capacity reservation that stays rejected on retry and after a
+later finalize with no Solana lock or Canton mint, coordinator restart after
+on-chain success that was not saved locally (including between the two mint
+attestations, after release-approval expiry, and after Zama redemption), the
+minted holding funds atomic Treasury DvP, the seller's stablecoin is redeemed,
+confidential release through Relayer confirms to the redemption destination,
+destination apply-pending is not applied twice, a completed resume skips setup
+and funding and checks Canton from update history, a second resume of the
+completed operation changes no ledger state, and Zama capacity probes are
+rejected while exposure is live and approved after redemption without decrypting
+amounts or limits.
 
 Amounts use one convention: Solana and Zama carry integer base units; Canton
 carries whole-token Decimals. With six decimals, 1 token is 1,000,000 base
@@ -620,9 +624,11 @@ observes data it should not, or any Canton process or port survives shutdown.
 ## Status
 
 **M1–M7 complete.** Phase 1 of the confidential rail is **complete** on the
-local stack: rejected Zama reservations cannot be retried into a lock or mint,
-resume reads Solana and destination state rather than only the journal, and
-Canton script amounts stay exact decimal strings. The stack is local-only,
+local stack: rejected or finalized-unapproved Zama reservations cannot lock or
+mint, resume records a completed operation after Zama redemption without
+starting another one, resume reads chain state rather than only the journal,
+Canton completion requires operation-specific update history, and Zama capacity
+recovery is checked with approval-only probes. The stack is local-only,
 unaudited, uses mock FHE in Hardhat, and relies on attested equality rather
 than a cross-scheme proof. Phase 2 has not started.
 

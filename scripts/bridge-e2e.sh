@@ -269,12 +269,72 @@ if grep -q CANTON_MINT_HOLDING /tmp/ctd-workflow.log; then
   fail "Canton mint occurred on rejected reservation retry"
 fi
 
+zama_rpc() {
+  local method="$1"
+  local args="$2"
+  (cd "$repo_root/zama" && env \
+    ZAMA_RPC_URL=http://127.0.0.1:8545 \
+    ZAMA_ENGINE="$(awk '/ZAMA_ENGINE /{print $2}' /tmp/ctd-zama-deploy.log | tail -1)" \
+    ZAMA_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+    ZAMA_METHOD="$method" \
+    ZAMA_ARGS="$args" \
+    npx hardhat run scripts/bridge-rpc.ts --network localhost)
+}
+
+zama_result_line() {
+  zama_rpc "$1" "$2" | awk '/^ZAMA_RESULT /{line=$0} END{print line}'
+}
+
+reject_reservation="$(python3 -c "import json; print(json.load(open('$reject_dir/journal.json'))['reservation_hex'])")"
+echo "BRIDGE_REJECT_FINALIZE"
+zama_rpc finalize "$reject_reservation" >/tmp/ctd-zama-finalize.log
+grep -q ZAMA_RESULT /tmp/ctd-zama-finalize.log || fail "finalize of the rejected reservation did not return"
+[[ "$(zama_result_line status "$reject_reservation")" == *'"status":2'* ]] \
+  || fail "rejected reservation was not finalized: $(zama_result_line status "$reject_reservation")"
+[[ "$(zama_result_line approved "$reject_reservation")" == *'"approved":false'* ]] \
+  || fail "finalized rejected reservation must stay unapproved: $(zama_result_line approved "$reject_reservation")"
+
+echo "BRIDGE_REJECT_FINALIZED_RESUME"
+set +e
+env "${workflow_env[@]}" BRIDGE_AMOUNT=300000 BRIDGE_JOURNAL_DIR="$reject_dir" \
+  cargo run --manifest-path bridge/Cargo.toml --quiet -- workflow \
+  --journal "$reject_dir" --resume --stop-after locked \
+  | tee -a /tmp/ctd-workflow.log
+finalized_retry=${PIPESTATUS[0]}
+set -e
+[[ "$finalized_retry" -ne 0 ]] || fail "finalized rejected reservation must not resume into lock"
+[[ "$(grep -c ZAMA_RESERVATION_REJECTED /tmp/ctd-workflow.log)" -ge 3 ]] \
+  || fail "finalized rejected reservation was not rejected on resume"
+assert_no_lock_or_mint "$reject_dir"
+if grep -q CANTON_MINT_HOLDING /tmp/ctd-workflow.log; then
+  fail "Canton mint occurred after rejected reservation was finalized"
+fi
+
 echo "BRIDGE_RESUME_AFTER accounts"
 BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
   run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after accounts
 echo "BRIDGE_RESUME_AFTER reserved"
 BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
   run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after reserved
+
+zama_client="$(awk '/ZAMA_CLIENT /{print $2}' /tmp/ctd-zama-deploy.log | tail -1)"
+probe_units=100000000000
+fresh_id() { python3 -c "import os; print('0x'+os.urandom(32).hex())"; }
+unrelated_id="$(fresh_id)"
+live_probe_id="$(fresh_id)"
+echo "BRIDGE_CAPACITY_PROBE_WHILE_LIVE"
+unrelated_line="$(zama_result_line reserve "$unrelated_id,$zama_client,$probe_units")"
+[[ "$unrelated_line" == *'"approved":true'* ]] \
+  || fail "unrelated live reservation should be approved: $unrelated_line"
+live_probe_line="$(zama_result_line reserve "$live_probe_id,$zama_client,$probe_units")"
+[[ "$live_probe_line" == *'"approved":false'* ]] \
+  || fail "same-sized probe must be rejected while original exposure is live: $live_probe_line"
+zama_rpc cancel "$live_probe_id" >/tmp/ctd-zama-cancel-live-probe.log
+[[ "$(zama_result_line approved "$unrelated_id")" == *'"approved":true'* ]] \
+  || fail "unrelated live exposure was dropped while the original reservation is active"
+[[ "$(zama_result_line status "$unrelated_id")" == *'"status":1'* ]] \
+  || fail "unrelated live reservation did not stay reserved"
+
 echo "BRIDGE_RESUME_AFTER locked"
 BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
   run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after locked
@@ -349,9 +409,136 @@ assert_journal_step "$journal_dir" released
 [[ "$(last_marker DEST_PENDING)" == "DEST_PENDING 0" ]] \
   || fail "destination pending credits were not settled: $(last_marker DEST_PENDING)"
 
-echo "BRIDGE_RESUME_AFTER zama_redeemed"
+echo "BRIDGE_ZAMA_REDEEM_BEFORE_SAVE"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --resume --stop-after zama_redeemed --omit-journal-save
+assert_journal_step "$journal_dir" released
+grep -q ZAMA_REDEEM_OK /tmp/ctd-workflow.log || fail "Zama redemption did not land before the journal save"
+main_reservation="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json'))['reservation_hex'])")"
+[[ "$(zama_result_line status "$main_reservation")" == *'"status":4'* ]] \
+  || fail "Zama redemption did not reach Redeemed: $(zama_result_line status "$main_reservation")"
+[[ "$(zama_result_line approved "$main_reservation")" == *'"approved":true'* ]] \
+  || fail "redeemed reservation lost its approval bit"
+
+zama_block() {
+  curl -sf -X POST -H 'content-type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+    http://127.0.0.1:8545 | python3 -c "import json,sys; print(int(json.load(sys.stdin)['result'],16))"
+}
+
+echo "BRIDGE_RESUME_AFTER_ZAMA_REDEEM_WITHOUT_SAVE"
+tx_size_before_complete="$(grep -c TX_SIZE /tmp/ctd-workflow.log || true)"
+zama_before_complete="$(zama_block)"
 BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
   run_workflow --journal "$journal_dir" --resume --stop-after zama_redeemed
+assert_journal_step "$journal_dir" zama_redeemed
+grep -q OPERATION_RECORDED_COMPLETE /tmp/ctd-workflow.log \
+  || fail "resume did not record the completed operation after Zama redemption"
+grep -q COMPLETED_RESUME_SKIP_SETUP /tmp/ctd-workflow.log \
+  || fail "completed resume did not skip setup and funding"
+grep -q CANTON_VERIFY_OK /tmp/ctd-workflow.log \
+  || fail "completed resume did not verify Canton from ledger history"
+[[ "$(grep -c ZAMA_REDEEM_OK /tmp/ctd-workflow.log)" -eq 1 ]] \
+  || fail "Zama redemption was submitted again after it had already landed"
+[[ "$(grep -c RELAYER_RELEASE_CONFIRMED /tmp/ctd-workflow.log)" -eq 1 ]] \
+  || fail "release was submitted again while recording completion"
+[[ "$(grep -c TX_SIZE /tmp/ctd-workflow.log || true)" == "$tx_size_before_complete" ]] \
+  || fail "completed resume submitted another Solana transaction"
+[[ "$(last_marker DEST_AVAILABLE)" == "DEST_AVAILABLE 100000000000" ]] \
+  || fail "destination balance changed while recording completion: $(last_marker DEST_AVAILABLE)"
+[[ "$(last_marker RECEIPT_STATUS)" == "RECEIPT_STATUS 4" ]] \
+  || fail "receipt changed while recording completion: $(last_marker RECEIPT_STATUS)"
+[[ "$(zama_block)" == "$zama_before_complete" ]] \
+  || fail "completed resume submitted another Zama transaction"
+
+echo "BRIDGE_LEDGER_EVIDENCE_NEGATIVE"
+lock_id="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json'))['lock_id'])")"
+mint_holding="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json'))['mint_holding'])")"
+payout="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json'))['payout_destination'])")"
+canton_amount="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json'))['canton_amount'])")"
+set +e
+env CANTON_RUN_DIR="$run_dir" CANTON_JAR="$canton_jar" \
+  BRIDGE_LOCK_ID="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" \
+  BRIDGE_CANTON_AMOUNT="$canton_amount" \
+  BRIDGE_TREASURY_AMOUNT=100.000000 \
+  BRIDGE_PAYOUT_DEST="$payout" \
+  BRIDGE_MINT_HOLDING="$mint_holding" \
+  java -jar "$canton_jar" run canton/scripts/verify-bridge-completion.canton \
+    -c canton/remote-console.conf --no-tty --log-level-stdout WARN \
+    > /tmp/ctd-canton-other-lock.log 2>&1
+other_lock_status=$?
+set -e
+[[ "$other_lock_status" -ne 0 ]] || fail "ledger verify accepted another operation lock"
+if ! grep -qE 'CANTON_VERIFY_FAIL|CANTON_HISTORY_OTHER_LOCK|another operation' /tmp/ctd-canton-other-lock.log; then
+  fail "other-operation verify did not fail closed: $(tail -20 /tmp/ctd-canton-other-lock.log)"
+fi
+set +e
+env CANTON_RUN_DIR="$run_dir" CANTON_JAR="$canton_jar" \
+  BRIDGE_LOCK_ID="$lock_id" \
+  BRIDGE_CANTON_AMOUNT="$canton_amount" \
+  BRIDGE_TREASURY_AMOUNT=100.000000 \
+  BRIDGE_PAYOUT_DEST="$payout" \
+  BRIDGE_MINT_HOLDING="$mint_holding" \
+  java -jar "$canton_jar" run canton/scripts/does-not-exist.canton \
+    -c canton/remote-console.conf --no-tty --log-level-stdout WARN \
+    > /tmp/ctd-canton-unreadable.log 2>&1
+unreadable_status=$?
+set -e
+[[ "$unreadable_status" -ne 0 ]] || fail "unreadable ledger verify was treated as success"
+if grep -q CANTON_VERIFY_OK /tmp/ctd-canton-unreadable.log; then
+  fail "unreadable ledger verify printed success"
+fi
+python3 - "$journal_dir/journal.json" <<'PY' > /tmp/ctd-canton-missing-input.json
+import json, sys
+journal = json.load(open(sys.argv[1]))
+print(json.dumps({
+    "lockId": "missing-lock",
+    "amount": journal["canton_amount"],
+    "digestHex": "",
+    "payoutDestination": journal["payout_destination"],
+}))
+PY
+set +e
+dpm script --dar daml/bridge-tests/.daml/dist/canton-treasury-dvp-bridge-tests-0.1.0.dar \
+  --script-name Tests.Bridge.Runtime:verifyCompletion \
+  --participant-config "$run_dir/participants.json" \
+  --input-file /tmp/ctd-canton-missing-input.json \
+  --wall-clock-time > /tmp/ctd-canton-missing.log 2>&1
+missing_status=$?
+set -e
+[[ "$missing_status" -ne 0 ]] || fail "missing ledger evidence was treated as completion"
+if grep -q CANTON_ACS_OK /tmp/ctd-canton-missing.log; then
+  fail "missing lock printed ACS success"
+fi
+
+echo "BRIDGE_RESUME_COMPLETED_AGAIN"
+tx_size_before_second="$(grep -c TX_SIZE /tmp/ctd-workflow.log || true)"
+zama_before_second="$(zama_block)"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --resume --stop-after zama_redeemed
+assert_journal_step "$journal_dir" zama_redeemed
+[[ "$(grep -c OPERATION_RECORDED_COMPLETE /tmp/ctd-workflow.log)" -ge 2 ]] \
+  || fail "second resume of a completed operation did not succeed"
+[[ "$(grep -c COMPLETED_RESUME_SKIP_SETUP /tmp/ctd-workflow.log)" -ge 2 ]] \
+  || fail "second completed resume did not skip setup and funding"
+[[ "$(grep -c CANTON_VERIFY_OK /tmp/ctd-workflow.log)" -ge 2 ]] \
+  || fail "second completed resume did not verify Canton from ledger history"
+[[ "$(grep -c TX_SIZE /tmp/ctd-workflow.log || true)" == "$tx_size_before_second" ]] \
+  || fail "second completed resume submitted another Solana transaction"
+[[ "$(zama_block)" == "$zama_before_second" ]] \
+  || fail "second completed resume submitted another Zama transaction"
+[[ "$(grep -c ZAMA_REDEEM_OK /tmp/ctd-workflow.log)" -eq 1 ]] \
+  || fail "second resume changed Zama redemption"
+[[ "$(grep -c RELAYER_RELEASE_CONFIRMED /tmp/ctd-workflow.log)" -eq 1 ]] \
+  || fail "second resume changed Solana release"
+[[ "$(last_marker DEST_AVAILABLE)" == "DEST_AVAILABLE 100000000000" ]] \
+  || fail "second resume changed destination balance: $(last_marker DEST_AVAILABLE)"
+[[ "$(last_marker DEST_PENDING)" == "DEST_PENDING 0" ]] \
+  || fail "second resume changed destination pending credits: $(last_marker DEST_PENDING)"
+[[ "$(zama_result_line status "$main_reservation")" == *'"status":4'* ]] \
+  || fail "second resume changed Zama status"
+[[ "$(zama_result_line approved "$reject_reservation")" == *'"approved":false'* ]] \
+  || fail "rejected reservation approval changed during recovery"
 
 grep -q CANTON_MINT_HOLDING /tmp/ctd-workflow.log || fail "Canton mint holding was not recorded"
 grep -q DVP_BUYER_TREASURY /tmp/ctd-workflow.log || fail "buyer did not receive Treasury"
@@ -361,4 +548,56 @@ grep -q CANTON_REDEEM /tmp/ctd-workflow.log || fail "seller redemption was not r
 grep -q RELAYER_RELEASE_CONFIRMED /tmp/ctd-workflow.log || fail "confidential release through Relayer did not confirm"
 grep -q ZAMA_REDEEM_OK /tmp/ctd-workflow.log || fail "Zama redemption did not succeed"
 grep -q EXPIRY_RECOVERY_COMPLETE /tmp/ctd-workflow.log || fail "expiry recovery evidence is missing"
+
+python3 - "$journal_dir/journal.json" /tmp/ctd-workflow.log <<'PY'
+import json, re, sys
+journal = json.load(open(sys.argv[1]))
+log = open(sys.argv[2]).read()
+mint = re.findall(r"CANTON_MINT_HOLDING (\S+)", log)
+consumed = re.findall(r"DVP_CONSUMED_PAYMENT (\S+)", log)
+if not mint or not consumed or mint[-1] != consumed[-1]:
+    raise SystemExit(f"bridged holding {mint[-1:]!r} did not fund DvP {consumed[-1:]!r}")
+if "DVP_TREASURY_AMOUNT 100" not in log and "DVP_TREASURY_AMOUNT 100.0" not in log:
+    raise SystemExit("buyer Treasury amount was not 100")
+if "DVP_PAYMENT_AMOUNT 100000" not in log:
+    raise SystemExit("seller stablecoin amount was not 100000")
+if journal.get("completed") != "zama_redeemed":
+    raise SystemExit(f"journal completed is {journal.get('completed')}")
+if journal.get("base_units") != 100_000_000_000:
+    raise SystemExit(f"journal base units are {journal.get('base_units')}")
+verified = re.findall(r"CANTON_VERIFY_MINT_CONSUMED (\S+)", log)
+if not verified or verified[-1] != consumed[-1] or verified[-1] != journal.get("mint_holding"):
+    raise SystemExit(f"ledger verify did not consume recorded holding {journal.get('mint_holding')!r}: {verified!r}")
+if log.count("CANTON_VERIFY_OK") < 2:
+    raise SystemExit("completed resumes did not verify Canton from ledger history twice")
+print("LEDGER_HOLDING_FUNDED_DVP " + consumed[-1])
+print("LEDGER_JOURNAL_COMPLETE")
+PY
+[[ "$(last_marker DEST_AVAILABLE)" == "DEST_AVAILABLE 100000000000" ]] \
+  || fail "intended destination did not receive 100000000000 base units"
+[[ "$(zama_result_line status "$main_reservation")" == *'"status":4'* ]] \
+  || fail "main reservation exposure was not redeemed"
+[[ "$(zama_result_line approved "$main_reservation")" == *'"approved":true'* ]] \
+  || fail "main reservation approval is missing"
+[[ "$(zama_result_line approved "$reject_reservation")" == *'"approved":false'* ]] \
+  || fail "rejected reservation must stay unapproved"
+echo "BRIDGE_CAPACITY_PROBE_AFTER_REDEEM"
+after_probe_id="$(fresh_id)"
+after_probe_line="$(zama_result_line reserve "$after_probe_id,$zama_client,$probe_units")"
+[[ "$after_probe_line" == *'"approved":true'* ]] \
+  || fail "same-sized probe must be approved after redemption: $after_probe_line"
+leftover_probe_id="$(fresh_id)"
+leftover_probe_line="$(zama_result_line reserve "$leftover_probe_id,$zama_client,$probe_units")"
+[[ "$leftover_probe_line" == *'"approved":false'* ]] \
+  || fail "unrelated live exposure should still reject another same-sized probe: $leftover_probe_line"
+zama_rpc cancel "$after_probe_id" >/tmp/ctd-zama-cancel-after-probe.log
+zama_rpc cancel "$leftover_probe_id" >/tmp/ctd-zama-cancel-leftover-probe.log
+[[ "$(zama_result_line approved "$unrelated_id")" == *'"approved":true'* ]] \
+  || fail "unrelated live exposure was dropped after redemption"
+[[ "$(zama_result_line status "$unrelated_id")" == *'"status":1'* ]] \
+  || fail "unrelated live reservation did not remain counted"
+echo "LEDGER_DEST_AVAILABLE 100000000000"
+echo "LEDGER_ZAMA_REDEEMED true"
+echo "LEDGER_REJECT_UNAPPROVED true"
+echo "LEDGER_CAPACITY_RECOVERED true"
 echo "BRIDGE_E2E_COMPLETE"

@@ -203,6 +203,36 @@ pub fn decode_bytes(text: &str) -> Result<Vec<u8>> {
     hex::decode(text).context("hex secret")
 }
 
+pub fn resume_matches_recorded_operation(
+    journal: &Journal,
+    amount: u64,
+    payout: &str,
+) -> Result<()> {
+    if journal.operation_hex.is_empty() {
+        return Ok(());
+    }
+    if journal.base_units != 0 && journal.base_units != amount {
+        return Err(anyhow!(
+            "resume amount does not match the recorded operation"
+        ));
+    }
+    if !journal.canton_amount.is_empty() {
+        let expected =
+            TokenUnits::from_base_units(journal.base_units, journal.decimals)?.canton_decimal()?;
+        if journal.canton_amount != expected {
+            return Err(anyhow!(
+                "resume Canton amount does not match the recorded operation"
+            ));
+        }
+    }
+    if !journal.payout_destination.is_empty() && journal.payout_destination != payout {
+        return Err(anyhow!(
+            "resume payout does not match the recorded operation"
+        ));
+    }
+    Ok(())
+}
+
 pub fn units_from_journal(journal: &Journal) -> Result<TokenUnits> {
     TokenUnits::from_base_units(journal.base_units, journal.decimals)
 }
@@ -211,6 +241,21 @@ pub fn units_from_journal(journal: &Journal) -> Result<TokenUnits> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn resume_rejects_changed_amount_or_payout() {
+        let journal = Journal {
+            operation_hex: "aa".repeat(32),
+            base_units: 100_000_000_000,
+            decimals: 6,
+            canton_amount: "100000.000000".into(),
+            payout_destination: "dest".into(),
+            ..Journal::default()
+        };
+        resume_matches_recorded_operation(&journal, 100_000_000_000, "dest").unwrap();
+        assert!(resume_matches_recorded_operation(&journal, 200_000_000_000, "dest").is_err());
+        assert!(resume_matches_recorded_operation(&journal, 100_000_000_000, "other").is_err());
+    }
 
     #[test]
     fn persist_and_resume_keep_the_same_operation() {

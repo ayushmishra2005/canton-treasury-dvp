@@ -1,0 +1,285 @@
+import com.daml.ledger.api.v2.transaction_filter.TransactionShape
+import com.daml.ledger.api.v2.value.Value
+
+val expectedLock = sys.env.getOrElse("BRIDGE_LOCK_ID", "")
+val expectedAmount = sys.env.getOrElse("BRIDGE_CANTON_AMOUNT", "")
+val expectedTreasury = sys.env.getOrElse("BRIDGE_TREASURY_AMOUNT", "100.000000")
+val expectedPayout = sys.env.getOrElse("BRIDGE_PAYOUT_DEST", "")
+val expectedMintHolding = sys.env.getOrElse("BRIDGE_MINT_HOLDING", "")
+
+if (expectedLock.isEmpty || expectedAmount.isEmpty || expectedPayout.isEmpty || expectedMintHolding.isEmpty) {
+  println("CANTON_VERIFY_FAIL missing verification inputs")
+  sys.error("missing verification inputs")
+}
+
+def numericEq(left: String, right: String): Boolean =
+  try BigDecimal(left) == BigDecimal(right)
+  catch { case _: Throwable => false }
+
+def texts(value: Value): Seq[String] = value.sum match {
+  case Value.Sum.Text(text) => Seq(text)
+  case Value.Sum.ContractId(cid) => Seq(cid)
+  case Value.Sum.Party(party) => Seq(party)
+  case Value.Sum.Numeric(number) => Seq(number)
+  case Value.Sum.Record(record) => record.fields.flatMap(_.value.toSeq.flatMap(texts))
+  case Value.Sum.List(list) => list.elements.flatMap(texts)
+  case Value.Sum.Optional(opt) => opt.value.toSeq.flatMap(texts)
+  case Value.Sum.Variant(variant) => variant.value.toSeq.flatMap(texts)
+  case Value.Sum.TextMap(map) => map.entries.flatMap(_.value.toSeq.flatMap(texts))
+  case Value.Sum.GenMap(map) =>
+    map.entries.flatMap(entry => entry.key.toSeq.flatMap(texts) ++ entry.value.toSeq.flatMap(texts))
+  case _ => Seq.empty
+}
+
+def labeled(value: Value, name: String): Option[Value] = value.sum match {
+  case Value.Sum.Record(record) =>
+    record.fields
+      .find(_.label == name)
+      .flatMap(_.value)
+      .orElse(record.fields.flatMap(_.value).flatMap(inner => labeled(inner, name)).headOption)
+  case _ => None
+}
+
+def labeledText(value: Value, name: String): Option[String] =
+  labeled(value, name)
+    .flatMap(texts(_).headOption)
+    .orElse(if (name == "lockId") texts(value).find(_ == expectedLock) else None)
+    .orElse(if (name == "holdingCid") texts(value).find(_ == expectedMintHolding) else None)
+    .orElse(if (name == "payoutDestination") texts(value).find(_ == expectedPayout) else None)
+
+def asNumeric(value: Value): Option[String] = value.sum match {
+  case Value.Sum.Numeric(number) => Some(number)
+  case Value.Sum.Record(record) =>
+    record.fields.flatMap(_.value).flatMap(asNumeric).headOption
+  case _ => None
+}
+
+case class CreatedFact(
+    template: String,
+    cid: String,
+    arguments: Option[Value],
+    updateId: String,
+)
+case class ExercisedFact(
+    template: String,
+    choice: String,
+    cid: String,
+    consuming: Boolean,
+    updateId: String,
+)
+case class ArchivedFact(template: String, cid: String, updateId: String)
+
+var failed = false
+def fail(reason: String): Nothing = {
+  failed = true
+  println(s"CANTON_VERIFY_FAIL $reason")
+  sys.error(reason)
+}
+
+def hostedParty(participantName: String, hint: String) = {
+  val node = participants.remote
+    .find(_.name == participantName)
+    .getOrElse(sys.error(s"missing participant $participantName"))
+  val party = node.parties
+    .hosted()
+    .map(_.party)
+    .find(_.filterString.startsWith(hint + "::"))
+    .getOrElse(sys.error(s"party $hint is not hosted on $participantName"))
+  (node, party)
+}
+
+def collect(participantName: String, hint: String) = {
+  val (node, party) = hostedParty(participantName, hint)
+  val end = node.ledger_api.state.end()
+  println(s"CANTON_LEDGER_END $participantName $end")
+  val effects = node.ledger_api.updates.transactions(
+    partyIds = Set(party),
+    completeAfter = PositiveInt.tryCreate(2000),
+    beginOffsetExclusive = 0L,
+    endOffsetInclusive = Some(end),
+    transactionShape = TransactionShape.TRANSACTION_SHAPE_LEDGER_EFFECTS,
+  )
+  val delta = node.ledger_api.updates.transactions(
+    partyIds = Set(party),
+    completeAfter = PositiveInt.tryCreate(2000),
+    beginOffsetExclusive = 0L,
+    endOffsetInclusive = Some(end),
+    transactionShape = TransactionShape.TRANSACTION_SHAPE_ACS_DELTA,
+  )
+  val created = effects.flatMap { wrapper =>
+    wrapper.transaction.events.flatMap(_.event.created).map { event =>
+      val id = event.templateId.getOrElse(sys.error("created event without template id"))
+      CreatedFact(
+        s"${id.moduleName}:${id.entityName}",
+        event.contractId,
+        event.createArguments.map(record => Value(Value.Sum.Record(record))),
+        wrapper.transaction.updateId,
+      )
+    }
+  }
+  val exercised = effects.flatMap { wrapper =>
+    wrapper.transaction.events.flatMap(_.event.exercised).map { event =>
+      val id = event.templateId.getOrElse(sys.error("exercised event without template id"))
+      ExercisedFact(
+        s"${id.moduleName}:${id.entityName}",
+        event.choice,
+        event.contractId,
+        event.consuming,
+        wrapper.transaction.updateId,
+      )
+    }
+  }
+  val archived = delta.flatMap { wrapper =>
+    wrapper.transaction.events.flatMap(_.event.archived).map { event =>
+      val id = event.templateId.getOrElse(sys.error("archived event without template id"))
+      ArchivedFact(
+        s"${id.moduleName}:${id.entityName}",
+        event.contractId,
+        wrapper.transaction.updateId,
+      )
+    }
+  }
+  if (created.isEmpty && exercised.isEmpty && archived.isEmpty) {
+    fail(s"empty update history on $participantName")
+  }
+  (created, exercised, archived, end)
+}
+
+try {
+  val views = Seq(
+    collect("p-cash", "cashRegistry"),
+    collect("p-buyer", "buyer"),
+    collect("p-seller", "seller"),
+    collect("p-venue", "venue"),
+    collect("p-treasury", "treasuryRegistry"),
+  )
+  val created = views.flatMap(_._1).distinctBy(fact => (fact.template, fact.cid, fact.updateId))
+  val exercised = views.flatMap(_._2).distinctBy(fact => (fact.choice, fact.cid, fact.updateId))
+  val archived = views.flatMap(_._3).distinctBy(fact => (fact.template, fact.cid, fact.updateId))
+
+  if (created.isEmpty) {
+    fail("no created events in update history")
+  }
+
+  val mintedLocks = created.filter(_.template.endsWith("MintedLock"))
+  val mintedForLock = mintedLocks.filter { fact =>
+    fact.arguments.exists(args => labeledText(args, "lockId").contains(expectedLock))
+  }
+  val mintedForHolding = mintedLocks.filter { fact =>
+    fact.arguments.exists(args => labeledText(args, "holdingCid").contains(expectedMintHolding))
+  }
+  mintedForHolding.foreach { fact =>
+    val other = fact.arguments.flatMap(args => labeledText(args, "lockId")).getOrElse("")
+    if (other.nonEmpty && other != expectedLock) {
+      println(s"CANTON_HISTORY_OTHER_LOCK $other")
+      fail("evidence belongs to another operation")
+    }
+  }
+  if (mintedForLock.size != 1) {
+    fail("missing minted lock in update history")
+  }
+  val mintedArgs = mintedForLock.head.arguments.getOrElse(fail("minted lock arguments unread"))
+  val mintHolding = labeledText(mintedArgs, "holdingCid").getOrElse("")
+  val mintAmount = labeled(mintedArgs, "amount").flatMap(asNumeric).getOrElse("")
+  if (mintHolding != expectedMintHolding) {
+    fail("minted holding does not match the recorded holding")
+  }
+  if (!numericEq(mintAmount, expectedAmount)) {
+    fail("minted amount does not match")
+  }
+
+  val settle = exercised.filter(_.choice == "DvpTrade_Settle")
+  if (settle.isEmpty) {
+    fail("DvpTrade_Settle is not in update history")
+  }
+  val mintConsumed =
+    archived.exists(_.cid == mintHolding) ||
+      exercised.exists(event => event.consuming && event.cid == mintHolding)
+  if (!mintConsumed) {
+    fail("recorded holding was not consumed in update history")
+  }
+
+  val redeemedLocks = created.filter { fact =>
+    fact.template.endsWith("RedeemedLock") &&
+    fact.arguments.exists(args => labeledText(args, "lockId").contains(expectedLock))
+  }
+  if (redeemedLocks.size != 1) {
+    fail("missing redeemed lock in update history")
+  }
+  val redeemedArgs = redeemedLocks.head.arguments.getOrElse(fail("redeemed lock arguments unread"))
+  val redeemAmount = labeled(redeemedArgs, "amount").flatMap(asNumeric).getOrElse("")
+  if (!numericEq(redeemAmount, expectedAmount)) {
+    fail("redeemed amount does not match")
+  }
+
+  val requests = created.filter { fact =>
+    fact.template.endsWith("RedemptionRequest") &&
+    fact.arguments.exists(args => labeledText(args, "lockId").contains(expectedLock))
+  }
+  if (requests.isEmpty) {
+    fail("missing redemption request in update history")
+  }
+  val requestArgs = requests.head.arguments.getOrElse(fail("redemption request arguments unread"))
+  val payout = labeledText(requestArgs, "payoutDestination").getOrElse("")
+  val sellerPayment = labeledText(requestArgs, "holdingCid").getOrElse("")
+  val requestAmount = labeled(requestArgs, "amount").flatMap(asNumeric).getOrElse("")
+  if (payout != expectedPayout) {
+    fail("payout destination does not match")
+  }
+  if (!numericEq(requestAmount, expectedAmount) || sellerPayment.isEmpty) {
+    fail("seller payment does not match the redemption")
+  }
+  val sellerBurned =
+    (archived.exists(_.cid == sellerPayment) ||
+      exercised.exists(event => event.consuming && event.cid == sellerPayment)) &&
+      exercised.exists(event => event.choice == "Gateway_Redeem" || event.choice == "Burn")
+  if (!sellerBurned) {
+    fail("seller payment burn is not in update history")
+  }
+
+  val buyerTreasury = created.filter { fact =>
+    fact.template.endsWith("TreasuryHolding") &&
+    fact.arguments.exists { args =>
+      labeledText(args, "owner").exists(_.startsWith("buyer::")) &&
+      labeled(args, "amount").flatMap(asNumeric).exists(numericEq(_, expectedTreasury))
+    }
+  }
+  if (buyerTreasury.isEmpty) {
+    fail("buyer Treasury is not in update history")
+  }
+  val treasuryArgs = buyerTreasury.head.arguments.getOrElse(fail("buyer treasury arguments unread"))
+  val treasuryAmount = labeled(treasuryArgs, "amount").flatMap(asNumeric).getOrElse("")
+  val treasuryInstrument = labeledText(treasuryArgs, "id").getOrElse("")
+  if (treasuryInstrument.nonEmpty && treasuryInstrument != "UST-2028-11") {
+    fail("buyer Treasury instrument does not match")
+  }
+
+  val paymentInstrument = created
+    .find(_.cid == mintHolding)
+    .flatMap(_.arguments)
+    .flatMap(args => labeledText(args, "id"))
+    .getOrElse("")
+  if (paymentInstrument.nonEmpty && paymentInstrument != "USD-C") {
+    fail("payment instrument does not match")
+  }
+
+  println(s"CANTON_HISTORY_LOCK $expectedLock")
+  println(s"CANTON_HISTORY_MINT_HOLDING $mintHolding")
+  println(s"CANTON_HISTORY_MINT_CONSUMED $mintHolding")
+  println(s"CANTON_HISTORY_SETTLE ${settle.head.updateId}")
+  println(s"CANTON_HISTORY_BUYER_TREASURY ${buyerTreasury.head.cid}")
+  println(s"CANTON_HISTORY_SELLER_PAYMENT $sellerPayment")
+  println(s"CANTON_HISTORY_SELLER_BURN $sellerPayment")
+  println(s"CANTON_HISTORY_REDEEM ${redeemedLocks.head.cid}")
+  println(s"CANTON_HISTORY_PAYOUT $payout")
+  println(s"CANTON_HISTORY_PAYMENT_AMOUNT $expectedAmount")
+  println(s"CANTON_HISTORY_TREASURY_AMOUNT $expectedTreasury")
+  println(s"CANTON_HISTORY_INSTRUMENT USD-C")
+  println("CANTON_VERIFY_OK")
+} catch {
+  case err: Throwable =>
+    if (!failed) {
+      println(s"CANTON_VERIFY_UNREADABLE ${err.getMessage}")
+    }
+    throw err
+}

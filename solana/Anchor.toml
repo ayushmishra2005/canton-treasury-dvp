@@ -1,0 +1,16 @@
+[toolchain]
+anchor_version = "0.31.1"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+confidential_escrow = "CQrz5E2egFB8AyHDBVGrCai3c1msyyXsgmD6BuhXQpQd"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[workspace]
+members = ["programs/confidential-escrow"]

@@ -1,0 +1,75 @@
+module Tests.Bridge.Mint where
+
+import DA.Assert ((===))
+import DA.Optional (isNone)
+import Daml.Script
+
+import Bridge.Gateway
+import Bridge.Types
+import Stablecoin.Holding
+import Stablecoin.Instrument
+import Tests.Bridge.Fixture
+
+twoAttestersMintOrdinaryHolding : Script ()
+twoAttestersMintOrdinaryHolding = do
+  fixture <- setup
+  holdingCid <- mintWith fixture fixture.attesterA fixture.attesterB "lock-1" 100000.0 "digest-1"
+  Some holding <- queryContractId fixture.holder holdingCid
+  holding.owner === fixture.holder
+  holding.amount === 100000.0
+  holding.lock === None
+  holding.instrumentId === fixture.instrumentId
+  mintedLocks <- query @MintedLock fixture.cashRegistry
+  case mintedLocks of
+    [(_, minted)] -> do
+      minted.amount === 100000.0
+      minted.beneficiary === fixture.holder
+    _ -> abort "expected one minted lock"
+
+sameLockCannotMintTwiceWithChangedDigest : Script ()
+sameLockCannotMintTwiceWithChangedDigest = do
+  fixture <- setup
+  holdingCid <- mintWith fixture fixture.attesterA fixture.attesterB "lock-1" 100000.0 "digest-1"
+  Some _ <- queryContractId fixture.holder holdingCid
+  firstCid <- attest fixture fixture.attesterA "lock-1" 100000.0 "digest-2" MintAttestation
+  secondCid <- attest fixture fixture.attesterB "lock-1" 100000.0 "digest-2" MintAttestation
+  gatewayCid <- currentGateway fixture
+  submitMustFail fixture.cashRegistry $
+    exerciseCmd gatewayCid Gateway_Mint with firstCid, secondCid
+  holdings <- query @StablecoinHolding fixture.holder
+  length holdings === 1
+
+oneAttesterCannotMint : Script ()
+oneAttesterCannotMint = do
+  fixture <- setup
+  firstCid <- attest fixture fixture.attesterA "lock-1" 100000.0 "digest-1" MintAttestation
+  submitMustFail fixture.cashRegistry $
+    exerciseCmd fixture.gatewayCid Gateway_Mint with
+      firstCid
+      secondCid = firstCid
+
+duplicateAttesterCannotMint : Script ()
+duplicateAttesterCannotMint = do
+  fixture <- setup
+  firstCid <- attest fixture fixture.attesterA "lock-1" 100000.0 "digest-1" MintAttestation
+  secondCid <- attest fixture fixture.attesterA "lock-1" 100000.0 "digest-1" MintAttestation
+  submitMustFail fixture.cashRegistry $
+    exerciseCmd fixture.gatewayCid Gateway_Mint with firstCid, secondCid
+
+unknownAttesterCannotMint : Script ()
+unknownAttesterCannotMint = do
+  fixture <- setup
+  firstCid <- attest fixture fixture.attesterA "lock-1" 100000.0 "digest-1" MintAttestation
+  secondCid <- attest fixture fixture.outsider "lock-1" 100000.0 "digest-1" MintAttestation
+  submitMustFail fixture.cashRegistry $
+    exerciseCmd fixture.gatewayCid Gateway_Mint with firstCid, secondCid
+
+issuerMintAuthorityRemains : Script ()
+issuerMintAuthorityRemains = do
+  fixture <- setup
+  holdingCid <- submit fixture.cashRegistry $ exerciseCmd fixture.instrumentCid Mint with
+    owner = fixture.holder
+    amount = 5.0
+  Some holding <- queryContractId fixture.holder holdingCid
+  holding.amount === 5.0
+  isNone holding.lock === True

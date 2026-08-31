@@ -1,0 +1,144 @@
+module Tests.Bridge.Runtime where
+
+import DA.List (sortOn)
+import DA.Text qualified as Text
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1
+
+import Bridge.Attestation
+import Bridge.Gateway
+import Bridge.Types
+import Stablecoin.Holding
+import Stablecoin.Instrument
+
+data RuntimeInput = RuntimeInput with
+    lockId : Text
+    amount : Decimal
+    digestHex : Text
+  deriving (Eq, Show)
+
+data Live = Live with
+  cashRegistry : Party
+  attesterA : Party
+  attesterB : Party
+  attesterC : Party
+  holder : Party
+  instrumentCid : ContractId StablecoinInstrument
+  gatewayCid : ContractId BridgeGateway
+
+lookupOn : Text -> Text -> Script Party
+lookupOn hint participant = do
+  known <- listKnownPartiesOn (ParticipantName participant)
+  let matches =
+        [ details.party
+        | details <- known
+        , details.isLocal
+        , Text.isPrefixOf (hint <> "::") (partyToText details.party)
+        ]
+  case sortOn partyToText matches of
+    [party] -> pure party
+    _ -> abort ("Expected exactly one party " <> hint <> " on " <> participant)
+
+only : Text -> [(ContractId t, t)] -> Script (ContractId t, t)
+only label contracts = case contracts of
+  [found] -> pure found
+  _ -> abort ("Expected exactly one " <> label)
+
+lookupLive : RuntimeInput -> Script Live
+lookupLive _input = do
+  cashRegistry <- lookupOn "cashRegistry" "p-cash"
+  attesterA <- lookupOn "attesterA" "p-cash"
+  attesterB <- lookupOn "attesterB" "p-cash"
+  attesterC <- lookupOn "attesterC" "p-cash"
+  holder <- lookupOn "buyer" "p-buyer"
+  (instrumentCid, _) <- only "stablecoin instrument" =<< query @StablecoinInstrument cashRegistry
+  (gatewayCid, _) <- only "bridge gateway" =<< query @BridgeGateway cashRegistry
+  pure Live with ..
+
+prepare : RuntimeInput -> Script ()
+prepare _input = do
+  cashRegistry <- lookupOn "cashRegistry" "p-cash"
+  attesterA <- lookupOn "attesterA" "p-cash"
+  attesterB <- lookupOn "attesterB" "p-cash"
+  attesterC <- lookupOn "attesterC" "p-cash"
+  instruments <- query @StablecoinInstrument cashRegistry
+  instrumentCid <- case instruments of
+    [(cid, _)] -> pure cid
+    [] -> submit cashRegistry $ createCmd StablecoinInstrument with
+      cashRegistry
+      id = "USD-C"
+      description = "Regulated USD payment stablecoin"
+    _ -> abort "expected at most one stablecoin instrument"
+  Some instrument <- queryContractId cashRegistry instrumentCid
+  let instrumentId = InstrumentId with admin = cashRegistry, id = instrument.id
+  gateways <- query @BridgeGateway cashRegistry
+  case gateways of
+    [_] -> pure ()
+    [] -> do
+      _ <- submit cashRegistry $ createCmd BridgeGateway with
+        cashRegistry
+        attesters = [attesterA, attesterB, attesterC]
+        instrumentCid
+        instrumentId
+        mintedLocks = []
+        redeemedLocks = []
+      pure ()
+    _ -> abort "expected at most one bridge gateway"
+
+mint : RuntimeInput -> Script (ContractId StablecoinHolding)
+mint input = do
+  live <- lookupLive input
+  firstCid <- submit live.attesterA $ createCmd BridgeAttestation with
+    attester = live.attesterA
+    cashRegistry = live.cashRegistry
+    lockId = input.lockId
+    amount = input.amount
+    beneficiary = live.holder
+    digestHex = input.digestHex
+    direction = MintAttestation
+  secondCid <- submit live.attesterB $ createCmd BridgeAttestation with
+    attester = live.attesterB
+    cashRegistry = live.cashRegistry
+    lockId = input.lockId
+    amount = input.amount
+    beneficiary = live.holder
+    digestHex = input.digestHex
+    direction = MintAttestation
+  (_gatewayCid, holdingCid) <- submit live.cashRegistry $ exerciseCmd live.gatewayCid Gateway_Mint with
+    firstCid
+    secondCid
+  pure holdingCid
+
+redeem : RuntimeInput -> Script (ContractId RedeemedLock)
+redeem input = do
+  live <- lookupLive input
+  holdings <- query @StablecoinHolding live.holder
+  (holdingCid, holding) <- only "holder stablecoin holding" holdings
+  requestCid <- submit live.holder $ createCmd RedemptionRequest with
+    holder = live.holder
+    cashRegistry = live.cashRegistry
+    lockId = input.lockId
+    holdingCid
+    amount = holding.amount
+  firstCid <- submit live.attesterA $ createCmd BridgeAttestation with
+    attester = live.attesterA
+    cashRegistry = live.cashRegistry
+    lockId = input.lockId
+    amount = holding.amount
+    beneficiary = live.holder
+    digestHex = input.digestHex
+    direction = RedeemAttestation
+  secondCid <- submit live.attesterB $ createCmd BridgeAttestation with
+    attester = live.attesterB
+    cashRegistry = live.cashRegistry
+    lockId = input.lockId
+    amount = holding.amount
+    beneficiary = live.holder
+    digestHex = input.digestHex
+    direction = RedeemAttestation
+  (_gatewayCid, redeemedCid) <- submit live.cashRegistry $ exerciseCmd live.gatewayCid Gateway_Redeem with
+    requestCid
+    firstCid
+    secondCid
+  pure redeemedCid

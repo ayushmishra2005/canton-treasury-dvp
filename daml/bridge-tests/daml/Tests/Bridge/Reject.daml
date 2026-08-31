@@ -1,0 +1,31 @@
+module Tests.Bridge.Reject where
+
+import Daml.Script
+
+import Bridge.Gateway
+import Bridge.Types
+import Tests.Bridge.Fixture
+
+mismatchedDigestRejected : Script ()
+mismatchedDigestRejected = do
+  fixture <- setup
+  firstCid <- attest fixture fixture.attesterA "lock-1" 100000.0 "digest-1" MintAttestation
+  secondCid <- attest fixture fixture.attesterB "lock-1" 100000.0 "digest-2" MintAttestation
+  submitMustFail fixture.cashRegistry $
+    exerciseCmd fixture.gatewayCid Gateway_Mint with firstCid, secondCid
+
+mismatchedAmountRejected : Script ()
+mismatchedAmountRejected = do
+  fixture <- setup
+  firstCid <- attest fixture fixture.attesterA "lock-1" 100000.0 "digest-1" MintAttestation
+  secondCid <- attest fixture fixture.attesterB "lock-1" 99999.0 "digest-1" MintAttestation
+  submitMustFail fixture.cashRegistry $
+    exerciseCmd fixture.gatewayCid Gateway_Mint with firstCid, secondCid
+
+redeemAttestationCannotMint : Script ()
+redeemAttestationCannotMint = do
+  fixture <- setup
+  firstCid <- attest fixture fixture.attesterA "lock-1" 100000.0 "digest-1" RedeemAttestation
+  secondCid <- attest fixture fixture.attesterB "lock-1" 100000.0 "digest-1" RedeemAttestation
+  submitMustFail fixture.cashRegistry $
+    exerciseCmd fixture.gatewayCid Gateway_Mint with firstCid, secondCid

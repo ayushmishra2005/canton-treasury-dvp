@@ -1,0 +1,204 @@
+module Tests.Bridge.Dvp where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import DA.Optional (isNone)
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, hours, time)
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV1
+import Splice.Api.Token.AllocationRequestV1
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Bridge.Attestation
+import Bridge.Gateway
+import Bridge.Types
+import Dvp.Proposal
+import Dvp.Trade
+import Stablecoin.Eligibility qualified as Stablecoin
+import Stablecoin.Eligibility (StablecoinEligibility(..))
+import Stablecoin.Instrument
+import Stablecoin.Rules qualified as Stablecoin
+import Stablecoin.Rules (StablecoinRules(..))
+import Treasury.Eligibility qualified as Treasury
+import Treasury.Eligibility (TreasuryEligibility(..))
+import Treasury.Instrument
+import Treasury.Rules qualified as Treasury
+import Treasury.Rules (TreasuryRules(..))
+
+bridgedHoldingFundsAtomicDvp : Script ()
+bridgedHoldingFundsAtomicDvp = do
+  setTime (time (date 2026 Jan 1) 12 0 0)
+  treasuryRegistry <- allocateParty "TreasuryRegistry"
+  cashRegistry <- allocateParty "CashRegistry"
+  venue <- allocateParty "Venue"
+  seller <- allocateParty "Seller"
+  buyer <- allocateParty "Buyer"
+  attesterA <- allocateParty "AttesterA"
+  attesterB <- allocateParty "AttesterB"
+  attesterC <- allocateParty "AttesterC"
+  now <- getTime
+  treasuryInstrumentCid <- submit treasuryRegistry $ createCmd TreasuryInstrument with
+    treasuryRegistry
+    id = "UST-2028-11"
+    description = "US Treasury Note 1.5% due 2028-11-15"
+    faceValue = 1000.0
+    maturityDate = date 2028 Nov 15
+  cashInstrumentCid <- submit cashRegistry $ createCmd StablecoinInstrument with
+    cashRegistry
+    id = "USD-C"
+    description = "Regulated USD payment stablecoin"
+  let treasuryInstrumentId = InstrumentId with admin = treasuryRegistry, id = "UST-2028-11"
+      paymentInstrumentId = InstrumentId with admin = cashRegistry, id = "USD-C"
+  treasuryRulesCid <- submit treasuryRegistry $ createCmd TreasuryRules with instrumentId = treasuryInstrumentId
+  cashRulesCid <- submit cashRegistry $ createCmd StablecoinRules with instrumentId = paymentInstrumentId
+  gatewayCid <- submit cashRegistry $ createCmd BridgeGateway with
+    cashRegistry
+    attesters = [attesterA, attesterB, attesterC]
+    instrumentCid = cashInstrumentCid
+    instrumentId = paymentInstrumentId
+    mintedLocks = []
+    redeemedLocks = []
+  firstCid <- submit attesterA $ createCmd BridgeAttestation with
+    attester = attesterA
+    cashRegistry
+    lockId = "lock-dvp"
+    amount = 100000.0
+    beneficiary = buyer
+    digestHex = "digest-dvp"
+    direction = MintAttestation
+  secondCid <- submit attesterB $ createCmd BridgeAttestation with
+    attester = attesterB
+    cashRegistry
+    lockId = "lock-dvp"
+    amount = 100000.0
+    beneficiary = buyer
+    digestHex = "digest-dvp"
+    direction = MintAttestation
+  (_nextGateway, paymentHoldingCid) <- submit cashRegistry $ exerciseCmd gatewayCid Gateway_Mint with firstCid, secondCid
+  treasuryHoldingCid <- submit treasuryRegistry $ exerciseCmd treasuryInstrumentCid Issue with
+    owner = seller
+    amount = 100.0
+  let allocateBefore = addRelTime now (hours 1)
+      settleBefore = addRelTime now (hours 2)
+      treasuryLeg = TransferLeg with
+        sender = seller
+        receiver = buyer
+        amount = 100.0
+        instrumentId = treasuryInstrumentId
+        meta = emptyMetadata
+      paymentLeg = TransferLeg with
+        sender = buyer
+        receiver = seller
+        amount = 100000.0
+        instrumentId = paymentInstrumentId
+        meta = emptyMetadata
+  proposalCid <- submit seller $ createCmd DvpProposal with
+    venue
+    seller
+    buyer
+    treasuryLeg
+    paymentLeg
+    requestedAt = now
+    allocateBefore
+    settleBefore
+    approvers = []
+    tradeCid = None
+  accepted <- submit seller $ exerciseCmd proposalCid DvpProposal_Accept with approver = seller
+  accepted2 <- submit buyer $ exerciseCmd accepted DvpProposal_Accept with approver = buyer
+  tradeCid <- submit venue $ exerciseCmd accepted2 DvpProposal_InitiateSettlement
+  Some requestView <- queryInterfaceContractId @AllocationRequest seller
+    (toInterfaceContractId @AllocationRequest tradeCid)
+  treasurySpec <- case TextMap.lookup treasuryLegId requestView.transferLegs of
+    Some transferLeg -> pure AllocationSpecification with
+      settlement = requestView.settlement
+      transferLegId = treasuryLegId
+      transferLeg
+    None -> abort "missing treasury leg"
+  paymentSpec <- case TextMap.lookup paymentLegId requestView.transferLegs of
+    Some transferLeg -> pure AllocationSpecification with
+      settlement = requestView.settlement
+      transferLegId = paymentLegId
+      transferLeg
+    None -> abort "missing payment leg"
+  sellerTreasuryEligibility <- submit treasuryRegistry $ createCmd TreasuryEligibility with
+    instrumentId = treasuryInstrumentId
+    investor = seller
+    status = Treasury.Eligible
+    validFrom = addRelTime now (hours (-1))
+    validUntil = addRelTime now (hours 24)
+    attestationRef = "attestation-000"
+  buyerTreasuryEligibility <- submit treasuryRegistry $ createCmd TreasuryEligibility with
+    instrumentId = treasuryInstrumentId
+    investor = buyer
+    status = Treasury.Eligible
+    validFrom = addRelTime now (hours (-1))
+    validUntil = addRelTime now (hours 24)
+    attestationRef = "attestation-000"
+  sellerPaymentEligibility <- submit cashRegistry $ createCmd StablecoinEligibility with
+    instrumentId = paymentInstrumentId
+    investor = seller
+    status = Stablecoin.Eligible
+    validFrom = addRelTime now (hours (-1))
+    validUntil = addRelTime now (hours 24)
+    attestationRef = "attestation-000"
+  buyerPaymentEligibility <- submit cashRegistry $ createCmd StablecoinEligibility with
+    instrumentId = paymentInstrumentId
+    investor = buyer
+    status = Stablecoin.Eligible
+    validFrom = addRelTime now (hours (-1))
+    validUntil = addRelTime now (hours 24)
+    attestationRef = "attestation-000"
+  treasuryResult <- submit (actAs seller <> readAs treasuryRegistry) $
+    exerciseCmd (toInterfaceContractId @AllocationFactory treasuryRulesCid)
+      AllocationFactory_Allocate with
+        expectedAdmin = treasuryRegistry
+        allocation = treasurySpec
+        requestedAt = now
+        inputHoldingCids = [toInterfaceContractId @Holding treasuryHoldingCid]
+        extraArgs = ExtraArgs with
+          context = ChoiceContext with
+            values = TextMap.fromList
+              [ (Treasury.senderEligibilityKey, AV_ContractId (coerceContractId sellerTreasuryEligibility))
+              , (Treasury.receiverEligibilityKey, AV_ContractId (coerceContractId buyerTreasuryEligibility))
+              ]
+          meta = emptyMetadata
+  paymentResult <- submit (actAs buyer <> readAs cashRegistry) $
+    exerciseCmd (toInterfaceContractId @AllocationFactory cashRulesCid)
+      AllocationFactory_Allocate with
+        expectedAdmin = cashRegistry
+        allocation = paymentSpec
+        requestedAt = now
+        inputHoldingCids = [toInterfaceContractId @Holding paymentHoldingCid]
+        extraArgs = ExtraArgs with
+          context = ChoiceContext with
+            values = TextMap.fromList
+              [ (Stablecoin.senderEligibilityKey, AV_ContractId (coerceContractId buyerPaymentEligibility))
+              , (Stablecoin.receiverEligibilityKey, AV_ContractId (coerceContractId sellerPaymentEligibility))
+              ]
+          meta = emptyMetadata
+  treasuryAllocationCid <- case treasuryResult.output of
+    AllocationInstructionResult_Completed cid -> pure cid
+    _ -> abort "treasury allocation failed"
+  paymentAllocationCid <- case paymentResult.output of
+    AllocationInstructionResult_Completed cid -> pure cid
+    _ -> abort "payment allocation failed"
+  settleResult <- submit (actAs venue <> readAs seller <> readAs buyer <> readAs treasuryRegistry <> readAs cashRegistry) $
+    exerciseCmd tradeCid DvpTrade_Settle with
+      allocations =
+        [ SettlementAllocation with
+            transferLegId = treasuryLegId
+            allocationCid = treasuryAllocationCid
+            extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
+        , SettlementAllocation with
+            transferLegId = paymentLegId
+            allocationCid = paymentAllocationCid
+            extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
+        ]
+  length settleResult.treasuryResult.receiverHoldingCids === 1
+  length settleResult.paymentResult.receiverHoldingCids === 1
+  tradeAfter <- queryContractId venue tradeCid
+  isNone tradeAfter === True

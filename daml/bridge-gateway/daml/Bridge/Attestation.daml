@@ -1,0 +1,23 @@
+module Bridge.Attestation where
+
+import Bridge.Types
+
+template BridgeAttestation
+  with
+    attester : Party
+    cashRegistry : Party
+    lockId : Text
+    amount : Decimal
+    beneficiary : Party
+    digestHex : Text
+    direction : BridgeDirection
+  where
+    signatory attester
+    observer cashRegistry
+
+    ensure
+      lockId /= ""
+        && amount > 0.0
+        && digestHex /= ""
+        && attester /= cashRegistry
+        && attester /= beneficiary

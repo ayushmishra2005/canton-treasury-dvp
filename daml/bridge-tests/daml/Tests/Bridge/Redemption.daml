@@ -1,0 +1,88 @@
+module Tests.Bridge.Redemption where
+
+import DA.Assert ((===))
+import DA.Optional (isNone)
+import Daml.Script
+
+import Bridge.Gateway
+import Bridge.Types
+import Stablecoin.Instrument
+import Tests.Bridge.Fixture
+
+burnBeforeRelease : Script ()
+burnBeforeRelease = do
+  fixture <- setup
+  holdingCid <- mintWith fixture fixture.attesterA fixture.attesterB "lock-1" 100000.0 "digest-1"
+  requestCid <- submit fixture.holder $ createCmd RedemptionRequest with
+    holder = fixture.holder
+    cashRegistry = fixture.cashRegistry
+    lockId = "lock-1"
+    holdingCid
+    amount = 100000.0
+  firstCid <- attest fixture fixture.attesterA "lock-1" 100000.0 "redeem-1" RedeemAttestation
+  secondCid <- attest fixture fixture.attesterC "lock-1" 100000.0 "redeem-1" RedeemAttestation
+  gatewayCid <- currentGateway fixture
+  (_next, redeemedCid) <- submit fixture.cashRegistry $ exerciseCmd gatewayCid Gateway_Redeem with
+    requestCid
+    firstCid
+    secondCid
+  Some redeemed <- queryContractId fixture.cashRegistry redeemedCid
+  redeemed.lockId === "lock-1"
+  redeemed.amount === 100000.0
+  after <- queryContractId fixture.holder holdingCid
+  isNone after === True
+
+cannotRedeemTwice : Script ()
+cannotRedeemTwice = do
+  fixture <- setup
+  holdingCid <- mintWith fixture fixture.attesterA fixture.attesterB "lock-1" 100000.0 "digest-1"
+  requestCid <- submit fixture.holder $ createCmd RedemptionRequest with
+    holder = fixture.holder
+    cashRegistry = fixture.cashRegistry
+    lockId = "lock-1"
+    holdingCid
+    amount = 100000.0
+  firstCid <- attest fixture fixture.attesterA "lock-1" 100000.0 "redeem-1" RedeemAttestation
+  secondCid <- attest fixture fixture.attesterB "lock-1" 100000.0 "redeem-1" RedeemAttestation
+  gatewayCid <- currentGateway fixture
+  _ <- submit fixture.cashRegistry $ exerciseCmd gatewayCid Gateway_Redeem with
+    requestCid
+    firstCid
+    secondCid
+  replacement <- submit fixture.cashRegistry $ exerciseCmd fixture.instrumentCid Mint with
+    owner = fixture.holder
+    amount = 100000.0
+  retryRequest <- submit fixture.holder $ createCmd RedemptionRequest with
+    holder = fixture.holder
+    cashRegistry = fixture.cashRegistry
+    lockId = "lock-1"
+    holdingCid = replacement
+    amount = 100000.0
+  retryFirst <- attest fixture fixture.attesterA "lock-1" 100000.0 "redeem-2" RedeemAttestation
+  retrySecond <- attest fixture fixture.attesterB "lock-1" 100000.0 "redeem-2" RedeemAttestation
+  afterRedeem <- currentGateway fixture
+  submitMustFail fixture.cashRegistry $ exerciseCmd afterRedeem Gateway_Redeem with
+    requestCid = retryRequest
+    firstCid = retryFirst
+    secondCid = retrySecond
+
+cannotRedeemUnmintedLock : Script ()
+cannotRedeemUnmintedLock = do
+  fixture <- setup
+  holdingCid <- submit fixture.cashRegistry $ exerciseCmd fixture.instrumentCid Mint with
+    owner = fixture.holder
+    amount = 100000.0
+  requestCid <- submit fixture.holder $ createCmd RedemptionRequest with
+    holder = fixture.holder
+    cashRegistry = fixture.cashRegistry
+    lockId = "never-locked"
+    holdingCid
+    amount = 100000.0
+  firstCid <- attest fixture fixture.attesterA "never-locked" 100000.0 "redeem-1" RedeemAttestation
+  secondCid <- attest fixture fixture.attesterB "never-locked" 100000.0 "redeem-1" RedeemAttestation
+  submitMustFail fixture.cashRegistry $ exerciseCmd fixture.gatewayCid Gateway_Redeem with
+    requestCid
+    firstCid
+    secondCid
+  Some holding <- queryContractId fixture.holder holdingCid
+  holding.amount === 100000.0

@@ -1,0 +1,12 @@
+{
+  "networks": [
+    {
+      "type": "solana",
+      "network": "localnet",
+      "rpc_urls": ["http://host.docker.internal:8899"],
+      "average_blocktime_ms": 400,
+      "is_testnet": true,
+      "tags": ["local", "solana"]
+    }
+  ]
+}

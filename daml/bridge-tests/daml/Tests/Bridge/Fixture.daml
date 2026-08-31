@@ -1,0 +1,72 @@
+module Tests.Bridge.Fixture where
+
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1
+
+import Bridge.Attestation
+import Bridge.Gateway
+import Bridge.Types
+import Stablecoin.Holding
+import Stablecoin.Instrument
+
+data Fixture = Fixture with
+  cashRegistry : Party
+  attesterA : Party
+  attesterB : Party
+  attesterC : Party
+  holder : Party
+  outsider : Party
+  instrumentCid : ContractId StablecoinInstrument
+  instrumentId : InstrumentId
+  gatewayCid : ContractId BridgeGateway
+
+setup : Script Fixture
+setup = do
+  cashRegistry <- allocateParty "CashRegistry"
+  attesterA <- allocateParty "AttesterA"
+  attesterB <- allocateParty "AttesterB"
+  attesterC <- allocateParty "AttesterC"
+  holder <- allocateParty "Holder"
+  outsider <- allocateParty "Outsider"
+  instrumentCid <- submit cashRegistry $ createCmd StablecoinInstrument with
+    cashRegistry
+    id = "USD-C"
+    description = "Regulated USD payment stablecoin"
+  let instrumentId = InstrumentId with admin = cashRegistry, id = "USD-C"
+  gatewayCid <- submit cashRegistry $ createCmd BridgeGateway with
+    cashRegistry
+    attesters = [attesterA, attesterB, attesterC]
+    instrumentCid
+    instrumentId
+    mintedLocks = []
+    redeemedLocks = []
+  pure Fixture with ..
+
+attest : Fixture -> Party -> Text -> Decimal -> Text -> BridgeDirection -> Script (ContractId BridgeAttestation)
+attest fixture attester lockId amount digestHex direction =
+  submit attester $ createCmd BridgeAttestation with
+    attester
+    cashRegistry = fixture.cashRegistry
+    lockId
+    amount
+    beneficiary = fixture.holder
+    digestHex
+    direction
+
+currentGateway : Fixture -> Script (ContractId BridgeGateway)
+currentGateway fixture = do
+  found <- query @BridgeGateway fixture.cashRegistry
+  case found of
+    [(cid, _)] -> pure cid
+    _ -> abort "expected one bridge gateway"
+
+mintWith : Fixture -> Party -> Party -> Text -> Decimal -> Text -> Script (ContractId StablecoinHolding)
+mintWith fixture first second lockId amount digestHex = do
+  firstCid <- attest fixture first lockId amount digestHex MintAttestation
+  secondCid <- attest fixture second lockId amount digestHex MintAttestation
+  gatewayCid <- currentGateway fixture
+  (_next, holdingCid) <- submit fixture.cashRegistry $ exerciseCmd gatewayCid Gateway_Mint with
+    firstCid
+    secondCid
+  pure holdingCid

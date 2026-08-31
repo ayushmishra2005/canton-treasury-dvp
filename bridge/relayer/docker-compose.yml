@@ -1,0 +1,23 @@
+services:
+  redis:
+    image: redis:7.4.2
+    ports:
+      - "16379:6379"
+  relayer:
+    image: openzeppelin/openzeppelin-relayer:v1.5.0
+    depends_on:
+      - redis
+    ports:
+      - "18080:8080"
+    environment:
+      RUST_LOG: info
+      REDIS_URL: redis://redis:6379
+      API_KEY: ${RELAYER_API_KEY}
+      KEYSTORE_PASSPHRASE: ${KEYSTORE_PASSPHRASE}
+      RPC_BLOCK_PRIVATE_IPS: "false"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config.json:/app/config/config.json:ro
+      - ./networks:/app/config/networks:ro
+      - ./keys:/app/config/keys:ro

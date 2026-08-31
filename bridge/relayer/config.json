@@ -1,0 +1,35 @@
+{
+  "relayers": [
+    {
+      "id": "solana-local",
+      "name": "local solana",
+      "network": "localnet",
+      "paused": false,
+      "signer_id": "local-signer",
+      "network_type": "solana",
+      "custom_rpc_urls": [
+        { "url": "http://host.docker.internal:8899", "weight": 100 }
+      ],
+      "policies": {
+        "fee_payment_strategy": "relayer",
+        "min_balance": 0
+      }
+    }
+  ],
+  "signers": [
+    {
+      "id": "local-signer",
+      "type": "local",
+      "config": {
+        "path": "config/keys/local-signer.json",
+        "passphrase": {
+          "type": "env",
+          "value": "KEYSTORE_PASSPHRASE"
+        }
+      }
+    }
+  ],
+  "networks": "./config/networks",
+  "notifications": [],
+  "plugins": []
+}

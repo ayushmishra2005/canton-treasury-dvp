@@ -1,0 +1,6 @@
+module Bridge.Types where
+
+data BridgeDirection
+  = MintAttestation
+  | RedeemAttestation
+  deriving (Eq, Show)

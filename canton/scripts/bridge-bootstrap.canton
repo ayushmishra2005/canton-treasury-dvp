@@ -1,0 +1,35 @@
+import java.nio.file.{Files, Paths}
+
+val settlementAlias = "settlement-sync"
+val hostNames = Seq("p-cash", "p-buyer", "p-seller", "p-venue", "p-treasury", "p-outsider")
+val hosts = hostNames.map { name =>
+  participants.remote.find(_.name == name).getOrElse(sys.error(s"missing $name"))
+}
+val settlementSynchronizerId =
+  hosts.head.synchronizers.list_connected().find(_.synchronizerAlias.unwrap == settlementAlias).get.synchronizerId
+
+val bridgeDar = "daml/bridge-gateway/.daml/dist/bridge-gateway-0.1.0.dar"
+hosts.foreach { host =>
+  host.dars.upload(bridgeDar, synchronizerId = Some(settlementSynchronizerId))
+}
+
+val cash = participants.remote.find(_.name == "p-cash").getOrElse(sys.error("missing p-cash"))
+val attesters = Seq("attesterA", "attesterB", "attesterC").map { name =>
+  val party = cash.parties.enable(name, synchronizer = Some(SynchronizerAlias.tryCreate(settlementAlias)))
+  println(s"PARTY $name p-cash ${party.toProtoPrimitive}")
+  party
+}
+
+val runDir = Paths.get(sys.env.getOrElse("CANTON_RUN_DIR", "canton/.run-bridge"))
+val participantsPath = runDir.resolve("participants.json")
+val original = new String(Files.readAllBytes(participantsPath), "UTF-8")
+val extra = attesters
+  .map(party => s""""${party.toProtoPrimitive}": "p-cash"""")
+  .mkString(",\n    ")
+val patched = original.replaceFirst(
+  """("party_participants"\s*:\s*\{)""",
+  s"$$1\n    $extra,",
+)
+Files.write(participantsPath, patched.getBytes("UTF-8"))
+
+println("BRIDGE_BOOTSTRAP_COMPLETE")

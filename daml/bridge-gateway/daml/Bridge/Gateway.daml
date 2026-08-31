@@ -1,0 +1,131 @@
+module Bridge.Gateway where
+
+import DA.Optional (isNone)
+
+import Splice.Api.Token.HoldingV1
+
+import Bridge.Attestation
+import Bridge.Types
+import Stablecoin.Holding
+import Stablecoin.Instrument
+
+template MintedLock
+  with
+    cashRegistry : Party
+    lockId : Text
+    holdingCid : ContractId StablecoinHolding
+    amount : Decimal
+    beneficiary : Party
+  where
+    signatory cashRegistry
+    observer beneficiary
+
+template RedeemedLock
+  with
+    cashRegistry : Party
+    lockId : Text
+    amount : Decimal
+    holder : Party
+  where
+    signatory cashRegistry
+    observer holder
+
+template RedemptionRequest
+  with
+    holder : Party
+    cashRegistry : Party
+    lockId : Text
+    holdingCid : ContractId StablecoinHolding
+    amount : Decimal
+  where
+    signatory holder
+    observer cashRegistry
+
+    ensure lockId /= "" && amount > 0.0
+
+template BridgeGateway
+  with
+    cashRegistry : Party
+    attesters : [Party]
+    instrumentCid : ContractId StablecoinInstrument
+    instrumentId : InstrumentId
+    mintedLocks : [Text]
+    redeemedLocks : [Text]
+  where
+    signatory cashRegistry
+
+    ensure
+      case attesters of
+        [first, second, third] -> first /= second && first /= third && second /= third
+        _ -> False
+
+    choice Gateway_Mint : (ContractId BridgeGateway, ContractId StablecoinHolding)
+      with
+        firstCid : ContractId BridgeAttestation
+        secondCid : ContractId BridgeAttestation
+      controller cashRegistry
+      do
+        first <- fetch firstCid
+        second <- fetch secondCid
+        assertMsg "Attestations must be distinct contracts" (firstCid /= secondCid)
+        assertMsg "Attesters must be distinct" (first.attester /= second.attester)
+        assertMsg "First attester is not configured" (first.attester `elem` attesters)
+        assertMsg "Second attester is not configured" (second.attester `elem` attesters)
+        assertMsg "Attestations must target this registry" (first.cashRegistry == cashRegistry && second.cashRegistry == cashRegistry)
+        assertMsg "Attestations must be mint attestations"
+          (first.direction == MintAttestation && second.direction == MintAttestation)
+        assertMsg "Attestations must agree on the lock" (first.lockId == second.lockId)
+        assertMsg "Attestations must agree on the amount" (first.amount == second.amount)
+        assertMsg "Attestations must agree on the beneficiary" (first.beneficiary == second.beneficiary)
+        assertMsg "Attestations must agree on the digest" (first.digestHex == second.digestHex)
+        assertMsg "Lock has already been minted" (first.lockId `notElem` mintedLocks)
+        holdingCid <- exercise instrumentCid Mint with
+          owner = first.beneficiary
+          amount = first.amount
+        create MintedLock with
+          cashRegistry
+          lockId = first.lockId
+          holdingCid
+          amount = first.amount
+          beneficiary = first.beneficiary
+        gatewayCid <- create this with mintedLocks = first.lockId :: mintedLocks
+        pure (gatewayCid, holdingCid)
+
+    choice Gateway_Redeem : (ContractId BridgeGateway, ContractId RedeemedLock)
+      with
+        requestCid : ContractId RedemptionRequest
+        firstCid : ContractId BridgeAttestation
+        secondCid : ContractId BridgeAttestation
+      controller cashRegistry
+      do
+        request <- fetch requestCid
+        first <- fetch firstCid
+        second <- fetch secondCid
+        holding <- fetch request.holdingCid
+        assertMsg "Redemption must name this registry" (request.cashRegistry == cashRegistry)
+        assertMsg "Holding must belong to the requesting holder" (holding.owner == request.holder)
+        assertMsg "Holding must use the gateway instrument" (holding.instrumentId == instrumentId)
+        assertMsg "Holding must be unlocked" (isNone holding.lock)
+        assertMsg "Holding amount must match the redemption" (holding.amount == request.amount)
+        assertMsg "Attestations must be distinct contracts" (firstCid /= secondCid)
+        assertMsg "Attesters must be distinct" (first.attester /= second.attester)
+        assertMsg "First attester is not configured" (first.attester `elem` attesters)
+        assertMsg "Second attester is not configured" (second.attester `elem` attesters)
+        assertMsg "Attestations must be redeem attestations"
+          (first.direction == RedeemAttestation && second.direction == RedeemAttestation)
+        assertMsg "Attestations must agree on the lock"
+          (first.lockId == second.lockId && first.lockId == request.lockId)
+        assertMsg "Attestations must agree on the amount"
+          (first.amount == second.amount && first.amount == request.amount)
+        assertMsg "Attestations must name the holder"
+          (first.beneficiary == request.holder && second.beneficiary == request.holder)
+        assertMsg "Lock must have been minted before redemption" (request.lockId `elem` mintedLocks)
+        assertMsg "Lock has already been redeemed" (request.lockId `notElem` redeemedLocks)
+        exercise request.holdingCid Burn
+        redeemedCid <- create RedeemedLock with
+          cashRegistry
+          lockId = request.lockId
+          amount = request.amount
+          holder = request.holder
+        gatewayCid <- create this with redeemedLocks = request.lockId :: redeemedLocks
+        pure (gatewayCid, redeemedCid)

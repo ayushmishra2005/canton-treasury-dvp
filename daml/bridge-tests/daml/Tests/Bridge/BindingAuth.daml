@@ -1,0 +1,172 @@
+module Tests.Bridge.BindingAuth where
+
+import DA.Assert ((===))
+import DA.Optional (isNone)
+import Daml.Script
+
+import Bridge.Binding
+import Stablecoin.Holding
+import Tests.Bridge.Fixture
+import Tests.Bridge.OperationIsolation
+
+data AuthWorld = AuthWorld with
+    fixture : Fixture
+    seller : Party
+    venue : Party
+    holdingA : ContractId StablecoinHolding
+    holdingB : ContractId StablecoinHolding
+
+setupAuth : Script AuthWorld
+setupAuth = do
+  fixture <- setup
+  seller <- allocateParty "Seller"
+  venue <- allocateParty "Venue"
+  holdingA <- mintWith fixture fixture.attesterA fixture.attesterB "lock-auth-a" 100000.0 "digest-auth-a"
+  holdingB <- mintWith fixture fixture.attesterA fixture.attesterB "lock-auth-b" 100000.0 "digest-auth-b"
+  pure AuthWorld with ..
+
+buyerAloneCannotCreateMintRef : Script ()
+buyerAloneCannotCreateMintRef = do
+  world <- setupAuth
+  submitMustFail world.fixture.holder $ createCmd BridgeMintRef with
+    cashRegistry = world.fixture.cashRegistry
+    buyer = world.fixture.holder
+    lockId = "lock-auth-a"
+    mintHoldingCid = world.holdingA
+
+buyerAloneCannotCreateTradeBinding : Script ()
+buyerAloneCannotCreateTradeBinding = do
+  world <- setupAuth
+  submitMustFail world.fixture.holder $ createCmd BridgeTradeBinding with
+    cashRegistry = world.fixture.cashRegistry
+    buyer = world.fixture.holder
+    seller = world.seller
+    venue = world.venue
+    lockId = "lock-auth-a"
+    mintHoldingCid = world.holdingA
+    tradeCid = "trade-forged"
+    buyerTreasuryCid = None
+    sellerPaymentCid = None
+
+gatewayMintCreatesTheOnlyMintRef : Script ()
+gatewayMintCreatesTheOnlyMintRef = do
+  world <- setupAuth
+  refs <- query @BridgeMintRef world.fixture.holder
+  let forA = [ref | (_, ref) <- refs, ref.lockId == "lock-auth-a"]
+  let forB = [ref | (_, ref) <- refs, ref.lockId == "lock-auth-b"]
+  length forA === 1
+  length forB === 1
+  case (forA, forB) of
+    ([a], [b]) -> do
+      a.cashRegistry === world.fixture.cashRegistry
+      b.cashRegistry === world.fixture.cashRegistry
+      a.buyer === world.fixture.holder
+      b.buyer === world.fixture.holder
+      a.mintHoldingCid === world.holdingA
+      b.mintHoldingCid === world.holdingB
+      (a.mintHoldingCid /= b.mintHoldingCid) === True
+    _ -> abort "gateway mint did not create one mint reference per lock"
+
+nonGatewayMintRefIsRejected : Script ()
+nonGatewayMintRefIsRejected = do
+  world <- setupAuth
+  submitMustFail world.fixture.holder $ createCmd BridgeMintRef with
+    cashRegistry = world.fixture.cashRegistry
+    buyer = world.fixture.holder
+    lockId = "lock-forged"
+    mintHoldingCid = world.holdingA
+  refs <- query @BridgeMintRef world.fixture.holder
+  null [cid | (cid, ref) <- refs, ref.lockId == "lock-forged"] === True
+  length [cid | (cid, ref) <- refs, ref.lockId == "lock-auth-a"] === 1
+  length [cid | (cid, ref) <- refs, ref.lockId == "lock-auth-b"] === 1
+
+mintRefCannotBeBoundTwice : Script ()
+mintRefCannotBeBoundTwice = do
+  world <- setupAuth
+  refs <- query @BridgeMintRef world.fixture.holder
+  refCid <- case [cid | (cid, ref) <- refs, ref.lockId == "lock-auth-a"] of
+    [cid] -> pure cid
+    _ -> abort "missing gateway mint reference for lock A"
+  bindingCid <- submit world.fixture.holder $ exerciseCmd refCid BridgeMintRef_Bind with
+    seller = world.seller
+    venue = world.venue
+    tradeCid = "trade-a"
+  submitMustFail world.fixture.holder $ exerciseCmd refCid BridgeMintRef_Bind with
+    seller = world.seller
+    venue = world.venue
+    tradeCid = "trade-a-again"
+  Some binding <- queryContractId world.fixture.holder bindingCid
+  binding.cashRegistry === world.fixture.cashRegistry
+  binding.lockId === "lock-auth-a"
+  binding.mintHoldingCid === world.holdingA
+
+holdingOrLockFromACannotBindToB : Script ()
+holdingOrLockFromACannotBindToB = do
+  world <- setupAuth
+  submitMustFail world.fixture.holder $ createCmd BridgeMintRef with
+    cashRegistry = world.fixture.cashRegistry
+    buyer = world.fixture.holder
+    lockId = "lock-auth-b"
+    mintHoldingCid = world.holdingA
+  submitMustFail world.fixture.holder $ createCmd BridgeTradeBinding with
+    cashRegistry = world.fixture.cashRegistry
+    buyer = world.fixture.holder
+    seller = world.seller
+    venue = world.venue
+    lockId = "lock-auth-b"
+    mintHoldingCid = world.holdingA
+    tradeCid = "trade-b"
+    buyerTreasuryCid = None
+    sellerPaymentCid = None
+  refs <- query @BridgeMintRef world.fixture.holder
+  refA <- case [cid | (cid, ref) <- refs, ref.lockId == "lock-auth-a"] of
+    [cid] -> pure cid
+    _ -> abort "missing gateway mint reference for lock A"
+  _ <- submit world.fixture.holder $ exerciseCmd refA BridgeMintRef_Bind with
+    seller = world.seller
+    venue = world.venue
+    tradeCid = "trade-a"
+  bindings <- query @BridgeTradeBinding world.fixture.holder
+  null
+    [ cid
+    | (cid, binding) <- bindings
+    , binding.lockId == "lock-auth-b"
+    , binding.mintHoldingCid == world.holdingA
+    ] === True
+  case [binding | (_, binding) <- bindings, binding.lockId == "lock-auth-a"] of
+    [boundA] -> boundA.mintHoldingCid === world.holdingA
+    _ -> abort "lock A lost its gateway binding"
+
+privacyRulesRemain : Script ()
+privacyRulesRemain = do
+  world <- setupAuth
+  refs <- query @BridgeMintRef world.fixture.holder
+  refA <- case [cid | (cid, ref) <- refs, ref.lockId == "lock-auth-a"] of
+    [cid] -> pure cid
+    _ -> abort "missing gateway mint reference for lock A"
+  _ <- submit world.fixture.holder $ exerciseCmd refA BridgeMintRef_Bind with
+    seller = world.seller
+    venue = world.venue
+    tradeCid = "trade-a"
+  outsiderRefs <- query @BridgeMintRef world.fixture.outsider
+  outsiderBindings <- query @BridgeTradeBinding world.fixture.outsider
+  attesterRefs <- query @BridgeMintRef world.fixture.attesterA
+  attesterBindings <- query @BridgeTradeBinding world.fixture.attesterA
+  venueBindings <- query @BridgeTradeBinding world.venue
+  sellerRefs <- query @BridgeMintRef world.seller
+  null outsiderRefs === True
+  null outsiderBindings === True
+  null attesterRefs === True
+  null attesterBindings === True
+  null venueBindings === True
+  null sellerRefs === True
+  sellerBindings <- query @BridgeTradeBinding world.seller
+  length sellerBindings === 1
+  holding <- queryContractId world.fixture.holder world.holdingA
+  isNone holding === False
+
+identicalTermOperationsStayIndependent : Script ()
+identicalTermOperationsStayIndependent = do
+  _ <- bothOperationsSettleAndRedeemIndependently
+  _ <- completingADoesNotBlockB
+  pure ()

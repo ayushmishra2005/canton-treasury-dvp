@@ -1,0 +1,378 @@
+module Tests.Bridge.OperationIsolation where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import DA.Optional (isNone)
+import DA.Text qualified as Text
+import DA.Time (addRelTime, hours, time)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Bridge.Attestation
+import Bridge.Binding
+import Bridge.Gateway
+import Bridge.Types
+import Dvp.Trade
+import Stablecoin.Eligibility qualified as Stablecoin
+import Stablecoin.Eligibility (StablecoinEligibility(..))
+import Stablecoin.Holding
+import Stablecoin.Instrument
+import Stablecoin.Rules (StablecoinRules(..))
+import Tests.Bridge.Runtime
+import Treasury.Eligibility qualified as Treasury
+import Treasury.Eligibility (TreasuryEligibility(..))
+import Treasury.Holding (TreasuryHolding)
+import Treasury.Instrument
+import Treasury.Rules (TreasuryRules(..))
+
+data Dual = Dual with
+    live : Live
+    treasuryInstrumentCid : ContractId TreasuryInstrument
+    cashRulesCid : ContractId StablecoinRules
+    treasuryRulesCid : ContractId TreasuryRules
+    inputA : RuntimeInput
+    inputB : RuntimeInput
+    mintA : ContractId StablecoinHolding
+    mintB : ContractId StablecoinHolding
+    tradeA : ContractId DvpTrade
+    tradeB : ContractId DvpTrade
+    bindingA : ContractId BridgeTradeBinding
+    bindingB : ContractId BridgeTradeBinding
+
+inputA0 : RuntimeInput
+inputA0 = RuntimeInput with
+    lockId = "lock-iso-a"
+    amount = "100000.000000"
+    digestHex = "digest-iso-a"
+    payoutDestination = "dest-iso-a"
+
+inputB0 : RuntimeInput
+inputB0 = RuntimeInput with
+    lockId = "lock-iso-b"
+    amount = "100000.000000"
+    digestHex = "digest-iso-b"
+    payoutDestination = "dest-iso-b"
+
+mintLock : Live -> ContractId BridgeGateway -> RuntimeInput -> Script (ContractId BridgeGateway, ContractId StablecoinHolding)
+mintLock live gatewayCid input = do
+  firstCid <- submit live.attesterA $ createCmd BridgeAttestation with
+    attester = live.attesterA
+    cashRegistry = live.cashRegistry
+    lockId = input.lockId
+    amount = 100000.0
+    beneficiary = live.buyer
+    digestHex = input.digestHex
+    direction = MintAttestation
+    instrumentId = live.instrumentId
+    payoutDestination = ""
+  secondCid <- submit live.attesterB $ createCmd BridgeAttestation with
+    attester = live.attesterB
+    cashRegistry = live.cashRegistry
+    lockId = input.lockId
+    amount = 100000.0
+    beneficiary = live.buyer
+    digestHex = input.digestHex
+    direction = MintAttestation
+    instrumentId = live.instrumentId
+    payoutDestination = ""
+  submit live.cashRegistry $ exerciseCmd gatewayCid Gateway_Mint with firstCid, secondCid
+
+setupDual : Script Dual
+setupDual = do
+  setTime (time (date 2026 Jan 1) 12 0 0)
+  treasuryRegistry <- allocateParty "TreasuryRegistry"
+  cashRegistry <- allocateParty "CashRegistry"
+  venue <- allocateParty "Venue"
+  seller <- allocateParty "Seller"
+  buyer <- allocateParty "Buyer"
+  attesterA <- allocateParty "AttesterA"
+  attesterB <- allocateParty "AttesterB"
+  attesterC <- allocateParty "AttesterC"
+  now <- getTime
+  treasuryInstrumentCid <- submit treasuryRegistry $ createCmd TreasuryInstrument with
+    treasuryRegistry
+    id = "UST-2028-11"
+    description = "US Treasury Note 1.5% due 2028-11-15"
+    faceValue = 1000.0
+    maturityDate = date 2028 Nov 15
+  cashInstrumentCid <- submit cashRegistry $ createCmd StablecoinInstrument with
+    cashRegistry
+    id = "USD-C"
+    description = "Regulated USD payment stablecoin"
+  let treasuryInstrumentId = InstrumentId with admin = treasuryRegistry, id = "UST-2028-11"
+      paymentInstrumentId = InstrumentId with admin = cashRegistry, id = "USD-C"
+  treasuryRulesCid <- submit treasuryRegistry $ createCmd TreasuryRules with instrumentId = treasuryInstrumentId
+  cashRulesCid <- submit cashRegistry $ createCmd StablecoinRules with instrumentId = paymentInstrumentId
+  gateway0 <- submit cashRegistry $ createCmd BridgeGateway with
+    cashRegistry
+    attesters = [attesterA, attesterB, attesterC]
+    instrumentCid = cashInstrumentCid
+    instrumentId = paymentInstrumentId
+    mintedLocks = []
+    redeemedLocks = []
+  let live = Live with
+        cashRegistry
+        treasuryRegistry
+        attesterA
+        attesterB
+        attesterC
+        buyer
+        seller
+        venue
+        instrumentCid = cashInstrumentCid
+        instrumentId = paymentInstrumentId
+        gatewayCid = gateway0
+  (gateway1, mintA) <- mintLock live gateway0 inputA0
+  (gateway2, mintB) <- mintLock live gateway1 inputB0
+  _ <- submit treasuryRegistry $ exerciseCmd treasuryInstrumentCid Issue with
+    owner = seller
+    amount = 100.0
+  _ <- submit treasuryRegistry $ exerciseCmd treasuryInstrumentCid Issue with
+    owner = seller
+    amount = 100.0
+  _ <- submit treasuryRegistry $ createCmd TreasuryEligibility with
+    instrumentId = treasuryInstrumentId
+    investor = seller
+    status = Treasury.Eligible
+    validFrom = addRelTime now (hours (-1))
+    validUntil = addRelTime now (hours 24)
+    attestationRef = "attestation-000"
+  _ <- submit treasuryRegistry $ createCmd TreasuryEligibility with
+    instrumentId = treasuryInstrumentId
+    investor = buyer
+    status = Treasury.Eligible
+    validFrom = addRelTime now (hours (-1))
+    validUntil = addRelTime now (hours 24)
+    attestationRef = "attestation-000"
+  _ <- submit cashRegistry $ createCmd StablecoinEligibility with
+    instrumentId = paymentInstrumentId
+    investor = seller
+    status = Stablecoin.Eligible
+    validFrom = addRelTime now (hours (-1))
+    validUntil = addRelTime now (hours 24)
+    attestationRef = "attestation-000"
+  _ <- submit cashRegistry $ createCmd StablecoinEligibility with
+    instrumentId = paymentInstrumentId
+    investor = buyer
+    status = Stablecoin.Eligible
+    validFrom = addRelTime now (hours (-1))
+    validUntil = addRelTime now (hours 24)
+    attestationRef = "attestation-000"
+  _ <- createPreparedTrade live inputA0 100000.0 now treasuryInstrumentId
+  _ <- createPreparedTrade live inputB0 100000.0 now treasuryInstrumentId
+  bindingsA <- bindingsForLock live inputA0.lockId
+  bindingsB <- bindingsForLock live inputB0.lockId
+  (bindingA, boundA) <- case bindingsA of
+    [one] -> pure one
+    _ -> abort "expected one binding for lock A"
+  (bindingB, boundB) <- case bindingsB of
+    [one] -> pure one
+    _ -> abort "expected one binding for lock B"
+  trades <- query @DvpTrade venue
+  (tradeA, _) <- case [(cid, trade) | (cid, trade) <- trades, show cid == boundA.tradeCid] of
+    [one] -> pure one
+    _ -> abort "bound trade A missing"
+  (tradeB, _) <- case [(cid, trade) | (cid, trade) <- trades, show cid == boundB.tradeCid] of
+    [one] -> pure one
+    _ -> abort "bound trade B missing"
+  boundA.cashRegistry === live.cashRegistry
+  boundB.cashRegistry === live.cashRegistry
+  boundA.mintHoldingCid === mintA
+  boundB.mintHoldingCid === mintB
+  boundA.tradeCid === show tradeA
+  boundB.tradeCid === show tradeB
+  pure Dual with
+    live = live with gatewayCid = gateway2
+    treasuryInstrumentCid
+    cashRulesCid
+    treasuryRulesCid
+    inputA = inputA0
+    inputB = inputB0
+    mintA
+    mintB
+    tradeA
+    tradeB
+    bindingA
+    bindingB
+
+broadLookupCannotIsolateTwoIdenticalOperations : Script ()
+broadLookupCannotIsolateTwoIdenticalOperations = do
+  dual <- setupDual
+  found <- tradesMatchingPartiesAndAmount dual.live 100000.0
+  length found === 2
+  broad <- broadTradeLookup dual.live 100000.0
+  broad === BroadMany with count = 2
+  (dual.tradeA /= dual.tradeB) === True
+  bindingsA <- bindingsForLock dual.live dual.inputA.lockId
+  bindingsB <- bindingsForLock dual.live dual.inputB.lockId
+  case (bindingsA, bindingsB) of
+    ([(_, a)], [(_, b)]) -> do
+      a.tradeCid === show dual.tradeA
+      b.tradeCid === show dual.tradeB
+      a.mintHoldingCid === dual.mintA
+      b.mintHoldingCid === dual.mintB
+      (a.tradeCid /= b.tradeCid) === True
+      (a.mintHoldingCid /= b.mintHoldingCid) === True
+    _ -> abort "expected one binding per lock"
+
+eachOperationUsesOnlyItsMintAndTrade : Script ()
+eachOperationUsesOnlyItsMintAndTrade = do
+  dual <- setupDual
+  now <- getTime
+  decisionA <- decideSettle dual.live 100000.0 dual.inputA.lockId now
+  decisionB <- decideSettle dual.live 100000.0 dual.inputB.lockId now
+  case (decisionA, decisionB) of
+    (ResumeSettle tradeA _, ResumeSettle tradeB _) -> do
+      tradeA === dual.tradeA
+      tradeB === dual.tradeB
+      (tradeA /= tradeB) === True
+    _ -> abort "both operations should resume their bound trades"
+  settledA <- settleFromLedger dual.live dual.inputA
+  Text.isInfixOf (show dual.mintA) settledA === True
+  mintedAAfter <- queryContractId dual.live.buyer dual.mintA
+  mintedBAfter <- queryContractId dual.live.buyer dual.mintB
+  isNone mintedAAfter === True
+  case mintedBAfter of
+    Some holding -> holding.amount === 100000.0
+    None -> abort "operation B lost its mint when A settled"
+  tradeAAfter <- queryContractId dual.live.venue dual.tradeA
+  tradeBAfter <- queryContractId dual.live.venue dual.tradeB
+  isNone tradeAAfter === True
+  case tradeBAfter of
+    Some _ -> pure ()
+    None -> abort "completing A archived B's trade"
+
+partialAllocationFromACannotBeUsedByB : Script ()
+partialAllocationFromACannotBeUsedByB = do
+  dual <- setupDual
+  now <- getTime
+  paymentA <- allocatePaymentLeg dual.live now dual.tradeA dual.cashRulesCid dual.mintA
+  allocsB <- matchingPaymentAllocations dual.live =<< do
+    Some trade <- queryContractId dual.live.venue dual.tradeB
+    pure trade
+  null allocsB === True
+  mintedB <- queryContractId dual.live.buyer dual.mintB
+  case mintedB of
+    Some _ -> pure ()
+    None -> abort "B's mint was consumed by A's allocation"
+  Some tradeB <- queryContractId dual.live.venue dual.tradeB
+  treasuryB <- allocateTreasuryLeg dual.live now dual.tradeB dual.treasuryRulesCid
+  submitMustFail (actAs dual.live.venue) $
+    exerciseCmd dual.tradeB DvpTrade_Settle with
+      allocations =
+        [ SettlementAllocation with
+            transferLegId = treasuryLegId
+            allocationCid = treasuryB
+            extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
+        , SettlementAllocation with
+            transferLegId = paymentLegId
+            allocationCid = paymentA
+            extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
+        ]
+  allocsBAfter <- matchingPaymentAllocations dual.live tradeB
+  null allocsBAfter === True
+  mintedA <- queryContractId dual.live.buyer dual.mintA
+  isNone mintedA === True
+  mintedBStill <- queryContractId dual.live.buyer dual.mintB
+  case mintedBStill of
+    Some _ -> pure ()
+    None -> abort "B's mint was consumed while rejecting A's allocation"
+  let _ = dual.bindingA
+  let _ = dual.bindingB
+  let _ = dual.treasuryInstrumentCid
+  pure ()
+
+completingADoesNotBlockB : Script ()
+completingADoesNotBlockB = do
+  dual <- setupDual
+  _ <- settleFromLedger dual.live dual.inputA
+  _ <- redeemFromLedger dual.live dual.inputA
+  now <- getTime
+  decisionB <- decideSettle dual.live 100000.0 dual.inputB.lockId now
+  case decisionB of
+    ResumeSettle tradeB _ -> tradeB === dual.tradeB
+    other -> abort ("completing A blocked B: " <> show other)
+  settledB <- settleFromLedger dual.live dual.inputB
+  Text.isInfixOf (show dual.mintB) settledB === True
+  _ <- redeemFromLedger dual.live dual.inputB
+  redeemed <- query @RedeemedLock dual.live.cashRegistry
+  let locks = [lock.lockId | (_, lock) <- redeemed]
+  (inputA0.lockId `elem` locks) === True
+  (inputB0.lockId `elem` locks) === True
+
+bothOperationsSettleAndRedeemIndependently : Script ()
+bothOperationsSettleAndRedeemIndependently = do
+  dual <- setupDual
+  settledA <- settleFromLedger dual.live dual.inputA
+  settledB <- settleFromLedger dual.live dual.inputB
+  Text.isInfixOf (show dual.mintA) settledA === True
+  Text.isInfixOf (show dual.mintB) settledB === True
+  Text.isInfixOf (show dual.mintB) settledA === False
+  Text.isInfixOf (show dual.mintA) settledB === False
+  redeemA <- redeemFromLedger dual.live dual.inputA
+  redeemB <- redeemFromLedger dual.live dual.inputB
+  Text.isInfixOf "CANTON_REDEEM" redeemA === True
+  Text.isInfixOf "CANTON_REDEEM" redeemB === True
+  mintedA <- queryContractId dual.live.buyer dual.mintA
+  mintedB <- queryContractId dual.live.buyer dual.mintB
+  isNone mintedA === True
+  isNone mintedB === True
+  tradeA <- queryContractId dual.live.venue dual.tradeA
+  tradeB <- queryContractId dual.live.venue dual.tradeB
+  isNone tradeA === True
+  isNone tradeB === True
+  buyerTreasuries <- query @TreasuryHolding dual.live.buyer
+  length [cid | (cid, holding) <- buyerTreasuries, holding.amount == 100.0, isNone holding.lock] === 2
+  sellerPays <- query @StablecoinHolding dual.live.seller
+  null [cid | (cid, holding) <- sellerPays, holding.amount == 100000.0, isNone holding.lock] === True
+  bindingsA <- bindingsForLock dual.live dual.inputA.lockId
+  bindingsB <- bindingsForLock dual.live dual.inputB.lockId
+  case (bindingsA, bindingsB) of
+    ([(_, a)], [(_, b)]) -> do
+      a.tradeCid === show dual.tradeA
+      b.tradeCid === show dual.tradeB
+      (a.sellerPaymentCid /= b.sellerPaymentCid) === True
+    _ -> abort "bindings missing after both redemptions"
+
+repeatedRecoveryCreatesNoDuplicates : Script ()
+repeatedRecoveryCreatesNoDuplicates = do
+  dual <- setupDual
+  firstA <- settleFromLedger dual.live dual.inputA
+  secondA <- settleFromLedger dual.live dual.inputA
+  firstB <- settleFromLedger dual.live dual.inputB
+  secondB <- settleFromLedger dual.live dual.inputB
+  Text.isInfixOf "CANTON_SETTLE_BUYER_TREASURY" firstA === True
+  Text.isInfixOf "CANTON_SETTLE_BUYER_TREASURY" secondA === True
+  Text.isInfixOf "CANTON_SETTLE_BUYER_TREASURY" firstB === True
+  Text.isInfixOf "CANTON_SETTLE_BUYER_TREASURY" secondB === True
+  firstA === secondA
+  firstB === secondB
+  (firstA /= firstB) === True
+  redeemA1 <- redeemFromLedger dual.live dual.inputA
+  redeemA2 <- redeemFromLedger dual.live dual.inputA
+  redeemB1 <- redeemFromLedger dual.live dual.inputB
+  redeemB2 <- redeemFromLedger dual.live dual.inputB
+  Text.isInfixOf "CANTON_REDEEM" redeemA1 === True
+  redeemA1 === redeemA2
+  redeemB1 === redeemB2
+  redeemed <- query @RedeemedLock dual.live.cashRegistry
+  length redeemed === 2
+  attestations <- query @BridgeAttestation dual.live.cashRegistry
+  let mintAttestsA =
+        [ cid
+        | (cid, attestation) <- attestations
+        , attestation.direction == MintAttestation
+        , attestation.lockId == dual.inputA.lockId
+        ]
+  let mintAttestsB =
+        [ cid
+        | (cid, attestation) <- attestations
+        , attestation.direction == MintAttestation
+        , attestation.lockId == dual.inputB.lockId
+        ]
+  length mintAttestsA === 2
+  length mintAttestsB === 2
+  mintedLocks <- query @MintedLock dual.live.cashRegistry
+  length mintedLocks === 2

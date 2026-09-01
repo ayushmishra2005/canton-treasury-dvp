@@ -156,6 +156,62 @@ java -jar "$canton_jar" run canton/scripts/origination.canton \
   || { tail -40 "$run_dir/origination.log" >&2; fail "treasury origination failed"; }
 grep -q ORIGINATION_COMPLETE "$run_dir/origination.log" || fail "treasury origination did not complete"
 
+python3 - <<'PY' > /tmp/ctd-live-isolation-input.json
+print('{"lockId":"unused","amount":"100000.000000","digestHex":"unused","payoutDestination":"unused"}')
+PY
+echo "BRIDGE_LIVE_ISOLATION"
+dpm script --dar daml/bridge-tests/.daml/dist/canton-treasury-dvp-bridge-tests-0.1.0.dar \
+  --script-name Tests.Bridge.Runtime:prepare \
+  --participant-config "$run_dir/participants.json" \
+  --input-file /tmp/ctd-live-isolation-input.json \
+  --wall-clock-time > /tmp/ctd-live-prepare.log 2>&1 \
+  || { tail -40 /tmp/ctd-live-prepare.log >&2; fail "live isolation prepare failed"; }
+REASSIGNMENT_CAPABILITY=granted java -jar "$canton_jar" run canton/scripts/reassignment-capability.canton \
+  -c canton/remote-console.conf --no-tty --log-level-stdout WARN \
+  > "$run_dir/isolation-capability-grant.log" 2>&1 \
+  || { tail -40 "$run_dir/isolation-capability-grant.log" >&2; fail "isolation reassignment grant failed"; }
+java -jar "$canton_jar" run canton/scripts/prepare-isolation-holdings.canton \
+  -c canton/remote-console.conf --no-tty --log-level-stdout WARN \
+  > "$run_dir/isolation-holdings.log" 2>&1 \
+  || { tail -40 "$run_dir/isolation-holdings.log" >&2; fail "isolation treasury holdings were not issued and reassigned"; }
+grep -q ISO_HOLDINGS_READY "$run_dir/isolation-holdings.log" \
+  || fail "isolation holdings script did not finish"
+iso_hold_a="$(awk '/ISO_HOLDING_A /{print $2}' "$run_dir/isolation-holdings.log" | tail -1)"
+iso_hold_b="$(awk '/ISO_HOLDING_B /{print $2}' "$run_dir/isolation-holdings.log" | tail -1)"
+[[ -n "$iso_hold_a" && -n "$iso_hold_b" && "$iso_hold_a" != "$iso_hold_b" ]] \
+  || fail "isolation holdings were not distinct: $iso_hold_a $iso_hold_b"
+REASSIGNMENT_CAPABILITY=revoked java -jar "$canton_jar" run canton/scripts/reassignment-capability.canton \
+  -c canton/remote-console.conf --no-tty --log-level-stdout WARN \
+  > "$run_dir/isolation-capability-revoke.log" 2>&1 \
+  || { tail -40 "$run_dir/isolation-capability-revoke.log" >&2; fail "isolation reassignment revoke failed"; }
+dpm script --dar daml/bridge-tests/.daml/dist/canton-treasury-dvp-bridge-tests-0.1.0.dar \
+  --script-name Tests.Bridge.LiveIsolation:twoLiveOperations \
+  --participant-config "$run_dir/participants.json" \
+  --input-file /tmp/ctd-live-isolation-input.json \
+  --wall-clock-time > /tmp/ctd-live-isolation.log 2>&1 \
+  || { tail -40 /tmp/ctd-live-isolation.log >&2; fail "live isolation of two identical-term operations failed"; }
+grep -q LIVE_ISOLATION_OK /tmp/ctd-live-isolation.log \
+  || fail "live isolation did not print LIVE_ISOLATION_OK"
+grep -q 'LIVE_ISOLATION_BROAD_LOOKUP 2' /tmp/ctd-live-isolation.log \
+  || fail "live isolation did not prove the broad party-and-amount lookup"
+daml_marker() {
+  local file="$1" key="$2"
+  sed -n "s/.*${key} \\([0-9a-fA-F]*\\).*/\\1/p" "$file" | tail -1
+}
+iso_a="$(daml_marker /tmp/ctd-live-isolation.log LIVE_ISOLATION_BINDING_A)"
+iso_b="$(daml_marker /tmp/ctd-live-isolation.log LIVE_ISOLATION_BINDING_B)"
+[[ -n "$iso_a" && -n "$iso_b" && "$iso_a" != "$iso_b" ]] \
+  || fail "live isolation did not bind A and B to different trades: $iso_a $iso_b"
+iso_mint_a="$(daml_marker /tmp/ctd-live-isolation.log LIVE_ISOLATION_MINT_A)"
+iso_mint_b="$(daml_marker /tmp/ctd-live-isolation.log LIVE_ISOLATION_MINT_B)"
+[[ -n "$iso_mint_a" && -n "$iso_mint_b" && "$iso_mint_a" != "$iso_mint_b" ]] \
+  || fail "live isolation did not keep distinct mint holdings"
+reserved_hold="$(awk -F= '/^reserved=/{print $2}' "$run_dir/isolation-holdings.txt")"
+used_holds="$(sed -n 's/.*CANTON_USED_TREASURY_HOLDING \([0-9a-fA-F]*\).*/\1/p' /tmp/ctd-live-isolation.log | sort -u)"
+printf '%s\n' "$used_holds" | grep -qx "$iso_hold_a" || fail "live isolation did not use reassigned holding A"
+printf '%s\n' "$used_holds" | grep -qx "$iso_hold_b" || fail "live isolation did not use reassigned holding B"
+printf '%s\n' "$used_holds" | grep -qx "$reserved_hold" && fail "live isolation consumed the reserved origination holding"
+
 echo "RELAYER_PROOF_REQUIRED confidential PDA release through Relayer 1.5.0"
 expiry_dir="$run_dir/bridge-expiry"
 journal_dir="$run_dir/bridge-op"
@@ -196,6 +252,12 @@ grep -q EXPIRY_RECOVERY_CANCEL_CONFIRMED /tmp/ctd-workflow.log \
   || fail "expiry recovery did not cancel through Relayer"
 grep -q EXPIRY_RECOVERY_COMPLETE /tmp/ctd-workflow.log \
   || fail "expiry recovery did not complete"
+grep -q "FAULT_INJECTED expiry_before_settlement" /tmp/ctd-workflow.log \
+  || fail "expiry-before-settlement fault was not recorded"
+grep -q "RECOVERY_RESULT cancelled" /tmp/ctd-workflow.log \
+  || fail "expiry recovery did not record a cancelled recovery result"
+grep -q "RECOVERY_DURATION_CHAIN_SECS" /tmp/ctd-workflow.log \
+  || fail "expiry recovery did not record chain-time duration"
 
 assert_journal_step() {
   local dir="$1"
@@ -230,6 +292,43 @@ PY
 
 last_marker() {
   grep "$1" /tmp/ctd-workflow.log | tail -1
+}
+
+solana_chain_unix() {
+  python3 - <<'PY'
+import base64, json, struct, urllib.request
+req = urllib.request.Request(
+    "http://127.0.0.1:8899",
+    data=json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getAccountInfo",
+        "params": [
+            "SysvarC1ock11111111111111111111111111111111",
+            {"encoding": "base64"},
+        ],
+    }).encode(),
+    headers={"content-type": "application/json"},
+)
+acc = json.load(urllib.request.urlopen(req))["result"]["value"]["data"][0]
+print(struct.unpack_from("<q", base64.b64decode(acc), 32)[0])
+PY
+}
+
+wait_chain_clock_past() {
+  local expiry="$1"
+  echo "BRIDGE_WAIT_CHAIN_CLOCK_PAST $expiry"
+  local now
+  for _ in $(seq 1 120); do
+    now="$(solana_chain_unix)"
+    echo "CHAIN_CLOCK $now RELEASE_ONCHAIN_EXPIRY $expiry"
+    if [[ "$now" -ge "$expiry" ]]; then
+      echo "BRIDGE_RELEASE_APPROVAL_EXPIRED_ON_CHAIN"
+      return 0
+    fi
+    sleep 1
+  done
+  fail "Solana chain clock $now did not reach expiry $expiry"
 }
 
 reject_dir="$run_dir/bridge-reject"
@@ -340,19 +439,38 @@ BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
   run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after locked
 assert_journal_step "$journal_dir" locked
 
-echo "BRIDGE_INTERRUPT_AFTER_FIRST_ATTESTATION"
+echo "BRIDGE_ATTESTER_DISAGREEMENT"
 BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
-  run_workflow --journal "$journal_dir" --resume --halt-after-first-approval --omit-journal-save
+  run_workflow --journal "$journal_dir" --resume --inject-attester-disagreement
 assert_journal_step "$journal_dir" locked
+grep -q "FAULT_INJECTED attester_disagreement" /tmp/ctd-workflow.log \
+  || fail "attester disagreement was not injected"
+grep -q "RECOVERY_WAIT_UNBOUNDED operator_or_quorum" /tmp/ctd-workflow.log \
+  || fail "attester disagreement did not record that quorum wait is unbounded"
+grep -q CHAIN_CLOCK /tmp/ctd-workflow.log \
+  || fail "attester disagreement did not record chain time"
 [[ "$(last_marker MINT_APPROVAL_BITMAP)" == "MINT_APPROVAL_BITMAP 1" ]] \
-  || fail "first attestation was not recorded on-chain: $(last_marker MINT_APPROVAL_BITMAP)"
+  || fail "conflicting attestation counted toward quorum: $(last_marker MINT_APPROVAL_BITMAP)"
 [[ "$(last_marker RECEIPT_STATUS)" == "RECEIPT_STATUS 1" ]] \
-  || fail "receipt must stay locked after one attestation: $(last_marker RECEIPT_STATUS)"
+  || fail "receipt must stay locked without 2-of-3: $(last_marker RECEIPT_STATUS)"
+python3 - "$journal_dir/journal.json" <<'PY'
+import json, sys
+journal = json.load(open(sys.argv[1]))
+if journal.get("mint_holding"):
+    raise SystemExit("disagreement minted before quorum")
+if journal.get("completed") != "locked":
+    raise SystemExit(f"disagreement advanced to {journal.get('completed')}")
+print("DISAGREEMENT_NO_MINT")
+PY
 
 echo "BRIDGE_SECOND_ATTESTATION_BEFORE_SAVE"
 BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
   run_workflow --journal "$journal_dir" --resume --stop-after mint_approved --omit-journal-save
 assert_journal_step "$journal_dir" locked
+grep -q "RECOVERY_DURATION_CHAIN_SECS" /tmp/ctd-workflow.log \
+  || fail "attester disagreement recovery did not record chain duration"
+grep -q "RECOVERY_WAIT_UNBOUNDED operator_or_quorum" /tmp/ctd-workflow.log \
+  || fail "attester disagreement recovery did not state the wait is unbounded"
 [[ "$(last_marker MINT_APPROVAL_BITMAP)" == "MINT_APPROVAL_BITMAP 3" ]] \
   || fail "missing attestation was not the only submit: $(last_marker MINT_APPROVAL_BITMAP)"
 [[ "$(last_marker RECEIPT_STATUS)" == "RECEIPT_STATUS 2" ]] \
@@ -367,26 +485,67 @@ assert_journal_step "$journal_dir" mint_approved
 [[ "$(last_marker RECEIPT_STATUS)" == "RECEIPT_STATUS 2" ]] \
   || fail "resume changed the mint-authorized receipt: $(last_marker RECEIPT_STATUS)"
 
-for step in canton_minted trade_prepared reassigned settled redeemed; do
+for step in canton_minted trade_prepared reassigned; do
   echo "BRIDGE_RESUME_AFTER $step"
   BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
     run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after "$step"
 done
 
+echo "BRIDGE_SETTLE_BEFORE_SAVE"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --resume --stop-after settled --omit-journal-save
+assert_journal_step "$journal_dir" reassigned
+grep -q DVP_BUYER_TREASURY /tmp/ctd-workflow.log \
+  || fail "settlement did not land before the journal save"
+settle_treasury="$(last_marker DVP_BUYER_TREASURY)"
+settle_payment="$(last_marker DVP_SELLER_STABLECOIN)"
+
+echo "BRIDGE_RESUME_AFTER_SETTLE_WITHOUT_SAVE"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --resume --stop-after settled
+assert_journal_step "$journal_dir" settled
+[[ "$(last_marker DVP_BUYER_TREASURY)" == "$settle_treasury" ]] \
+  || fail "resume after unsaved settlement changed the buyer Treasury holding"
+[[ "$(last_marker DVP_SELLER_STABLECOIN)" == "$settle_payment" ]] \
+  || fail "resume after unsaved settlement changed the seller stablecoin holding"
+
+echo "BRIDGE_RESUME_AFTER redeemed"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after redeemed
+assert_journal_step "$journal_dir" redeemed
+grep -q "FAULT_INJECTED delayed_release_after_redemption" /tmp/ctd-workflow.log \
+  || fail "delayed release fault was not recorded"
+grep -q "LOCKED_STATE solana_vault" /tmp/ctd-workflow.log \
+  || fail "delayed release did not record the locked state"
+grep -q "RECOVERY_WAIT_UNBOUNDED operator_or_quorum" /tmp/ctd-workflow.log \
+  || fail "delayed release did not record that operator resume wait is unbounded"
+grep -q CHAIN_CLOCK /tmp/ctd-workflow.log \
+  || fail "delayed release did not record chain time at inject"
+
 echo "BRIDGE_RELEASE_APPROVAL"
 BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_RELEASE_EXPIRY_SECS=15 BRIDGE_JOURNAL_DIR="$journal_dir" \
   run_workflow --journal "$journal_dir" --resume --stop-after release_approved
 assert_journal_step "$journal_dir" release_approved
+grep -q CHAIN_CLOCK /tmp/ctd-workflow.log \
+  || fail "release approval did not read the Solana chain clock"
+release_expiry="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json'))['release_expiry'])")"
+[[ "$release_expiry" -gt 0 ]] || fail "release expiry was not stored"
 
 echo "BRIDGE_RELEASE_APPROVAL_EXPIRED"
-sleep 16
+wait_chain_clock_past "$release_expiry"
 
 echo "BRIDGE_RELEASE_BEFORE_SAVE"
 BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_RELEASE_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
   run_workflow --journal "$journal_dir" --resume --stop-after released --omit-journal-save
 assert_journal_step "$journal_dir" release_approved
+grep -q RELEASE_REFRESHED_AFTER_CHAIN_EXPIRY /tmp/ctd-workflow.log \
+  || fail "expired release approval was not replaced using Solana chain time"
+grep -q "FAULT_INJECTED expiry_after_settlement" /tmp/ctd-workflow.log \
+  || fail "expired release approval fault was not recorded"
 grep -q RELAYER_RELEASE_CONFIRMED /tmp/ctd-workflow.log \
   || fail "confidential release through Relayer did not confirm"
+grep -q "RECOVERY_DURATION_CHAIN_SECS" /tmp/ctd-workflow.log \
+  || fail "delayed release recovery did not record chain duration"
 [[ "$(last_marker RELEASE_APPROVAL_BITMAP)" == "RELEASE_APPROVAL_BITMAP 3" ]] \
   || fail "expired release approval was not replaced with a fresh 2-of-3: $(last_marker RELEASE_APPROVAL_BITMAP)"
 [[ "$(last_marker RECEIPT_STATUS)" == "RECEIPT_STATUS 4" ]] \
@@ -591,6 +750,10 @@ if not payment_admin or not treasury_admin or "::" not in payment_admin[-1] or "
     raise SystemExit(f"connected instrument admins were not extracted: {payment_admin!r} {treasury_admin!r}")
 if log.count("CANTON_VERIFY_OK") < 2:
     raise SystemExit("completed resumes did not verify Canton from ledger history twice")
+binding = re.findall(r"CANTON_VERIFY_BINDING_TRADE (\S+)", log)
+if not binding:
+    raise SystemExit("completed resume did not verify the lock-mint-trade binding")
+print("CONNECTED_BINDING_TRADE " + binding[-1])
 print("CONNECTED_MINT_HOLDING " + verified[-1])
 print("CONNECTED_PAYMENT_ALLOCATION " + allocation[-1])
 print("CONNECTED_PAYMENT_LOCKED " + locked[-1])

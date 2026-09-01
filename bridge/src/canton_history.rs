@@ -184,6 +184,22 @@ pub fn connect_canton_history(
         ));
     }
 
+    let binding = authorized_binding(
+        history,
+        &expected.lock_id,
+        &mint_holding,
+        &minted.update_id,
+        &cash_registry,
+        &buyer,
+    )?;
+    let bound_trade = require_text(
+        binding.arguments.as_ref().ok_or_else(|| {
+            anyhow!("Canton ledger evidence is missing BridgeTradeBinding arguments")
+        })?,
+        "tradeCid",
+        "bound trade",
+    )?;
+
     let allocate = unique_exercised(history, "AllocationFactory_Allocate", |fact| {
         fact.argument
             .as_ref()
@@ -288,6 +304,11 @@ pub fn connect_canton_history(
     if treasury_allocation == payment_allocation {
         return Err(anyhow!(
             "treasury and payment allocations must be distinct contracts"
+        ));
+    }
+    if settle.cid != bound_trade {
+        return Err(anyhow!(
+            "DvpTrade_Settle is not the trade bound to this lock"
         ));
     }
     if !consumed_in(history, &payment_allocation, &settle.update_id)
@@ -482,6 +503,7 @@ pub fn connect_canton_history(
         payment_admin,
         treasury_instrument,
         treasury_admin,
+        trade_cid: bound_trade,
     })
 }
 
@@ -760,6 +782,142 @@ fn allocation_locked_holding(
     Ok(locked)
 }
 
+fn authorized_binding(
+    history: &CantonHistory,
+    lock_id: &str,
+    mint_holding: &str,
+    minted_update: &str,
+    cash_registry: &str,
+    buyer: &str,
+) -> Result<CreatedFact> {
+    unique_exercised(history, "Gateway_Mint", |fact| {
+        fact.update_id == minted_update
+    })
+    .map_err(|err| {
+        if err.to_string().contains("missing") {
+            anyhow!("mint reference was not created by Gateway_Mint")
+        } else {
+            err
+        }
+    })?;
+    let mint_ref = unique_created(history, "BridgeMintRef", |fact| {
+        fact.update_id == minted_update
+            && field_text(fact.arguments.as_ref(), "lockId") == Some(lock_id)
+    })
+    .map_err(|err| {
+        if err.to_string().contains("missing") {
+            anyhow!("mint reference was not created by Gateway_Mint")
+        } else {
+            err
+        }
+    })?;
+    let ref_args = mint_ref
+        .arguments
+        .as_ref()
+        .ok_or_else(|| anyhow!("Canton ledger evidence is missing mint reference arguments"))?;
+    if require_text(ref_args, "lockId", "mint reference lock")? != lock_id {
+        return Err(anyhow!(
+            "Canton ledger evidence belongs to another operation"
+        ));
+    }
+    if require_text(ref_args, "mintHoldingCid", "mint reference holding")? != mint_holding {
+        return Err(anyhow!(
+            "mint reference does not name the same holding as MintedLock"
+        ));
+    }
+    if require_text(ref_args, "cashRegistry", "mint reference registry")? != cash_registry {
+        return Err(anyhow!("mint reference registry does not match MintedLock"));
+    }
+    if require_text(ref_args, "buyer", "mint reference buyer")? != buyer {
+        return Err(anyhow!("mint reference buyer does not match MintedLock"));
+    }
+    let bind = unique_exercised(history, "BridgeMintRef_Bind", |fact| {
+        fact.consuming && fact.cid == mint_ref.cid
+    })
+    .map_err(|err| {
+        if err.to_string().contains("missing") {
+            anyhow!("binding was not created by consuming the mint reference")
+        } else {
+            err
+        }
+    })?;
+    if !consumed_in(history, &mint_ref.cid, &bind.update_id) {
+        return Err(anyhow!(
+            "binding was not created by consuming the mint reference"
+        ));
+    }
+    let bound_at_bind = unique_created(history, "BridgeTradeBinding", |fact| {
+        fact.update_id == bind.update_id
+            && field_text(fact.arguments.as_ref(), "lockId") == Some(lock_id)
+    })
+    .map_err(|err| {
+        if err.to_string().contains("missing") {
+            anyhow!("binding was not created by consuming the mint reference")
+        } else {
+            err
+        }
+    })?;
+    let bound_args = bound_at_bind
+        .arguments
+        .as_ref()
+        .ok_or_else(|| anyhow!("Canton ledger evidence is missing BridgeTradeBinding arguments"))?;
+    if require_text(bound_args, "mintHoldingCid", "bound mint holding")? != mint_holding {
+        return Err(anyhow!(
+            "Canton ledger evidence belongs to another operation"
+        ));
+    }
+    if require_text(bound_args, "lockId", "bound lock")? != lock_id {
+        return Err(anyhow!(
+            "Canton ledger evidence belongs to another operation"
+        ));
+    }
+    binding_for_lock(history, lock_id, mint_holding)
+}
+
+fn binding_for_lock(
+    history: &CantonHistory,
+    lock_id: &str,
+    mint_holding: &str,
+) -> Result<CreatedFact> {
+    let found = history
+        .created
+        .iter()
+        .filter(|fact| {
+            template_ends(fact, "BridgeTradeBinding")
+                && field_text(fact.arguments.as_ref(), "lockId") == Some(lock_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if found.is_empty() {
+        return Err(anyhow!(
+            "Canton ledger evidence is missing BridgeTradeBinding"
+        ));
+    }
+    let mut mint_ids = Vec::new();
+    let mut trade_ids = Vec::new();
+    for fact in &found {
+        if let Some(mint) = field_text(fact.arguments.as_ref(), "mintHoldingCid") {
+            if !mint_ids.iter().any(|value: &String| value == mint) {
+                mint_ids.push(mint.to_string());
+            }
+        }
+        if let Some(trade) = field_text(fact.arguments.as_ref(), "tradeCid") {
+            if !trade_ids.iter().any(|value: &String| value == trade) {
+                trade_ids.push(trade.to_string());
+            }
+        }
+    }
+    if mint_ids.as_slice() != [mint_holding] || trade_ids.len() != 1 {
+        return Err(anyhow!(
+            "Canton ledger evidence belongs to another operation"
+        ));
+    }
+    found
+        .into_iter()
+        .max_by_key(|fact| field_text(fact.arguments.as_ref(), "sellerPaymentCid").is_some())
+        .ok_or_else(|| anyhow!("Canton ledger evidence is missing BridgeTradeBinding"))
+}
+
 fn created_by_cid<'a>(history: &'a CantonHistory, cid: &str) -> Option<&'a CreatedFact> {
     history
         .created
@@ -892,6 +1050,8 @@ mod tests {
         lock: &'static str,
         mint_holding: &'static str,
         minted_lock: &'static str,
+        mint_update: &'static str,
+        mint_ref: &'static str,
         allocate_update: &'static str,
         payment_allocation: &'static str,
         payment_locked: &'static str,
@@ -903,12 +1063,15 @@ mod tests {
         redeem_update: &'static str,
         redeemed_lock: &'static str,
         payout: &'static str,
+        trade: &'static str,
     }
 
     const OP_A: OpIds = OpIds {
         lock: "lock-a",
         mint_holding: "holding-mint-a",
         minted_lock: "minted-a",
+        mint_update: "upd-mint-a",
+        mint_ref: "mint-ref-a",
         allocate_update: "upd-alloc-a",
         payment_allocation: "alloc-pay-a",
         payment_locked: "locked-pay-a",
@@ -920,12 +1083,15 @@ mod tests {
         redeem_update: "upd-redeem-a",
         redeemed_lock: "redeem-a",
         payout: "dest-a",
+        trade: "trade-a",
     };
 
     const OP_B: OpIds = OpIds {
         lock: "lock-b",
         mint_holding: "holding-mint-b",
         minted_lock: "minted-b",
+        mint_update: "upd-mint-b",
+        mint_ref: "mint-ref-b",
         allocate_update: "upd-alloc-b",
         payment_allocation: "alloc-pay-b",
         payment_locked: "locked-pay-b",
@@ -937,6 +1103,7 @@ mod tests {
         redeem_update: "upd-redeem-b",
         redeemed_lock: "redeem-b",
         payout: "dest-b",
+        trade: "trade-b",
     };
 
     fn created(template: &str, cid: &str, update: &str, arguments: LedgerValue) -> CreatedFact {
@@ -987,7 +1154,7 @@ mod tests {
                 created(
                     "Bridge.Gateway:MintedLock",
                     op.minted_lock,
-                    "upd-mint",
+                    op.mint_update,
                     rec(&[
                         ("cashRegistry", party(cash)),
                         ("lockId", text(op.lock)),
@@ -999,8 +1166,37 @@ mod tests {
                 created(
                     "Stablecoin.Holding:StablecoinHolding",
                     op.mint_holding,
-                    "upd-mint",
+                    op.mint_update,
                     holding_args(buyer, cash, "USD-C", payment),
+                ),
+                created(
+                    "Bridge.Binding:BridgeMintRef",
+                    op.mint_ref,
+                    op.mint_update,
+                    rec(&[
+                        ("cashRegistry", party(cash)),
+                        ("buyer", party(buyer)),
+                        ("lockId", text(op.lock)),
+                        ("mintHoldingCid", cid(op.mint_holding)),
+                    ]),
+                ),
+                created(
+                    "Bridge.Binding:BridgeTradeBinding",
+                    if op.lock == "lock-a" {
+                        "binding-a"
+                    } else {
+                        "binding-b"
+                    },
+                    "upd-bind",
+                    rec(&[
+                        ("cashRegistry", party(cash)),
+                        ("buyer", party(buyer)),
+                        ("seller", party(seller)),
+                        ("venue", party("venue::party")),
+                        ("lockId", text(op.lock)),
+                        ("mintHoldingCid", cid(op.mint_holding)),
+                        ("tradeCid", text(op.trade)),
+                    ]),
                 ),
                 created(
                     "Stablecoin.Allocation:StablecoinAllocation",
@@ -1054,6 +1250,26 @@ mod tests {
             ],
             exercised: vec![
                 exercised(
+                    "Gateway_Mint",
+                    "gateway",
+                    op.mint_update,
+                    true,
+                    rec(&[]),
+                    rec(&[]),
+                ),
+                exercised(
+                    "BridgeMintRef_Bind",
+                    op.mint_ref,
+                    "upd-bind",
+                    true,
+                    rec(&[
+                        ("seller", party(seller)),
+                        ("venue", party("venue::party")),
+                        ("tradeCid", text(op.trade)),
+                    ]),
+                    rec(&[]),
+                ),
+                exercised(
                     "AllocationFactory_Allocate",
                     "cash-rules",
                     op.allocate_update,
@@ -1087,7 +1303,7 @@ mod tests {
                 ),
                 exercised(
                     "DvpTrade_Settle",
-                    "trade",
+                    op.trade,
                     op.settle_update,
                     true,
                     rec(&[(
@@ -1143,6 +1359,7 @@ mod tests {
                 ),
             ],
             archived: vec![
+                archived("Bridge.Binding:BridgeMintRef", op.mint_ref, "upd-bind"),
                 archived(
                     "Stablecoin.Holding:StablecoinHolding",
                     op.mint_holding,
@@ -1219,6 +1436,7 @@ mod tests {
         assert_eq!(evidence.payment_admin, "cashRegistry::party");
         assert_eq!(evidence.treasury_instrument, "UST-2028-11");
         assert_eq!(evidence.treasury_admin, "treasuryRegistry::party");
+        assert_eq!(evidence.trade_cid, "trade-a");
         assert_ne!(evidence.allocate_update, evidence.settle_update);
     }
 
@@ -1231,7 +1449,10 @@ mod tests {
         assert_eq!(b.settle_update, "upd-settle-b");
         assert_eq!(a.buyer_treasury, "treasury-a");
         assert_eq!(b.buyer_treasury, "treasury-b");
+        assert_eq!(a.trade_cid, "trade-a");
+        assert_eq!(b.trade_cid, "trade-b");
         assert_ne!(a.payment_allocation, b.payment_allocation);
+        assert_ne!(a.trade_cid, b.trade_cid);
     }
 
     #[test]
@@ -1264,6 +1485,281 @@ mod tests {
             err.to_string().contains("missing"),
             "missing admin must fail: {err}"
         );
+    }
+
+    fn with_unrelated_holdings() -> CantonHistory {
+        let mut history = operation_history(&OP_A);
+        history.created.push(created(
+            "Treasury.Holding:TreasuryHolding",
+            "unrelated-treasury",
+            "upd-unrelated",
+            holding_args(
+                "buyer::party",
+                "treasuryRegistry::party",
+                "UST-2028-11",
+                "50.000000",
+            ),
+        ));
+        history.created.push(created(
+            "Stablecoin.Holding:StablecoinHolding",
+            "unrelated-payment",
+            "upd-unrelated",
+            holding_args(
+                "seller::party",
+                "cashRegistry::party",
+                "USD-C",
+                "25000.000000",
+            ),
+        ));
+        history
+    }
+
+    fn without_choice(history: &CantonHistory, choice: &str) -> CantonHistory {
+        CantonHistory {
+            created: history.created.clone(),
+            exercised: history
+                .exercised
+                .iter()
+                .filter(|fact| fact.choice != choice)
+                .cloned()
+                .collect(),
+            archived: history.archived.clone(),
+        }
+    }
+
+    fn settle_a_redeem_b() -> CantonHistory {
+        let mut history = operation_history(&OP_A);
+        history
+            .created
+            .retain(|fact| fact.cid != OP_A.request && fact.cid != OP_A.redeemed_lock);
+        history
+            .exercised
+            .retain(|fact| fact.choice != "Gateway_Redeem" && fact.choice != "Burn");
+        history
+            .archived
+            .retain(|fact| fact.update_id != OP_A.redeem_update);
+        let b = operation_history(&OP_B);
+        history.created.extend(
+            b.created
+                .iter()
+                .filter(|fact| {
+                    fact.cid == OP_B.request
+                        || fact.cid == OP_B.redeemed_lock
+                        || fact.cid == OP_B.minted_lock
+                        || fact.cid == OP_B.mint_holding
+                })
+                .cloned(),
+        );
+        history.exercised.extend(
+            b.exercised
+                .iter()
+                .filter(|fact| fact.choice == "Gateway_Redeem" || fact.choice == "Burn")
+                .cloned(),
+        );
+        history.archived.extend(
+            b.archived
+                .iter()
+                .filter(|fact| fact.update_id == OP_B.redeem_update)
+                .cloned(),
+        );
+        history
+    }
+
+    #[test]
+    fn unrelated_buyer_treasury_holdings_do_not_break_connection() {
+        let evidence = connect_canton_history(&with_unrelated_holdings(), &expected_a()).unwrap();
+        assert_eq!(evidence.buyer_treasury, "treasury-a");
+        assert_ne!(evidence.buyer_treasury, "unrelated-treasury");
+    }
+
+    #[test]
+    fn unrelated_seller_stablecoin_holdings_do_not_break_connection() {
+        let evidence = connect_canton_history(&with_unrelated_holdings(), &expected_a()).unwrap();
+        assert_eq!(evidence.seller_payment, "payment-a");
+        assert_ne!(evidence.seller_payment, "unrelated-payment");
+    }
+
+    #[test]
+    fn settlement_from_one_operation_cannot_complete_another_redemption() {
+        let err = connect_canton_history(&settle_a_redeem_b(), &expected_b()).unwrap_err();
+        assert!(
+            err.to_string().contains("missing")
+                || err.to_string().contains("another operation")
+                || err.to_string().contains("not connected")
+                || err.to_string().contains("not created by Gateway_Mint"),
+            "A's settlement plus B's redemption must fail: {err}"
+        );
+        let err = connect_canton_history(&settle_a_redeem_b(), &expected_a()).unwrap_err();
+        assert!(
+            err.to_string().contains("missing")
+                || err.to_string().contains("not connected")
+                || err.to_string().contains("another operation")
+                || err.to_string().contains("not created by Gateway_Mint"),
+            "A's settlement plus B's redemption must not complete A: {err}"
+        );
+    }
+
+    #[test]
+    fn mint_ref_not_created_by_gateway_mint_fails() {
+        let mut history = operation_history(&OP_A);
+        if let Some(mint_ref) = history
+            .created
+            .iter_mut()
+            .find(|fact| template_ends(fact, "BridgeMintRef"))
+        {
+            mint_ref.update_id = "upd-forged".to_string();
+        }
+        let err = connect_canton_history(&history, &expected_a()).unwrap_err();
+        assert!(
+            err.to_string().contains("not created by Gateway_Mint"),
+            "forged mint reference must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_mint_ref_fails_closed() {
+        let mut history = operation_history(&OP_A);
+        history
+            .created
+            .retain(|fact| !template_ends(fact, "BridgeMintRef"));
+        let err = connect_canton_history(&history, &expected_a()).unwrap_err();
+        assert!(
+            err.to_string().contains("not created by Gateway_Mint")
+                || err.to_string().contains("missing"),
+            "missing mint reference must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn bind_must_consume_the_gateway_mint_ref() {
+        let mut history = operation_history(&OP_A);
+        history
+            .exercised
+            .retain(|fact| fact.choice != "BridgeMintRef_Bind");
+        let err = connect_canton_history(&history, &expected_a()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not created by consuming the mint reference")
+                || err.to_string().contains("missing"),
+            "binding without consuming the mint reference must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_binding_fails_closed() {
+        let mut history = operation_history(&OP_A);
+        history
+            .created
+            .retain(|fact| !template_ends(fact, "BridgeTradeBinding"));
+        let err = connect_canton_history(&history, &expected_a()).unwrap_err();
+        assert!(
+            (err.to_string().contains("missing") && err.to_string().contains("BridgeTradeBinding"))
+                || err
+                    .to_string()
+                    .contains("not created by consuming the mint reference"),
+            "missing binding must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn binding_to_the_other_operations_trade_fails() {
+        let mut history = operation_history(&OP_A);
+        if let Some(binding) = history
+            .created
+            .iter_mut()
+            .find(|fact| template_ends(fact, "BridgeTradeBinding"))
+        {
+            binding.arguments = Some(rec(&[
+                ("lockId", text("lock-a")),
+                ("mintHoldingCid", cid("holding-mint-a")),
+                ("tradeCid", text("trade-b")),
+            ]));
+        }
+        let err = connect_canton_history(&history, &expected_a()).unwrap_err();
+        assert!(
+            err.to_string().contains("not the trade bound")
+                || err.to_string().contains("another operation")
+                || err.to_string().contains("not connected"),
+            "A's mint bound to B's trade must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn mixed_ab_history_rejects_crossed_events() {
+        let err = connect_canton_history(&mixed_a_settle_on_b(), &expected_b()).unwrap_err();
+        assert!(
+            err.to_string().contains("not connected")
+                || err.to_string().contains("another operation")
+                || err.to_string().contains("not the trade bound"),
+            "mixed A/B events must fail: {err}"
+        );
+        let err = connect_canton_history(&settle_a_redeem_b(), &expected_a()).unwrap_err();
+        assert!(
+            err.to_string().contains("missing")
+                || err.to_string().contains("not connected")
+                || err.to_string().contains("another operation")
+                || err.to_string().contains("not created by Gateway_Mint"),
+            "mixed A settle / B redeem must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_allocation_fails_closed() {
+        let err = connect_canton_history(
+            &without_choice(&operation_history(&OP_A), "AllocationFactory_Allocate"),
+            &expected_a(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("missing"),
+            "missing allocation must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_settlement_fails_closed() {
+        let err = connect_canton_history(
+            &without_choice(&operation_history(&OP_A), "DvpTrade_Settle"),
+            &expected_a(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("missing") || err.to_string().contains("not connected"),
+            "missing settlement must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_burn_fails_closed() {
+        let err = connect_canton_history(
+            &without_choice(&operation_history(&OP_A), "Burn"),
+            &expected_a(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("missing") || err.to_string().contains("not connected"),
+            "missing burn must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn unreadable_history_fails_closed() {
+        let err = parse_canton_history_facts("CANTON_FACT {not-json").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be read"),
+            "unreadable history must fail: {err}"
+        );
+        assert!(parse_canton_history_facts("CANTON_FACT {\"kind\":\"other\"}").is_err());
+    }
+
+    #[test]
+    fn repeated_verification_of_the_same_completed_operation() {
+        let history = operation_history(&OP_A);
+        let first = connect_canton_history(&history, &expected_a()).unwrap();
+        let second = connect_canton_history(&history, &expected_a()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.settle_update, "upd-settle-a");
+        assert_eq!(second.redeemed_lock, "redeem-a");
     }
 
     #[test]

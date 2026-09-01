@@ -34,6 +34,8 @@ enum Command {
         omit_journal_save: bool,
         #[arg(long)]
         halt_after_first_approval: bool,
+        #[arg(long)]
+        inject_attester_disagreement: bool,
     },
     RelayerProof,
 }
@@ -51,6 +53,7 @@ fn main() -> Result<()> {
                     reuse_from,
                     omit_journal_save,
                     halt_after_first_approval,
+                    inject_attester_disagreement,
                 },
         } => run_workflow(
             true,
@@ -61,10 +64,11 @@ fn main() -> Result<()> {
             reuse_from,
             omit_journal_save,
             halt_after_first_approval,
+            inject_attester_disagreement,
         ),
         Args {
             command: Command::RelayerProof,
-        } => run_workflow(false, false, None, None, false, None, false, false),
+        } => run_workflow(false, false, None, None, false, None, false, false, false),
     }
 }
 
@@ -78,6 +82,7 @@ fn run_workflow(
     reuse_from: Option<PathBuf>,
     omit_journal_save: bool,
     halt_after_first_approval: bool,
+    inject_attester_disagreement: bool,
 ) -> Result<()> {
     let rpc =
         RpcClient::new_with_commitment(required("SOLANA_RPC_URL"), CommitmentConfig::confirmed());
@@ -128,6 +133,7 @@ fn run_workflow(
         reuse_from,
         omit_journal_save,
         halt_after_first_approval,
+        inject_attester_disagreement,
     };
     let tokens = required("BRIDGE_AMOUNT").parse()?;
     if full {

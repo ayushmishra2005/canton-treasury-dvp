@@ -2,7 +2,7 @@ module Tests.Bridge.Runtime where
 
 import DA.Assert ((===))
 import DA.List (sortOn)
-import DA.Optional (isNone)
+import DA.Optional (fromOptional, isNone)
 import DA.Text qualified as Text
 import DA.TextMap qualified as TextMap
 import DA.Time (addRelTime, hours)
@@ -15,6 +15,7 @@ import Splice.Api.Token.HoldingV1
 import Splice.Api.Token.MetadataV1
 
 import Bridge.Attestation
+import Bridge.Binding
 import Bridge.Gateway
 import Bridge.Types
 import Dvp.Proposal
@@ -25,11 +26,13 @@ import Stablecoin.Holding
 import Stablecoin.Instrument
 import Stablecoin.Rules qualified as Stablecoin
 import Stablecoin.Rules (StablecoinRules(..))
+import Treasury.Allocation (TreasuryAllocation(..))
 import Treasury.Eligibility qualified as Treasury
 import Treasury.Eligibility (TreasuryEligibility(..))
 import Treasury.Holding (TreasuryHolding)
 import Treasury.Rules qualified as Treasury
 import Treasury.Rules (TreasuryRules(..))
+import Stablecoin.Allocation (StablecoinAllocation(..))
 
 data RuntimeInput = RuntimeInput with
     lockId : Text
@@ -161,6 +164,273 @@ mintedFor live lockId = do
     [one] -> pure one
     _ -> abort ("Expected one minted lock " <> lockId)
 
+matchingTreasuryAllocations : Live -> DvpTrade -> Script [(ContractId TreasuryAllocation, TreasuryAllocation)]
+matchingTreasuryAllocations live trade = do
+  found <- query @TreasuryAllocation live.seller
+  let ref = (settlementInfo trade).settlementRef
+  pure
+    [ (cid, alloc)
+    | (cid, alloc) <- found
+    , alloc.allocation.settlement.settlementRef == ref
+    , alloc.allocation.transferLegId == treasuryLegId
+    ]
+
+matchingPaymentAllocations : Live -> DvpTrade -> Script [(ContractId StablecoinAllocation, StablecoinAllocation)]
+matchingPaymentAllocations live trade = do
+  found <- query @StablecoinAllocation live.buyer
+  let ref = (settlementInfo trade).settlementRef
+  pure
+    [ (cid, alloc)
+    | (cid, alloc) <- found
+    , alloc.allocation.settlement.settlementRef == ref
+    , alloc.allocation.transferLegId == paymentLegId
+    ]
+
+matchingSellerPayments : Live -> Decimal -> Script [(ContractId StablecoinHolding, StablecoinHolding)]
+matchingSellerPayments live amount = do
+  found <- query @StablecoinHolding live.seller
+  pure
+    [ (cid, holding)
+    | (cid, holding) <- found
+    , holding.owner == live.seller
+    , holding.amount == amount
+    , isNone holding.lock
+    , holding.instrumentId == live.instrumentId
+    ]
+
+matchingBuyerTreasuries : Live -> Script [(ContractId TreasuryHolding, TreasuryHolding)]
+matchingBuyerTreasuries live = do
+  found <- query @TreasuryHolding live.buyer
+  let treasuryInstrumentId = InstrumentId with admin = live.treasuryRegistry, id = "UST-2028-11"
+  pure
+    [ (cid, holding)
+    | (cid, holding) <- found
+    , holding.owner == live.buyer
+    , holding.amount == 100.0
+    , isNone holding.lock
+    , holding.instrumentId == treasuryInstrumentId
+    ]
+
+unlockedSellerTreasuries : Live -> Script [(ContractId TreasuryHolding, TreasuryHolding)]
+unlockedSellerTreasuries live = do
+  found <- query @TreasuryHolding live.seller
+  pure
+    [ (cid, holding)
+    | (cid, holding) <- found
+    , holding.owner == live.seller
+    , holding.amount == 100.0
+    , isNone holding.lock
+    ]
+
+unlockedSellerTreasury : Live -> Script (ContractId TreasuryHolding, TreasuryHolding)
+unlockedSellerTreasury live = do
+  found <- unlockedSellerTreasuries live
+  case found of
+    one :: _ -> pure one
+    [] -> abort "RECOVERY_REQUIRED_ACTION seller must provide an unlocked Treasury holding"
+
+data BroadLookup
+  = BroadNone
+  | BroadOne with tradeCid : ContractId DvpTrade
+  | BroadMany with count : Int
+  deriving (Eq, Show)
+
+tradesMatchingPartiesAndAmount : Live -> Decimal -> Script [(ContractId DvpTrade, DvpTrade)]
+tradesMatchingPartiesAndAmount live amount = do
+  trades <- query @DvpTrade live.venue
+  pure
+    [ (cid, trade)
+    | (cid, trade) <- trades
+    , trade.buyer == live.buyer
+    , trade.seller == live.seller
+    , trade.paymentLeg.amount == amount
+    ]
+
+broadTradeLookup : Live -> Decimal -> Script BroadLookup
+broadTradeLookup live amount = do
+  found <- tradesMatchingPartiesAndAmount live amount
+  case found of
+    [] -> pure BroadNone
+    [(cid, _)] -> pure (BroadOne with tradeCid = cid)
+    many -> pure (BroadMany with count = length many)
+
+bindingsForLock : Live -> Text -> Script [(ContractId BridgeTradeBinding, BridgeTradeBinding)]
+bindingsForLock live lockId = do
+  found <- query @BridgeTradeBinding live.buyer
+  pure [(cid, binding) | (cid, binding) <- found, binding.lockId == lockId]
+
+mintRefsForLock : Live -> Text -> Script [(ContractId BridgeMintRef, BridgeMintRef)]
+mintRefsForLock live lockId = do
+  found <- query @BridgeMintRef live.buyer
+  pure [(cid, ref) | (cid, ref) <- found, ref.lockId == lockId]
+
+requireGatewayMintRef : Live -> Text -> ContractId StablecoinHolding -> Script (ContractId BridgeMintRef, BridgeMintRef)
+requireGatewayMintRef live lockId holdingCid = do
+  (_mintedCid, minted) <- mintedFor live lockId
+  minted.holdingCid === holdingCid
+  minted.cashRegistry === live.cashRegistry
+  minted.beneficiary === live.buyer
+  refs <- mintRefsForLock live lockId
+  case refs of
+    [(cid, ref)] -> do
+      ref.cashRegistry === live.cashRegistry
+      ref.buyer === live.buyer
+      ref.lockId === lockId
+      ref.mintHoldingCid === holdingCid
+      ref.mintHoldingCid === minted.holdingCid
+      pure (cid, ref)
+    [] -> abort ("gateway mint did not create a mint reference for lock " <> lockId)
+    _ -> abort ("multiple mint refs for lock " <> lockId)
+
+ensureMintRef : Live -> Text -> ContractId StablecoinHolding -> Script ()
+ensureMintRef live lockId holdingCid = do
+  bindings <- bindingsForLock live lockId
+  case bindings of
+    [(_, binding)] -> do
+      binding.cashRegistry === live.cashRegistry
+      binding.buyer === live.buyer
+      binding.mintHoldingCid === holdingCid
+    _ :: _ -> abort ("multiple trade bindings for lock " <> lockId)
+    [] -> do
+      _ <- requireGatewayMintRef live lockId holdingCid
+      pure ()
+
+bindLockToTrade : Live -> Text -> ContractId StablecoinHolding -> ContractId DvpTrade -> Script (ContractId BridgeTradeBinding)
+bindLockToTrade live lockId holdingCid tradeCid = do
+  existing <- bindingsForLock live lockId
+  case existing of
+    [(cid, binding)] -> do
+      binding.cashRegistry === live.cashRegistry
+      binding.mintHoldingCid === holdingCid
+      binding.tradeCid === show tradeCid
+      binding.buyer === live.buyer
+      binding.seller === live.seller
+      binding.venue === live.venue
+      pure cid
+    [] -> do
+      allBindings <- query @BridgeTradeBinding live.buyer
+      let taken =
+            [ cid
+            | (cid, binding) <- allBindings
+            , binding.tradeCid == show tradeCid || binding.mintHoldingCid == holdingCid
+            ]
+      case taken of
+        [] -> pure ()
+        _ -> abort "mint holding or trade is already bound to another lock"
+      (refCid, ref) <- requireGatewayMintRef live lockId holdingCid
+      bindingCid <- submit live.buyer $ exerciseCmd refCid BridgeMintRef_Bind with
+        seller = live.seller
+        venue = live.venue
+        tradeCid = show tradeCid
+      Some binding <- queryContractId live.buyer bindingCid
+      binding.cashRegistry === ref.cashRegistry
+      binding.mintHoldingCid === ref.mintHoldingCid
+      binding.lockId === ref.lockId
+      debug ("CANTON_BINDING_LOCK " <> lockId)
+      debug ("CANTON_BINDING_MINT " <> show holdingCid)
+      debug ("CANTON_BINDING_TRADE " <> show tradeCid)
+      pure bindingCid
+    _ -> abort ("multiple trade bindings for lock " <> lockId)
+
+recordBindingOutputs : Live -> Text -> ContractId TreasuryHolding -> ContractId StablecoinHolding -> Script ()
+recordBindingOutputs live lockId treasuryCid paymentCid = do
+  found <- bindingsForLock live lockId
+  case found of
+    [(bindingCid, binding)] -> do
+      afterTreasury <- case binding.buyerTreasuryCid of
+        Some recordedTreasury -> do
+          recordedTreasury === show treasuryCid
+          pure bindingCid
+        None ->
+          submit live.buyer $ exerciseCmd bindingCid BridgeTradeBinding_RecordTreasury with
+            recordedTreasuryCid = show treasuryCid
+      Some afterBinding <- queryContractId live.buyer afterTreasury
+      case afterBinding.sellerPaymentCid of
+        Some recordedPayment -> recordedPayment === show paymentCid
+        None -> do
+          _ <- submit live.seller $ exerciseCmd afterTreasury BridgeTradeBinding_RecordPayment with
+            recordedPaymentCid = show paymentCid
+          pure ()
+    [] -> abort ("missing trade binding for lock " <> lockId)
+    _ -> abort ("multiple trade bindings for lock " <> lockId)
+
+boundTrade : Live -> Text -> ContractId StablecoinHolding -> Script (Optional (ContractId DvpTrade, DvpTrade))
+boundTrade live lockId holdingCid = do
+  found <- bindingsForLock live lockId
+  case found of
+    [(cid, binding)] -> do
+      binding.mintHoldingCid === holdingCid
+      let _ = cid
+      trades <- query @DvpTrade live.venue
+      case [(tradeCid, trade) | (tradeCid, trade) <- trades, show tradeCid == binding.tradeCid] of
+        [one] -> pure (Some one)
+        [] -> pure None
+        _ -> abort ("multiple ledger trades share bound CID " <> binding.tradeCid)
+    [] -> pure None
+    _ -> abort ("multiple trade bindings for lock " <> lockId)
+
+matchingMintAttestations : Live -> Text -> Decimal -> Text -> Script [(ContractId BridgeAttestation, BridgeAttestation)]
+matchingMintAttestations live lockId amount digestHex = do
+  found <- query @BridgeAttestation live.cashRegistry
+  pure
+    [ (cid, attestation)
+    | (cid, attestation) <- found
+    , attestation.lockId == lockId
+    , attestation.direction == MintAttestation
+    , attestation.amount == amount
+    , attestation.digestHex == digestHex
+    , attestation.beneficiary == live.buyer
+    ]
+
+matchingRedeemAttestations : Live -> Text -> Decimal -> Text -> Text -> Script [(ContractId BridgeAttestation, BridgeAttestation)]
+matchingRedeemAttestations live lockId amount digestHex payoutDestination = do
+  found <- query @BridgeAttestation live.cashRegistry
+  pure
+    [ (cid, attestation)
+    | (cid, attestation) <- found
+    , attestation.lockId == lockId
+    , attestation.direction == RedeemAttestation
+    , attestation.amount == amount
+    , attestation.digestHex == digestHex
+    , attestation.beneficiary == live.seller
+    , attestation.payoutDestination == payoutDestination
+    ]
+
+createMintAttestation : Live -> Party -> RuntimeInput -> Decimal -> Script (ContractId BridgeAttestation)
+createMintAttestation live attester input amount =
+  submit attester $ createCmd BridgeAttestation with
+    attester
+    cashRegistry = live.cashRegistry
+    lockId = input.lockId
+    amount
+    beneficiary = live.buyer
+    digestHex = input.digestHex
+    direction = MintAttestation
+    instrumentId = live.instrumentId
+    payoutDestination = ""
+
+createRedeemAttestation : Live -> Party -> RuntimeInput -> Decimal -> Script (ContractId BridgeAttestation)
+createRedeemAttestation live attester input amount =
+  submit attester $ createCmd BridgeAttestation with
+    attester
+    cashRegistry = live.cashRegistry
+    lockId = input.lockId
+    amount
+    beneficiary = live.seller
+    digestHex = input.digestHex
+    direction = RedeemAttestation
+    instrumentId = live.instrumentId
+    payoutDestination = input.payoutDestination
+
+otherMintAttester : Live -> Party -> Party
+otherMintAttester live attester =
+  if attester == live.attesterA then live.attesterB else live.attesterA
+
+matchingRedemptionRequests : Live -> Text -> Script [(ContractId RedemptionRequest, RedemptionRequest)]
+matchingRedemptionRequests live lockId = do
+  found <- query @RedemptionRequest live.seller
+  pure [(cid, request) | (cid, request) <- found, request.lockId == lockId]
+
 prepare : RuntimeInput -> Script ()
 prepare _input = do
   cashRegistry <- lookupOn "cashRegistry" "p-cash"
@@ -191,6 +461,26 @@ prepare _input = do
       pure ()
     _ -> abort "expected at most one bridge gateway"
 
+reuseOrCreateMintAttestations : Live -> RuntimeInput -> Decimal -> Script (ContractId BridgeAttestation, ContractId BridgeAttestation)
+reuseOrCreateMintAttestations live input amount = do
+  existing <- matchingMintAttestations live input.lockId amount input.digestHex
+  case existing of
+    [(firstCid, first), (secondCid, second)] ->
+      if first.attester == second.attester
+      then abort "duplicate mint attester for this lock"
+      else do
+        debug ("CANTON_REUSED_MINT_ATTESTATIONS " <> show firstCid <> " " <> show secondCid)
+        pure (firstCid, secondCid)
+    [(firstCid, first)] -> do
+      secondCid <- createMintAttestation live (otherMintAttester live first.attester) input amount
+      debug ("CANTON_REUSED_ONE_MINT_ATTESTATION " <> show firstCid)
+      pure (firstCid, secondCid)
+    [] -> do
+      firstCid <- createMintAttestation live live.attesterA input amount
+      secondCid <- createMintAttestation live live.attesterB input amount
+      pure (firstCid, secondCid)
+    _ -> abort "duplicate mint attestations for this lock"
+
 mint : RuntimeInput -> Script Text
 mint input = do
   amount <- parseExactDecimal input.amount
@@ -198,29 +488,11 @@ mint input = do
   existing <- query @MintedLock live.cashRegistry
   case [minted.holdingCid | (_, minted) <- existing, minted.lockId == input.lockId] of
     [existingHolding] -> do
+      ensureMintRef live input.lockId existingHolding
       debug ("CANTON_MINT_HOLDING " <> show existingHolding)
       pure ("CANTON_MINT_HOLDING " <> show existingHolding)
     _ -> do
-      firstCid <- submit live.attesterA $ createCmd BridgeAttestation with
-        attester = live.attesterA
-        cashRegistry = live.cashRegistry
-        lockId = input.lockId
-        amount = amount
-        beneficiary = live.buyer
-        digestHex = input.digestHex
-        direction = MintAttestation
-        instrumentId = live.instrumentId
-        payoutDestination = ""
-      secondCid <- submit live.attesterB $ createCmd BridgeAttestation with
-        attester = live.attesterB
-        cashRegistry = live.cashRegistry
-        lockId = input.lockId
-        amount = amount
-        beneficiary = live.buyer
-        digestHex = input.digestHex
-        direction = MintAttestation
-        instrumentId = live.instrumentId
-        payoutDestination = ""
+      (firstCid, secondCid) <- reuseOrCreateMintAttestations live input amount
       (_gatewayCid, holdingCid) <- submit live.cashRegistry $ exerciseCmd live.gatewayCid Gateway_Mint with
         firstCid
         secondCid
@@ -229,6 +501,7 @@ mint input = do
       holding.amount === amount
       holding.instrumentId === live.instrumentId
       isNone holding.lock === True
+      ensureMintRef live input.lockId holdingCid
       debug ("CANTON_MINT_HOLDING " <> show holdingCid)
       pure ("CANTON_MINT_HOLDING " <> show holdingCid)
 
@@ -238,19 +511,32 @@ prepareTrade input = do
   live <- lookupLive input
   now <- getTime
   let treasuryInstrumentId = InstrumentId with admin = live.treasuryRegistry, id = "UST-2028-11"
-  trades <- query @DvpTrade live.venue
-  case trades of
-    [(tradeCid, _)] -> do
+  (_mintedCid, minted) <- mintedFor live input.lockId
+  minted.amount === amount
+  bound <- boundTrade live input.lockId minted.holdingCid
+  case bound of
+    Some (tradeCid, _) -> do
       debug ("CANTON_TRADE " <> show tradeCid)
+      debug ("CANTON_BINDING_LOCK " <> input.lockId)
+      debug ("CANTON_BINDING_TRADE " <> show tradeCid)
       pure ("CANTON_TRADE " <> show tradeCid)
-    _ -> do
+    None -> do
+      stillMinted <- queryContractId live.buyer minted.holdingCid
+      case stillMinted of
+        None -> do
+          debug "CANTON_TRADE already-settled"
+          pure "CANTON_TRADE already-settled"
+        Some _ -> createPreparedTrade live input amount now treasuryInstrumentId
+
+createPreparedTrade : Live -> RuntimeInput -> Decimal -> Time -> InstrumentId -> Script Text
+createPreparedTrade live input amount now treasuryInstrumentId = do
       (mintedCid, minted) <- mintedFor live input.lockId
       minted.amount === amount
       minted.beneficiary === live.buyer
       Some paymentHolding <- queryContractId live.buyer minted.holdingCid
       paymentHolding.amount === amount
       paymentHolding.owner === live.buyer
-      (_treasuryHoldingCid, treasuryHolding) <- only "treasury holding" =<< query @TreasuryHolding live.seller
+      (_treasuryHoldingCid, treasuryHolding) <- unlockedSellerTreasury live
       treasuryHolding.owner === live.seller
       treasuryHolding.amount === 100.0
       treasuryRules <- query @TreasuryRules live.treasuryRegistry
@@ -331,169 +617,352 @@ prepareTrade input = do
       accepted <- submit live.seller $ exerciseCmd proposalCid DvpProposal_Accept with approver = live.seller
       accepted2 <- submit live.buyer $ exerciseCmd accepted DvpProposal_Accept with approver = live.buyer
       tradeCid <- submit live.venue $ exerciseCmd accepted2 DvpProposal_InitiateSettlement
+      _ <- bindLockToTrade live input.lockId minted.holdingCid tradeCid
       let _ = mintedCid
       debug ("CANTON_TRADE " <> show tradeCid)
       pure ("CANTON_TRADE " <> show tradeCid)
 
+alreadySettledText : Live -> Decimal -> Text -> Script Text
+alreadySettledText live amount lockId = do
+  (_mintedCid, minted) <- mintedFor live lockId
+  minted.amount === amount
+  bindings <- bindingsForLock live lockId
+  redeemed <- query @RedeemedLock live.cashRegistry
+  let redeemedHere = [lock | (_, lock) <- redeemed, lock.lockId == lockId]
+  case (bindings, redeemedHere) of
+    ([(_, binding)], locks) -> do
+      binding.mintHoldingCid === minted.holdingCid
+      let treasuryCid = fromOptional "settled" binding.buyerTreasuryCid
+          paymentCid = case (binding.sellerPaymentCid, locks) of
+            (Some cid, _) -> cid
+            (None, _ :: _) -> "redeemed"
+            (None, []) -> "settled"
+      case locks of
+        lock :: _ -> do
+          lock.amount === amount
+          lock.holder === live.seller
+        [] -> pure ()
+      let settled =
+            "CANTON_SETTLE_BUYER_TREASURY " <> treasuryCid
+              <> "\nCANTON_SETTLE_SELLER_STABLECOIN " <> paymentCid
+              <> "\nCANTON_SETTLE_PAYMENT_AMOUNT " <> show amount
+              <> "\nCANTON_SETTLE_TREASURY_AMOUNT 100.0"
+              <> "\nCANTON_CONSUMED_PAYMENT " <> show minted.holdingCid
+      debug settled
+      debug "CANTON_REUSED_SETTLEMENT"
+      debug ("CANTON_BINDING_LOCK " <> lockId)
+      debug ("CANTON_BINDING_TRADE " <> binding.tradeCid)
+      pure settled
+    _ -> abort "Canton settlement outputs are missing the trade binding for this lock"
+
+allocateTreasuryLeg : Live -> Time -> ContractId DvpTrade -> ContractId TreasuryRules -> Script (ContractId Allocation)
+allocateTreasuryLeg live now tradeCid treasuryRulesCid = do
+  holdings <- unlockedSellerTreasuries live
+  case holdings of
+    [] -> abort "RECOVERY_REQUIRED_ACTION seller must provide an unlocked Treasury holding"
+    _ -> allocateTreasuryFromHoldings live now tradeCid treasuryRulesCid holdings
+
+allocateTreasuryFromHoldings : Live -> Time -> ContractId DvpTrade -> ContractId TreasuryRules -> [(ContractId TreasuryHolding, TreasuryHolding)] -> Script (ContractId Allocation)
+allocateTreasuryFromHoldings live now tradeCid treasuryRulesCid holdings = case holdings of
+  [] -> abort "RECOVERY_REQUIRED_ACTION seller must provide an unlocked Treasury holding on the settlement synchronizer"
+  (deliveryHoldingCid, _) :: rest -> do
+    treasuryEligibilities <- query @TreasuryEligibility live.treasuryRegistry
+    (sellerTreasuryEligibilityCid, _) <- only "seller treasury eligibility"
+      [entry | entry@(_, eligibility) <- treasuryEligibilities, eligibility.investor == live.seller]
+    (buyerTreasuryEligibilityCid, _) <- only "buyer treasury eligibility"
+      [entry | entry@(_, eligibility) <- treasuryEligibilities, eligibility.investor == live.buyer]
+    Some sellerRequestView <- queryInterfaceContractId @AllocationRequest live.seller
+      (toInterfaceContractId @AllocationRequest tradeCid)
+    treasurySpec <- legSpec sellerRequestView treasuryLegId
+    treasuryRulesDisclosure <- disclosureOf live.treasuryRegistry treasuryRulesCid
+    buyerTreasuryEligibilityDisclosure <- disclosureOf live.treasuryRegistry buyerTreasuryEligibilityCid
+    treasuryResult <- trySubmit
+      (actAs live.seller
+        <> disclose treasuryRulesDisclosure
+        <> disclose buyerTreasuryEligibilityDisclosure) $
+      exerciseCmd (toInterfaceContractId @AllocationFactory treasuryRulesCid)
+        AllocationFactory_Allocate with
+          expectedAdmin = live.treasuryRegistry
+          allocation = treasurySpec
+          requestedAt = now
+          inputHoldingCids = [toInterfaceContractId @Holding deliveryHoldingCid]
+          extraArgs = ExtraArgs with
+            context = ChoiceContext with
+              values = TextMap.fromList
+                [ (Treasury.senderEligibilityKey, AV_ContractId (coerceContractId sellerTreasuryEligibilityCid))
+                , (Treasury.receiverEligibilityKey, AV_ContractId (coerceContractId buyerTreasuryEligibilityCid))
+                ]
+            meta = emptyMetadata
+    case treasuryResult of
+      Right instruction -> do
+        cid <- completedAllocation instruction
+        debug ("CANTON_CREATED_TREASURY_ALLOCATION " <> show cid)
+        debug ("CANTON_USED_TREASURY_HOLDING " <> show deliveryHoldingCid)
+        pure cid
+      Left _ -> do
+        debug ("CANTON_SKIPPED_TREASURY_HOLDING " <> show deliveryHoldingCid)
+        allocateTreasuryFromHoldings live now tradeCid treasuryRulesCid rest
+
+allocatePaymentLeg : Live -> Time -> ContractId DvpTrade -> ContractId StablecoinRules -> ContractId StablecoinHolding -> Script (ContractId Allocation)
+allocatePaymentLeg live now tradeCid cashRulesCid mintedHoldingCid = do
+  paymentEligibilities <- query @StablecoinEligibility live.cashRegistry
+  (sellerPaymentEligibilityCid, _) <- only "seller payment eligibility"
+    [entry | entry@(_, eligibility) <- paymentEligibilities, eligibility.investor == live.seller]
+  (buyerPaymentEligibilityCid, _) <- only "buyer payment eligibility"
+    [entry | entry@(_, eligibility) <- paymentEligibilities, eligibility.investor == live.buyer]
+  Some buyerRequestView <- queryInterfaceContractId @AllocationRequest live.buyer
+    (toInterfaceContractId @AllocationRequest tradeCid)
+  paymentSpec <- legSpec buyerRequestView paymentLegId
+  cashRulesDisclosure <- disclosureOf live.cashRegistry cashRulesCid
+  sellerPaymentEligibilityDisclosure <- disclosureOf live.cashRegistry sellerPaymentEligibilityCid
+  paymentResult <- submit
+    (actAs live.buyer
+      <> disclose cashRulesDisclosure
+      <> disclose sellerPaymentEligibilityDisclosure) $
+    exerciseCmd (toInterfaceContractId @AllocationFactory cashRulesCid)
+      AllocationFactory_Allocate with
+        expectedAdmin = live.cashRegistry
+        allocation = paymentSpec
+        requestedAt = now
+        inputHoldingCids = [toInterfaceContractId @Holding mintedHoldingCid]
+        extraArgs = ExtraArgs with
+          context = ChoiceContext with
+            values = TextMap.fromList
+              [ (Stablecoin.senderEligibilityKey, AV_ContractId (coerceContractId buyerPaymentEligibilityCid))
+              , (Stablecoin.receiverEligibilityKey, AV_ContractId (coerceContractId sellerPaymentEligibilityCid))
+              ]
+          meta = emptyMetadata
+  cid <- completedAllocation paymentResult
+  debug ("CANTON_CREATED_PAYMENT_ALLOCATION " <> show cid)
+  pure cid
+
+settleExistingTrade : Live -> Decimal -> Text -> ContractId DvpTrade -> DvpTrade -> Time -> Script Text
+settleExistingTrade live amount lockId tradeCid trade now = do
+  if now >= trade.settleBefore
+  then abort ("RECOVERY_EXPIRED_TRADE " <> show tradeCid <> " required_action=do_not_settle")
+  else do
+    (treasuryRulesCid, _) <- only "treasury rules" =<< query @TreasuryRules live.treasuryRegistry
+    (cashRulesCid, _) <- only "stablecoin rules" =<< query @StablecoinRules live.cashRegistry
+    (_mintedCid, minted) <- mintedFor live lockId
+    treasuryAllocs <- matchingTreasuryAllocations live trade
+    paymentAllocs <- matchingPaymentAllocations live trade
+    treasuryAllocationCid <- case treasuryAllocs of
+      [(cid, _)] -> do
+        debug ("CANTON_REUSED_TREASURY_ALLOCATION " <> show cid)
+        pure (toInterfaceContractId @Allocation cid)
+      [] ->
+        if now >= trade.allocateBefore
+        then abort ("RECOVERY_EXPIRED_ALLOCATION " <> show tradeCid <> " required_action=seller_must_withdraw")
+        else allocateTreasuryLeg live now tradeCid treasuryRulesCid
+      _ -> abort "multiple treasury allocations for this trade"
+    paymentAllocationCid <- case paymentAllocs of
+      [(cid, _)] -> do
+        stillMinted <- queryContractId live.buyer minted.holdingCid
+        case stillMinted of
+          None -> pure ()
+          Some _ -> abort "payment allocation exists while this mint holding is still active"
+        debug ("CANTON_REUSED_PAYMENT_ALLOCATION " <> show cid)
+        pure (toInterfaceContractId @Allocation cid)
+      [] ->
+        if now >= trade.allocateBefore
+        then abort ("RECOVERY_EXPIRED_ALLOCATION " <> show tradeCid <> " required_action=buyer_must_withdraw")
+        else do
+          stillMinted <- queryContractId live.buyer minted.holdingCid
+          case stillMinted of
+            None -> abort ("RECOVERY_REQUIRED_ACTION buyer must restore minted holding " <> show minted.holdingCid)
+            Some paymentHolding -> do
+              paymentHolding.amount === amount
+              allocatePaymentLeg live now tradeCid cashRulesCid minted.holdingCid
+      _ -> abort "multiple payment allocations for this trade"
+    Some treasuryAllocationView <-
+      queryInterfaceContractId @Allocation live.treasuryRegistry treasuryAllocationCid
+    Some paymentAllocationView <-
+      queryInterfaceContractId @Allocation live.cashRegistry paymentAllocationCid
+    treasuryLockedCid <- case treasuryAllocationView.holdingCids of
+      [cid] -> pure cid
+      _ -> abort "expected one treasury backing holding"
+    paymentLockedCid <- case paymentAllocationView.holdingCids of
+      [cid] -> pure cid
+      _ -> abort "expected one payment backing holding"
+    treasuryLockedDisclosure <- disclosureOf live.treasuryRegistry
+      (fromInterfaceContractId @TreasuryHolding treasuryLockedCid)
+    paymentLockedDisclosure <- disclosureOf live.cashRegistry
+      (fromInterfaceContractId @StablecoinHolding paymentLockedCid)
+    settleResult <- submit
+      (actAs live.venue
+        <> disclose treasuryLockedDisclosure
+        <> disclose paymentLockedDisclosure) $
+      exerciseCmd tradeCid DvpTrade_Settle with
+        allocations =
+          [ SettlementAllocation with
+              transferLegId = treasuryLegId
+              allocationCid = treasuryAllocationCid
+              extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
+          , SettlementAllocation with
+              transferLegId = paymentLegId
+              allocationCid = paymentAllocationCid
+              extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
+          ]
+    length settleResult.treasuryResult.receiverHoldingCids === 1
+    length settleResult.paymentResult.receiverHoldingCids === 1
+    tradeAfter <- queryContractId live.venue tradeCid
+    isNone tradeAfter === True
+    buyerTreasuryCid <- case settleResult.treasuryResult.receiverHoldingCids of
+      [cid] -> pure (fromInterfaceContractId @TreasuryHolding cid)
+      _ -> abort "buyer Treasury output is missing after settlement"
+    sellerPaymentCid <- case settleResult.paymentResult.receiverHoldingCids of
+      [cid] -> pure (fromInterfaceContractId @StablecoinHolding cid)
+      _ -> abort "seller stablecoin output is missing after settlement"
+    Some buyerTreasuryHolding <- queryContractId live.buyer buyerTreasuryCid
+    Some sellerPaymentHolding <- queryContractId live.seller sellerPaymentCid
+    buyerTreasuryHolding.owner === live.buyer
+    buyerTreasuryHolding.amount === 100.0
+    sellerPaymentHolding.owner === live.seller
+    sellerPaymentHolding.amount === amount
+    mintedAfter <- queryContractId live.buyer minted.holdingCid
+    isNone mintedAfter === True
+    recordBindingOutputs live lockId buyerTreasuryCid sellerPaymentCid
+    let _ = paymentLockedCid
+    let settled =
+          "CANTON_SETTLE_BUYER_TREASURY " <> show buyerTreasuryCid
+            <> "\nCANTON_SETTLE_SELLER_STABLECOIN " <> show sellerPaymentCid
+            <> "\nCANTON_SETTLE_PAYMENT_AMOUNT " <> show sellerPaymentHolding.amount
+            <> "\nCANTON_SETTLE_TREASURY_AMOUNT " <> show buyerTreasuryHolding.amount
+            <> "\nCANTON_CONSUMED_PAYMENT " <> show minted.holdingCid
+    debug settled
+    debug ("CANTON_BINDING_LOCK " <> lockId)
+    debug ("CANTON_BINDING_TRADE " <> show tradeCid)
+    pure settled
+
+data SettleDecision
+  = ResumeSettle with tradeCid : ContractId DvpTrade, trade : DvpTrade
+  | AlreadySettled
+  | RecoveryBlocked with message : Text
+  deriving (Eq, Show)
+
+decideSettle : Live -> Decimal -> Text -> Time -> Script SettleDecision
+decideSettle live amount lockId now = do
+  (_mintedCid, minted) <- mintedFor live lockId
+  minted.amount === amount
+  bound <- boundTrade live lockId minted.holdingCid
+  case bound of
+    Some (tradeCid, trade) -> do
+      treasuryAllocs <- matchingTreasuryAllocations live trade
+      paymentAllocs <- matchingPaymentAllocations live trade
+      if now >= trade.settleBefore
+      then pure (RecoveryBlocked ("RECOVERY_EXPIRED_TRADE " <> show tradeCid <> " required_action=do_not_settle"))
+      else if now >= trade.allocateBefore
+      then case (treasuryAllocs, paymentAllocs) of
+        ([_], [_]) -> pure (ResumeSettle tradeCid trade)
+        ([(cid, _)], []) ->
+          pure (RecoveryBlocked ("RECOVERY_EXPIRED_ALLOCATION " <> show cid <> " required_action=seller_must_withdraw"))
+        ([], [(cid, _)]) ->
+          pure (RecoveryBlocked ("RECOVERY_EXPIRED_ALLOCATION " <> show cid <> " required_action=buyer_must_withdraw"))
+        ([], []) ->
+          pure (RecoveryBlocked ("RECOVERY_EXPIRED_TRADE " <> show tradeCid <> " required_action=do_not_allocate"))
+        _ -> abort "multiple allocations for this trade"
+      else pure (ResumeSettle tradeCid trade)
+    None -> do
+      bindings <- bindingsForLock live lockId
+      stillMinted <- queryContractId live.buyer minted.holdingCid
+      case (bindings, stillMinted) of
+        ([(_, binding)], None) -> do
+          binding.mintHoldingCid === minted.holdingCid
+          pure AlreadySettled
+        ([(_, binding)], Some _) ->
+          pure (RecoveryBlocked ("bound trade " <> binding.tradeCid <> " is missing while the minted holding is still active; will not start a new operation"))
+        ([], Some _) ->
+          pure (RecoveryBlocked "trade binding is missing while the minted holding is still active; will not start a new operation")
+        ([], None) ->
+          pure (RecoveryBlocked "trade binding is missing after the minted holding was consumed")
+        _ -> abort ("multiple trade bindings for lock " <> lockId)
+
+inspectSettleRecovery : Live -> RuntimeInput -> Script Text
+inspectSettleRecovery live input = do
+  amount <- parseExactDecimal input.amount
+  now <- getTime
+  decision <- decideSettle live amount input.lockId now
+  case decision of
+    ResumeSettle tradeCid _ -> pure ("RESUME_SETTLE " <> show tradeCid)
+    AlreadySettled -> pure "ALREADY_SETTLED"
+    RecoveryBlocked message -> pure message
+
+settleFromLedger : Live -> RuntimeInput -> Script Text
+settleFromLedger live input = do
+  amount <- parseExactDecimal input.amount
+  now <- getTime
+  decision <- decideSettle live amount input.lockId now
+  case decision of
+    ResumeSettle tradeCid trade -> settleExistingTrade live amount input.lockId tradeCid trade now
+    AlreadySettled -> alreadySettledText live amount input.lockId
+    RecoveryBlocked message -> abort message
+
 settle : RuntimeInput -> Script Text
 settle input = do
-  amount <- parseExactDecimal input.amount
   live <- lookupLive input
-  now <- getTime
-  sellerStable <- query @StablecoinHolding live.seller
-  buyerTreasury <- query @TreasuryHolding live.buyer
-  case (sellerStable, buyerTreasury) of
-    ([(paymentCid, payment)], [(treasuryCid, treasury)]) -> do
-      payment.owner === live.seller
-      payment.amount === amount
-      treasury.owner === live.buyer
-      treasury.amount === 100.0
-      let settled =
-            "CANTON_SETTLE_BUYER_TREASURY " <> show treasuryCid
-              <> "\nCANTON_SETTLE_SELLER_STABLECOIN " <> show paymentCid
-              <> "\nCANTON_SETTLE_PAYMENT_AMOUNT " <> show payment.amount
-              <> "\nCANTON_SETTLE_TREASURY_AMOUNT " <> show treasury.amount
-      debug settled
-      pure settled
-    _ -> do
-      (treasuryRulesCid, _) <- only "treasury rules" =<< query @TreasuryRules live.treasuryRegistry
-      (cashRulesCid, _) <- only "stablecoin rules" =<< query @StablecoinRules live.cashRegistry
-      (tradeCid, _) <- only "trade" =<< query @DvpTrade live.venue
-      (_mintedCid, minted) <- mintedFor live input.lockId
-      Some paymentHolding <- queryContractId live.buyer minted.holdingCid
-      paymentHolding.amount === amount
-      paymentHolding.owner === live.buyer
-      (deliveryHoldingCid, deliveryHolding) <- only "treasury holding" =<< query @TreasuryHolding live.seller
-      deliveryHolding.owner === live.seller
-      treasuryEligibilities <- query @TreasuryEligibility live.treasuryRegistry
-      paymentEligibilities <- query @StablecoinEligibility live.cashRegistry
-      (sellerTreasuryEligibilityCid, _) <- only "seller treasury eligibility"
-        [entry | entry@(_, eligibility) <- treasuryEligibilities, eligibility.investor == live.seller]
-      (buyerTreasuryEligibilityCid, _) <- only "buyer treasury eligibility"
-        [entry | entry@(_, eligibility) <- treasuryEligibilities, eligibility.investor == live.buyer]
-      (sellerPaymentEligibilityCid, _) <- only "seller payment eligibility"
-        [entry | entry@(_, eligibility) <- paymentEligibilities, eligibility.investor == live.seller]
-      (buyerPaymentEligibilityCid, _) <- only "buyer payment eligibility"
-        [entry | entry@(_, eligibility) <- paymentEligibilities, eligibility.investor == live.buyer]
-      Some sellerRequestView <- queryInterfaceContractId @AllocationRequest live.seller
-        (toInterfaceContractId @AllocationRequest tradeCid)
-      Some buyerRequestView <- queryInterfaceContractId @AllocationRequest live.buyer
-        (toInterfaceContractId @AllocationRequest tradeCid)
-      treasurySpec <- legSpec sellerRequestView treasuryLegId
-      paymentSpec <- legSpec buyerRequestView paymentLegId
-      treasuryRulesDisclosure <- disclosureOf live.treasuryRegistry treasuryRulesCid
-      buyerTreasuryEligibilityDisclosure <- disclosureOf live.treasuryRegistry buyerTreasuryEligibilityCid
-      treasuryResult <- submit
-        (actAs live.seller
-          <> disclose treasuryRulesDisclosure
-          <> disclose buyerTreasuryEligibilityDisclosure) $
-        exerciseCmd (toInterfaceContractId @AllocationFactory treasuryRulesCid)
-          AllocationFactory_Allocate with
-            expectedAdmin = live.treasuryRegistry
-            allocation = treasurySpec
-            requestedAt = now
-            inputHoldingCids = [toInterfaceContractId @Holding deliveryHoldingCid]
-            extraArgs = ExtraArgs with
-              context = ChoiceContext with
-                values = TextMap.fromList
-                  [ (Treasury.senderEligibilityKey, AV_ContractId (coerceContractId sellerTreasuryEligibilityCid))
-                  , (Treasury.receiverEligibilityKey, AV_ContractId (coerceContractId buyerTreasuryEligibilityCid))
-                  ]
-              meta = emptyMetadata
-      treasuryAllocationCid <- completedAllocation treasuryResult
-      cashRulesDisclosure <- disclosureOf live.cashRegistry cashRulesCid
-      sellerPaymentEligibilityDisclosure <- disclosureOf live.cashRegistry sellerPaymentEligibilityCid
-      paymentResult <- submit
-        (actAs live.buyer
-          <> disclose cashRulesDisclosure
-          <> disclose sellerPaymentEligibilityDisclosure) $
-        exerciseCmd (toInterfaceContractId @AllocationFactory cashRulesCid)
-          AllocationFactory_Allocate with
-            expectedAdmin = live.cashRegistry
-            allocation = paymentSpec
-            requestedAt = now
-            inputHoldingCids = [toInterfaceContractId @Holding minted.holdingCid]
-            extraArgs = ExtraArgs with
-              context = ChoiceContext with
-                values = TextMap.fromList
-                  [ (Stablecoin.senderEligibilityKey, AV_ContractId (coerceContractId buyerPaymentEligibilityCid))
-                  , (Stablecoin.receiverEligibilityKey, AV_ContractId (coerceContractId sellerPaymentEligibilityCid))
-                  ]
-              meta = emptyMetadata
-      paymentAllocationCid <- completedAllocation paymentResult
-      Some treasuryAllocationView <-
-        queryInterfaceContractId @Allocation live.treasuryRegistry treasuryAllocationCid
-      Some paymentAllocationView <-
-        queryInterfaceContractId @Allocation live.cashRegistry paymentAllocationCid
-      treasuryLockedCid <- case treasuryAllocationView.holdingCids of
-        [cid] -> pure cid
-        _ -> abort "expected one treasury backing holding"
-      paymentLockedCid <- case paymentAllocationView.holdingCids of
-        [cid] -> pure cid
-        _ -> abort "expected one payment backing holding"
-      treasuryLockedDisclosure <- disclosureOf live.treasuryRegistry
-        (fromInterfaceContractId @TreasuryHolding treasuryLockedCid)
-      paymentLockedDisclosure <- disclosureOf live.cashRegistry
-        (fromInterfaceContractId @StablecoinHolding paymentLockedCid)
-      settleResult <- submit
-        (actAs live.venue
-          <> disclose treasuryLockedDisclosure
-          <> disclose paymentLockedDisclosure) $
-        exerciseCmd tradeCid DvpTrade_Settle with
-          allocations =
-            [ SettlementAllocation with
-                transferLegId = treasuryLegId
-                allocationCid = treasuryAllocationCid
-                extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
-            , SettlementAllocation with
-                transferLegId = paymentLegId
-                allocationCid = paymentAllocationCid
-                extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
-            ]
-      length settleResult.treasuryResult.receiverHoldingCids === 1
-      length settleResult.paymentResult.receiverHoldingCids === 1
-      tradeAfter <- queryContractId live.venue tradeCid
-      isNone tradeAfter === True
-      (buyerTreasuryCid, buyerTreasuryHolding) <- only "buyer treasury holding" =<< query @TreasuryHolding live.buyer
-      (sellerPaymentCid, sellerPaymentHolding) <- only "seller stablecoin holding" =<< query @StablecoinHolding live.seller
-      buyerTreasuryHolding.owner === live.buyer
-      buyerTreasuryHolding.amount === 100.0
-      sellerPaymentHolding.owner === live.seller
-      sellerPaymentHolding.amount === amount
-      buyerStable <- query @StablecoinHolding live.buyer
-      sellerTreasury <- query @TreasuryHolding live.seller
-      null buyerStable === True
-      null sellerTreasury === True
-      mintedAfter <- queryContractId live.buyer minted.holdingCid
-      isNone mintedAfter === True
-      let _ = paymentHolding
-      let _ = paymentLockedCid
-      let settled =
-            "CANTON_SETTLE_BUYER_TREASURY " <> show buyerTreasuryCid
-              <> "\nCANTON_SETTLE_SELLER_STABLECOIN " <> show sellerPaymentCid
-              <> "\nCANTON_SETTLE_PAYMENT_AMOUNT " <> show sellerPaymentHolding.amount
-              <> "\nCANTON_SETTLE_TREASURY_AMOUNT " <> show buyerTreasuryHolding.amount
-              <> "\nCANTON_CONSUMED_PAYMENT " <> show minted.holdingCid
-              <> "\nCANTON_CONSUMED_TREASURY " <> show deliveryHoldingCid
-      debug settled
-      pure settled
+  settleFromLedger live input
 
-redeem : RuntimeInput -> Script Text
-redeem input = do
-  amount <- parseExactDecimal input.amount
-  live <- lookupLive input
-  redeemed <- query @RedeemedLock live.cashRegistry
-  case [cid | (cid, lock) <- redeemed, lock.lockId == input.lockId] of
-    [cid] -> do
-      debug ("CANTON_REDEEM " <> show cid)
-      debug ("CANTON_PAYOUT_DEST " <> input.payoutDestination)
-      pure ("CANTON_REDEEM " <> show cid <> "\nCANTON_PAYOUT_DEST " <> input.payoutDestination)
-    _ -> do
-      (mintedCid, minted) <- mintedFor live input.lockId
-      holdings <- query @StablecoinHolding live.seller
-      (holdingCid, holding) <- only "seller stablecoin holding" holdings
-      holding.amount === minted.amount
-      holding.amount === amount
+reuseOrCreateRedeemAttestations : Live -> RuntimeInput -> Decimal -> Script (ContractId BridgeAttestation, ContractId BridgeAttestation)
+reuseOrCreateRedeemAttestations live input amount = do
+  existing <- matchingRedeemAttestations live input.lockId amount input.digestHex input.payoutDestination
+  case existing of
+    [(firstCid, first), (secondCid, second)] ->
+      if first.attester == second.attester
+      then abort "duplicate redeem attester for this lock"
+      else do
+        debug ("CANTON_REUSED_REDEEM_ATTESTATIONS " <> show firstCid <> " " <> show secondCid)
+        pure (firstCid, secondCid)
+    [(firstCid, first)] -> do
+      secondCid <- createRedeemAttestation live (otherMintAttester live first.attester) input amount
+      debug ("CANTON_REUSED_ONE_REDEEM_ATTESTATION " <> show firstCid)
+      pure (firstCid, secondCid)
+    [] -> do
+      firstCid <- createRedeemAttestation live live.attesterA input amount
+      secondCid <- createRedeemAttestation live live.attesterB input amount
+      pure (firstCid, secondCid)
+    _ -> abort "duplicate redeem attestations for this lock"
+
+boundSellerPayment : Live -> Text -> Decimal -> Script (ContractId StablecoinHolding, StablecoinHolding)
+boundSellerPayment live lockId amount = do
+  bindings <- bindingsForLock live lockId
+  case bindings of
+    [(_, binding)] ->
+      case binding.sellerPaymentCid of
+        Some paymentText -> do
+          found <- query @StablecoinHolding live.seller
+          case [(cid, holding) | (cid, holding) <- found, show cid == paymentText] of
+            [(cid, holding)] -> do
+              holding.owner === live.seller
+              holding.amount === amount
+              isNone holding.lock === True
+              pure (cid, holding)
+            [] -> abort ("RECOVERY_REQUIRED_ACTION seller must provide bound stablecoin holding " <> paymentText)
+            _ -> abort ("duplicate seller holdings for bound payment " <> paymentText)
+        None -> abort ("settlement outputs are not recorded on the binding for lock " <> lockId)
+    [] -> abort ("missing trade binding for lock " <> lockId)
+    _ -> abort ("multiple trade bindings for lock " <> lockId)
+
+reuseOrCreateRedemptionRequest : Live -> RuntimeInput -> Decimal -> Script (ContractId RedemptionRequest, ContractId StablecoinHolding)
+reuseOrCreateRedemptionRequest live input amount = do
+  requests <- matchingRedemptionRequests live input.lockId
+  case requests of
+    [(requestCid, request)] -> do
+      request.amount === amount
+      request.digestHex === input.digestHex
+      request.payoutDestination === input.payoutDestination
+      request.holder === live.seller
+      bindings <- bindingsForLock live input.lockId
+      case bindings of
+        [(_, binding)] ->
+          case binding.sellerPaymentCid of
+            Some paymentText -> show request.holdingCid === paymentText
+            None -> abort ("settlement outputs are not recorded on the binding for lock " <> input.lockId)
+        [] -> abort ("missing trade binding for lock " <> input.lockId)
+        _ -> abort ("multiple trade bindings for lock " <> input.lockId)
+      debug ("CANTON_REUSED_REDEMPTION_REQUEST " <> show requestCid)
+      pure (requestCid, request.holdingCid)
+    [] -> do
+      (holdingCid, holding) <- boundSellerPayment live input.lockId amount
       holding.owner === live.seller
       requestCid <- submit live.seller $ createCmd RedemptionRequest with
         holder = live.seller
@@ -504,27 +973,31 @@ redeem input = do
         digestHex = input.digestHex
         instrumentId = live.instrumentId
         payoutDestination = input.payoutDestination
-      firstCid <- submit live.attesterA $ createCmd BridgeAttestation with
-        attester = live.attesterA
-        cashRegistry = live.cashRegistry
-        lockId = input.lockId
-        amount = holding.amount
-        beneficiary = live.seller
-        digestHex = input.digestHex
-        direction = RedeemAttestation
-        instrumentId = live.instrumentId
-        payoutDestination = input.payoutDestination
-      secondCid <- submit live.attesterB $ createCmd BridgeAttestation with
-        attester = live.attesterB
-        cashRegistry = live.cashRegistry
-        lockId = input.lockId
-        amount = holding.amount
-        beneficiary = live.seller
-        digestHex = input.digestHex
-        direction = RedeemAttestation
-        instrumentId = live.instrumentId
-        payoutDestination = input.payoutDestination
-      (_gatewayCid, redeemedCid) <- submit live.cashRegistry $ exerciseCmd live.gatewayCid Gateway_Redeem with
+      debug ("CANTON_CREATED_REDEMPTION_REQUEST " <> show requestCid)
+      pure (requestCid, holdingCid)
+    _ -> abort "duplicate redemption requests for this lock"
+
+redeemFromLedger : Live -> RuntimeInput -> Script Text
+redeemFromLedger live input = do
+  amount <- parseExactDecimal input.amount
+  redeemed <- query @RedeemedLock live.cashRegistry
+  case [cid | (cid, lock) <- redeemed, lock.lockId == input.lockId] of
+    [cid] -> do
+      let reused =
+            "CANTON_REDEEM " <> show cid
+              <> "\nCANTON_REDEEM_HOLDER seller"
+              <> "\nCANTON_REDEEM_AMOUNT " <> show amount
+              <> "\nCANTON_PAYOUT_DEST " <> input.payoutDestination
+      debug reused
+      debug "CANTON_REUSED_REDEEM"
+      pure reused
+    _ -> do
+      (mintedCid, minted) <- mintedFor live input.lockId
+      minted.amount === amount
+      (requestCid, holdingCid) <- reuseOrCreateRedemptionRequest live input amount
+      (firstCid, secondCid) <- reuseOrCreateRedeemAttestations live input amount
+      (gatewayCid, _) <- only "bridge gateway" =<< query @BridgeGateway live.cashRegistry
+      (_nextGateway, redeemedCid) <- submit live.cashRegistry $ exerciseCmd gatewayCid Gateway_Redeem with
         requestCid
         firstCid
         secondCid
@@ -534,10 +1007,15 @@ redeem input = do
       let redeemed =
             "CANTON_REDEEM " <> show redeemedCid
               <> "\nCANTON_REDEEM_HOLDER seller"
-              <> "\nCANTON_REDEEM_AMOUNT " <> show holding.amount
+              <> "\nCANTON_REDEEM_AMOUNT " <> show amount
               <> "\nCANTON_PAYOUT_DEST " <> input.payoutDestination
       debug redeemed
       pure redeemed
+
+redeem : RuntimeInput -> Script Text
+redeem input = do
+  live <- lookupLive input
+  redeemFromLedger live input
 
 verifyCompletion : RuntimeInput -> Script Text
 verifyCompletion input = do
@@ -564,20 +1042,28 @@ verifyCompletion input = do
   redeemed.amount === amount
   redeemed.holder === live.seller
   sellerPayments <- query @StablecoinHolding live.seller
-  null sellerPayments === True
-  (buyerTreasuryCid, buyerTreasury) <- only "buyer treasury holding" =<< query @TreasuryHolding live.buyer
-  buyerTreasury.owner === live.buyer
-  buyerTreasury.amount === 100.0
-  buyerTreasury.instrumentId === InstrumentId with admin = live.treasuryRegistry, id = "UST-2028-11"
+  buyerTreasuries <- query @TreasuryHolding live.buyer
+  let matchingTreasury =
+        [ (cid, holding)
+        | (cid, holding) <- buyerTreasuries
+        , holding.owner == live.buyer
+        , holding.amount == 100.0
+        , holding.instrumentId == InstrumentId with admin = live.treasuryRegistry, id = "UST-2028-11"
+        ]
+  let treasuryLine = case matchingTreasury of
+        [(buyerTreasuryCid, buyerTreasury)] ->
+          "CANTON_ACS_BUYER_TREASURY " <> show buyerTreasuryCid
+            <> "\nCANTON_ACS_TREASURY_AMOUNT " <> show buyerTreasury.amount
+        _ -> "CANTON_ACS_BUYER_TREASURY_SKIP"
   live.instrumentId.id === "USD-C"
+  let _ = sellerPayments
   let evidence =
         "CANTON_ACS_LOCK " <> minted.lockId
           <> "\nCANTON_ACS_MINT_HOLDING " <> show minted.holdingCid
           <> "\nCANTON_ACS_MINT_AMOUNT " <> show minted.amount
           <> "\nCANTON_ACS_REDEEM " <> show redeemedCid
           <> "\nCANTON_ACS_REDEEM_AMOUNT " <> show redeemed.amount
-          <> "\nCANTON_ACS_BUYER_TREASURY " <> show buyerTreasuryCid
-          <> "\nCANTON_ACS_TREASURY_AMOUNT " <> show buyerTreasury.amount
+          <> "\n" <> treasuryLine
           <> "\nCANTON_ACS_BUYER " <> partyToText live.buyer
           <> "\nCANTON_ACS_SELLER " <> partyToText live.seller
           <> "\nCANTON_ACS_INSTRUMENT " <> live.instrumentId.id

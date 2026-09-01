@@ -1,0 +1,98 @@
+module Tests.Bridge.Faults where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import DA.Optional (isNone)
+import DA.Time (time)
+import Daml.Script
+
+import Bridge.Attestation
+import Bridge.Gateway
+import Bridge.Types
+import Splice.Api.Token.HoldingV1
+
+import Stablecoin.Holding
+import Stablecoin.Instrument
+
+disagreeingMintAttestationsDoNotMint : Script ()
+disagreeingMintAttestationsDoNotMint = do
+  setTime (time (date 2026 Jan 1) 12 0 0)
+  cashRegistry <- allocateParty "CashRegistry"
+  attesterA <- allocateParty "AttesterA"
+  attesterB <- allocateParty "AttesterB"
+  attesterC <- allocateParty "AttesterC"
+  buyer <- allocateParty "Buyer"
+  cashInstrumentCid <- submit cashRegistry $ createCmd StablecoinInstrument with
+    cashRegistry
+    id = "USD-C"
+    description = "Regulated USD payment stablecoin"
+  let instrumentId = InstrumentId with admin = cashRegistry, id = "USD-C"
+  gatewayCid <- submit cashRegistry $ createCmd BridgeGateway with
+    cashRegistry
+    attesters = [attesterA, attesterB, attesterC]
+    instrumentCid = cashInstrumentCid
+    instrumentId
+    mintedLocks = []
+    redeemedLocks = []
+  goodCid <- submit attesterA $ createCmd BridgeAttestation with
+    attester = attesterA
+    cashRegistry
+    lockId = "lock-disagree"
+    amount = 100000.0
+    beneficiary = buyer
+    digestHex = "digest-good"
+    direction = MintAttestation
+    instrumentId
+    payoutDestination = ""
+  badCid <- submit attesterB $ createCmd BridgeAttestation with
+    attester = attesterB
+    cashRegistry
+    lockId = "lock-disagree"
+    amount = 100000.0
+    beneficiary = buyer
+    digestHex = "digest-conflicting"
+    direction = MintAttestation
+    instrumentId
+    payoutDestination = ""
+  debug "FAULT_INJECTED attester_disagreement"
+  debug "LOCKED_VALUE 100000.000000"
+  debug "LOCKED_STATE canton_unminted"
+  submitMustFail cashRegistry $ exerciseCmd gatewayCid Gateway_Mint with
+    firstCid = goodCid
+    secondCid = badCid
+  minted <- query @MintedLock cashRegistry
+  null minted === True
+  holdings <- query @StablecoinHolding buyer
+  null holdings === True
+  debug "RECOVERY_RESULT no_mint_without_quorum"
+  goodB <- submit attesterB $ createCmd BridgeAttestation with
+    attester = attesterB
+    cashRegistry
+    lockId = "lock-disagree"
+    amount = 100000.0
+    beneficiary = buyer
+    digestHex = "digest-good"
+    direction = MintAttestation
+    instrumentId
+    payoutDestination = ""
+  (nextGateway, holdingCid) <- submit cashRegistry $ exerciseCmd gatewayCid Gateway_Mint with
+    firstCid = goodCid
+    secondCid = goodB
+  Some holding <- queryContractId buyer holdingCid
+  holding.amount === 100000.0
+  isNone holding.lock === True
+  mintedAfter <- query @MintedLock cashRegistry
+  length mintedAfter === 1
+  submitMustFail cashRegistry $ exerciseCmd nextGateway Gateway_Mint with
+    firstCid = goodCid
+    secondCid = goodB
+  mintedAgain <- query @MintedLock cashRegistry
+  length mintedAgain === 1
+  holdingsAfter <- query @StablecoinHolding buyer
+  length holdingsAfter === 1
+  debug "RECOVERY_RESULT quorum_recovered"
+  debug "TERMINAL_STATE minted_once"
+  debug "ACTION_COUNTS mint=1 settle=0 burn=0 release=0 zama=0"
+  debug "RECOVERY_DURATION_LEDGER_SECS 0"
+  let _ = attesterC
+  pure ()

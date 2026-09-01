@@ -267,7 +267,7 @@ LP tokens, swap curves, or AMM pricing.
 |---|---|
 | M1–M7 Canton atomic DvP, two synchronizers, verified privacy | **Complete** |
 | Phase 1 confidential settlement rail | **Complete (local only).** Encrypted capacity, confidential Solana custody, 2-of-3 mint/release approvals, live Treasury DvP funded by the minted holding, seller redemption, Relayer release, Zama redeem, journal resume from on-chain state after partial success, rejected or finalized-unapproved reservations without lock or mint, post-redemption crash recording, exact Canton decimal strings, Canton completion checked from a connected update-history sequence rather than journal fields, and Zama capacity recovery checked with approval-only probes. |
-| Phase 2 extended security testing, operational hardening, benchmarks, and publication | **Not started.** |
+| Phase 2 operational hardening of the confidential rail | **Complete (local only).** Each bridge lock is bound on ledger to its minted holding CID and `DvpTrade` CID. Prepare, settle, redeem, resume, and history verification use that binding, not a party-and-amount lookup. Release and mint expiry are taken from the Solana chain clock. Crash resume uses ledger contracts at each Canton and Solana/Zama boundary. Temporary secret files are created at `0600` under a `0700` directory. |
 
 Phase 1 workflow, all asynchronous except the existing Canton settle:
 
@@ -363,6 +363,7 @@ official `program@v7.0.0` source and the local validator loads that program.
 make verify
 make bridge-test
 scripts/bridge-e2e.sh
+scripts/bridge-walkthrough.sh
 make bridge-verify
 ```
 
@@ -372,14 +373,42 @@ fail the run. `BRIDGE_E2E_COMPLETE` is printed only after expiry recovery on a l
 operation, an over-capacity reservation that stays rejected on retry and after a
 later finalize with no Solana lock or Canton mint, coordinator restart after
 on-chain success that was not saved locally (including between the two mint
-attestations, after release-approval expiry, and after Zama redemption), the
-minted holding funds atomic Treasury DvP, the seller's stablecoin is redeemed,
-confidential release through Relayer confirms to the redemption destination,
-destination apply-pending is not applied twice, a completed resume skips setup
-and funding and checks Canton from a connected update-history sequence, a second resume of the
-completed operation changes no ledger state, and Zama capacity probes are
-rejected while exposure is live and approved after redemption without decrypting
-amounts or limits.
+attestations, after Canton settlement, after release-approval expiry on the
+Solana chain clock, and after Zama redemption), the minted holding funds atomic
+Treasury DvP, the seller's stablecoin is redeemed, a fresh 2-of-3 release
+approval is collected after chain-clock expiry, confidential release through
+Relayer confirms to the redemption destination, destination apply-pending is
+not applied twice, a completed resume skips setup and funding and checks Canton
+from a connected update-history sequence, a second resume of the completed
+operation changes no ledger state, an unrelated lock is rejected, and Zama
+capacity probes are rejected while exposure is live and approved after
+redemption without decrypting amounts or limits.
+
+Crash resume is tested at these boundaries: Treasury allocation without
+payment allocation, both allocations without settlement, settlement without a
+local journal save, redemption request without burn, burn without release
+approval, Solana release without Zama redeem, and Zama redeem without a
+completion journal save. Resume finds the existing lock, settlement reference,
+and connected contracts. It creates only the missing allocation, reuses a valid
+unexpired approval, and does not mint, burn, settle, release, or redeem twice.
+
+`scripts/bridge-walkthrough.sh` is a separate operator run, not a second call
+to `scripts/bridge-e2e.sh`. It checks two simultaneous Canton operations with
+identical terms, attester disagreement, expiry before settlement, an expired
+release approval after committed settlement, a stop after Canton redemption
+and before Solana release, and two completed resumes that add no Solana or
+Zama transactions. Contract IDs, signatures, and balances from that run stay
+in the operator notes; they are not stored in this repository.
+
+Local recovery measurements from `scripts/bridge-e2e.sh` on this machine.
+These are not production benchmarks.
+
+| Fault | Locked value (base units) | Locked state | Recovery | Chain duration | Terminal state | mint / settle / burn / release / zama |
+|---|---|---|---|---|---|---|
+| Attester disagreement | 100000000000 | Solana vault | Bad attestation ignored; later 2-of-3 minted once | 13–14 s from inject to quorum on this machine. Waiting for the second attestation is operator-controlled and can be unbounded. | `locked_awaiting_quorum`, then the same operation continued | 0 / 0 / 0 / 0 / 0 until quorum |
+| Expiry before mint or settlement | 100000000000 | Solana vault | Mint approval rejected; cancel/refund path | 7 s | `cancelled` | 0 / 0 / 0 / 0 / 1 |
+| Canton redeemed, Solana not released | 100000000000 | Solana vault | Connected history, one Relayer release | 78–81 s from inject to release on this machine. Waiting for operator resume is unbounded. | `canton_redeemed_solana_locked`, then `released` | 1 / 1 / 1 / 0 / 0 until resume |
+| Release approval expired after settlement | 100000000000 | Solana vault | Fresh 2-of-3 from chain time; one release | 29–31 s | `released` | 1 / 1 / 1 / 1 / 0 |
 
 Amounts use one convention: Solana and Zama carry integer base units; Canton
 carries whole-token Decimals. With six decimals, 1 token is 1,000,000 base
@@ -402,6 +431,12 @@ not recompute the Solana digest.
   separate from the original mint deadline. A later 2-of-3 can recover an
   eligible locked operation after that mint deadline. Epoch on the Zama engine
   is a policy version and does not erase reserved or active exposure.
+- Daml Script cannot prescribe a synchronizer or submit `actAs` across
+  participants. Extra Treasury holdings for two live identical-term operations
+  are issued on `treasury-sync` and explicitly reassigned. Settlement outputs
+  are recorded on the binding by the buyer and the seller in separate choices.
+  `Gateway_Mint` creates the only valid `BridgeMintRef`. The buyer selects the
+  trade by consuming that reference. A buyer-only create is rejected.
 
 ## Repository structure
 
@@ -424,6 +459,8 @@ canton/
     probe-pending.canton       pending-assignment scenario and reassignment round trip
     verify-privacy.canton      per-participant update-stream privacy assertions
     bridge-bootstrap.canton    extra attesters and bridge-gateway vetting
+    prepare-isolation-holdings.canton
+                               two extra Treasury holdings on treasury-sync, then explicit reassignment
 solana/                        Token-2022 confidential escrow program
 zama/                          ConfidentialRiskEngine (FHEVM, mock in local tests)
 bridge/                        Rust coordinator and Relayer 1.5.0 local config
@@ -624,14 +661,14 @@ observes data it should not, or any Canton process or port survives shutdown.
 ## Status
 
 **M1–M7 complete.** Phase 1 of the confidential rail is **complete** on the
-local stack: rejected or finalized-unapproved Zama reservations cannot lock or
-mint, resume records a completed operation after Zama redemption without
-starting another one, resume reads chain state rather than only the journal,
-Canton completion requires a connected mint-allocation-settle-redeem
-sequence from update history, and Zama capacity recovery is checked with
-approval-only probes. The stack is local-only,
-unaudited, uses mock FHE in Hardhat, and relies on attested equality rather
-than a cross-scheme proof. Phase 2 has not started.
+local stack. Phase 2 hardening is **complete** on the same local stack:
+each lock is bound to its mint holding and trade by a cash-registry mint
+reference created in `Gateway_Mint`, mint and release expiry use
+Solana chain time, Canton completion is verified from connected update history,
+crash resume uses ledger contracts rather than journal markers alone, and
+secret files are created private. The stack is local-only, unaudited, uses
+mock FHE in Hardhat, and relies on attested equality rather than a
+cross-scheme proof.
 
 - M1: Treasury instrument and standard-compatible holdings
 - M2: independently governed stablecoin package with registry-controlled mint and burn
@@ -653,7 +690,8 @@ This repository is a protocol and modelling demonstration. It does not include, 
 - No PostgreSQL or authentication infrastructure
 - No Canton Network or Global Synchronizer deployment
 - No Token Standard V2
-- No production deployment, audit, or Phase 2 hardening
+- No production deployment or audit. Phase 2 hardening is local-only and
+  unaudited.
 
 The local topology demonstrates **protocol behavior**: how Canton enforces atomicity, authorization,
 and need-to-know visibility across independently governed applications. It does not demonstrate

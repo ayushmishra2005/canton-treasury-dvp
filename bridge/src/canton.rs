@@ -82,18 +82,9 @@ impl CantonClient {
             &expected.payout_destination,
         ) {
             Ok(stdout) => stdout,
-            Err(err) => {
-                let text = err.to_string();
-                if text.contains("Canton completion missing")
-                    || text.contains("Expected one")
-                    || text.contains("CANTON_VERIFY_FAIL")
-                {
-                    return Ok(CantonLedgerEvidence::default());
-                }
-                return Err(anyhow!("Canton ledger evidence cannot be read: {err}"));
-            }
+            Err(err) => format!("CANTON_ACS_SKIP {err}"),
         };
-        let history = match self.run_console_env(
+        let history = self.run_console_env(
             "canton/scripts/verify-bridge-completion.canton",
             &[
                 ("BRIDGE_LOCK_ID", expected.lock_id.as_str()),
@@ -102,75 +93,8 @@ impl CantonClient {
                 ("BRIDGE_PAYOUT_DEST", expected.payout_destination.as_str()),
                 ("BRIDGE_MINT_HOLDING", expected.mint_holding.as_str()),
             ],
-        ) {
-            Ok(stdout) => stdout,
-            Err(err) => {
-                let text = err.to_string();
-                if text.contains("CANTON_HISTORY_OTHER_LOCK") || text.contains("another operation")
-                {
-                    return Err(anyhow!(
-                        "Canton ledger evidence belongs to another operation"
-                    ));
-                }
-                if text.contains("CANTON_VERIFY_UNREADABLE") {
-                    return Err(anyhow!("Canton ledger evidence cannot be read: {err}"));
-                }
-                if text.contains("CANTON_VERIFY_FAIL") || text.contains("missing") {
-                    let facts = parse_canton_history_facts(&text).unwrap_or_default();
-                    if !facts.is_empty() {
-                        return match connect_canton_history(&facts, expected) {
-                            Ok(evidence) => Ok(evidence),
-                            Err(connect_err) => {
-                                let connect_text = connect_err.to_string();
-                                if connect_text.contains("another operation")
-                                    || connect_text.contains("not connected")
-                                {
-                                    Err(anyhow!(
-                                        "Canton ledger evidence belongs to another operation"
-                                    ))
-                                } else {
-                                    Ok(CantonLedgerEvidence::default())
-                                }
-                            }
-                        };
-                    }
-                    return Ok(CantonLedgerEvidence::default());
-                }
-                return Err(anyhow!("Canton ledger evidence cannot be read: {err}"));
-            }
-        };
-        let combined = format!("{acs}\n{history}");
-        if combined.contains("CANTON_VERIFY_UNREADABLE") {
-            return Err(anyhow!("Canton ledger evidence cannot be read"));
-        }
-        if combined.contains("CANTON_HISTORY_OTHER_LOCK") || combined.contains("another operation")
-        {
-            return Err(anyhow!(
-                "Canton ledger evidence belongs to another operation"
-            ));
-        }
-        let facts = parse_canton_history_facts(&combined)?;
-        if facts.is_empty() {
-            if combined.contains("CANTON_VERIFY_FAIL") || combined.contains("missing") {
-                return Ok(CantonLedgerEvidence::default());
-            }
-            return Err(anyhow!("Canton ledger evidence cannot be read"));
-        }
-        match connect_canton_history(&facts, expected) {
-            Ok(evidence) => Ok(evidence),
-            Err(err) => {
-                let text = err.to_string();
-                if text.contains("another operation") || text.contains("not connected") {
-                    return Err(anyhow!(
-                        "Canton ledger evidence belongs to another operation"
-                    ));
-                }
-                if text.contains("cannot be read") {
-                    return Err(anyhow!("Canton ledger evidence cannot be read: {err}"));
-                }
-                Ok(CantonLedgerEvidence::default())
-            }
-        }
+        );
+        completion_from_acs_and_history(&acs, history, expected)
     }
 
     pub fn redeem(
@@ -343,6 +267,67 @@ pub struct CantonLedgerEvidence {
     pub payment_admin: String,
     pub treasury_instrument: String,
     pub treasury_admin: String,
+    pub trade_cid: String,
+}
+
+pub fn completion_from_acs_and_history(
+    acs: &str,
+    history: Result<String>,
+    expected: &CantonLedgerExpectation,
+) -> Result<CantonLedgerEvidence> {
+    let history_text = match history {
+        Ok(stdout) => stdout,
+        Err(err) => {
+            let text = err.to_string();
+            if text.contains("CANTON_HISTORY_OTHER_LOCK") || text.contains("another operation") {
+                return Err(anyhow!(
+                    "Canton ledger evidence belongs to another operation"
+                ));
+            }
+            if text.contains("CANTON_VERIFY_UNREADABLE") {
+                return Err(anyhow!("Canton ledger evidence cannot be read: {err}"));
+            }
+            if text.contains("CANTON_VERIFY_FAIL") || text.contains("missing") {
+                text
+            } else {
+                return Err(anyhow!("Canton ledger evidence cannot be read: {err}"));
+            }
+        }
+    };
+    let combined = format!("{acs}\n{history_text}");
+    if combined.contains("CANTON_VERIFY_UNREADABLE") {
+        return Err(anyhow!("Canton ledger evidence cannot be read"));
+    }
+    if combined.contains("CANTON_HISTORY_OTHER_LOCK") || combined.contains("another operation") {
+        return Err(anyhow!(
+            "Canton ledger evidence belongs to another operation"
+        ));
+    }
+    let facts = match parse_canton_history_facts(&combined) {
+        Ok(facts) => facts,
+        Err(err) => return Err(anyhow!("Canton ledger evidence cannot be read: {err}")),
+    };
+    if facts.is_empty() {
+        if combined.contains("CANTON_VERIFY_FAIL") || combined.contains("missing") {
+            return Ok(CantonLedgerEvidence::default());
+        }
+        return Err(anyhow!("Canton ledger evidence cannot be read"));
+    }
+    match connect_canton_history(&facts, expected) {
+        Ok(evidence) => Ok(evidence),
+        Err(err) => {
+            let text = err.to_string();
+            if text.contains("another operation") || text.contains("not connected") {
+                return Err(anyhow!(
+                    "Canton ledger evidence belongs to another operation"
+                ));
+            }
+            if text.contains("cannot be read") {
+                return Err(anyhow!("Canton ledger evidence cannot be read: {err}"));
+            }
+            Ok(CantonLedgerEvidence::default())
+        }
+    }
 }
 
 pub fn require_canton_ledger_evidence(
@@ -380,6 +365,7 @@ pub fn require_canton_ledger_evidence(
         || evidence.payment_admin.is_empty()
         || evidence.treasury_instrument.is_empty()
         || evidence.treasury_admin.is_empty()
+        || evidence.trade_cid.is_empty()
         || !evidence.mint_consumed
         || !evidence.seller_burned
         || !evidence.settle_seen
@@ -493,6 +479,7 @@ fn parse_canton_ledger_evidence(stdout: &str) -> CantonLedgerEvidence {
             .unwrap_or_default(),
         treasury_admin: optional_marker(stdout, "CANTON_HISTORY_TREASURY_ADMIN")
             .unwrap_or_default(),
+        trade_cid: optional_marker(stdout, "CANTON_HISTORY_BINDING_TRADE").unwrap_or_default(),
     }
 }
 
@@ -652,6 +639,7 @@ mod tests {
             payment_admin: "cashRegistry::party".to_string(),
             treasury_instrument: "UST-2028-11".to_string(),
             treasury_admin: "treasuryRegistry::party".to_string(),
+            trade_cid: "trade-a".to_string(),
         }
     }
 
@@ -720,6 +708,46 @@ mod tests {
     }
 
     #[test]
+    fn acs_uniqueness_failure_does_not_block_connected_history() {
+        let facts = r#"
+CANTON_FACT {"kind":"created","template":"Bridge.Gateway:MintedLock","cid":"minted-a","updateId":"upd-mint","arguments":{"record":{"cashRegistry":{"party":"cashRegistry::party"},"lockId":{"text":"lock-a"},"holdingCid":{"cid":"holding-a"},"amount":{"numeric":"100000.000000"},"beneficiary":{"party":"buyer::party"}}}}
+CANTON_FACT {"kind":"created","template":"Stablecoin.Holding:StablecoinHolding","cid":"holding-a","updateId":"upd-mint","arguments":{"record":{"owner":{"party":"buyer::party"},"amount":{"numeric":"100000.000000"},"instrumentId":{"record":{"admin":{"party":"cashRegistry::party"},"id":{"text":"USD-C"}}}}}}
+CANTON_FACT {"kind":"created","template":"Bridge.Binding:BridgeMintRef","cid":"mint-ref-a","updateId":"upd-mint","arguments":{"record":{"cashRegistry":{"party":"cashRegistry::party"},"buyer":{"party":"buyer::party"},"lockId":{"text":"lock-a"},"mintHoldingCid":{"cid":"holding-a"}}}}
+CANTON_FACT {"kind":"created","template":"Bridge.Binding:BridgeTradeBinding","cid":"binding-a","updateId":"upd-bind","arguments":{"record":{"cashRegistry":{"party":"cashRegistry::party"},"buyer":{"party":"buyer::party"},"seller":{"party":"seller::party"},"venue":{"party":"venue::party"},"lockId":{"text":"lock-a"},"mintHoldingCid":{"cid":"holding-a"},"tradeCid":{"text":"trade-a"}}}}
+CANTON_FACT {"kind":"exercised","template":"Bridge.Gateway:BridgeGateway","choice":"Gateway_Mint","cid":"gateway","consuming":true,"updateId":"upd-mint","argument":{"record":{}},"result":{"record":{}}}
+CANTON_FACT {"kind":"exercised","template":"Bridge.Binding:BridgeMintRef","choice":"BridgeMintRef_Bind","cid":"mint-ref-a","consuming":true,"updateId":"upd-bind","argument":{"record":{"tradeCid":{"text":"trade-a"}}},"result":{"record":{}}}
+CANTON_FACT {"kind":"archived","template":"Bridge.Binding:BridgeMintRef","cid":"mint-ref-a","updateId":"upd-bind"}
+CANTON_FACT {"kind":"created","template":"Stablecoin.Allocation:StablecoinAllocation","cid":"alloc-a","updateId":"upd-alloc-a","arguments":{"record":{"lockedHoldingCid":{"cid":"locked-a"}}}}
+CANTON_FACT {"kind":"created","template":"Stablecoin.Holding:StablecoinHolding","cid":"locked-a","updateId":"upd-alloc-a","arguments":{"record":{"owner":{"party":"buyer::party"},"amount":{"numeric":"100000.000000"},"instrumentId":{"record":{"admin":{"party":"cashRegistry::party"},"id":{"text":"USD-C"}}}}}}
+CANTON_FACT {"kind":"created","template":"Treasury.Holding:TreasuryHolding","cid":"treasury-a","updateId":"upd-1","arguments":{"record":{"owner":{"party":"buyer::party"},"amount":{"numeric":"100.000000"},"instrumentId":{"record":{"admin":{"party":"treasuryRegistry::party"},"id":{"text":"UST-2028-11"}}}}}}
+CANTON_FACT {"kind":"created","template":"Stablecoin.Holding:StablecoinHolding","cid":"payment-a","updateId":"upd-1","arguments":{"record":{"owner":{"party":"seller::party"},"amount":{"numeric":"100000.000000"},"instrumentId":{"record":{"admin":{"party":"cashRegistry::party"},"id":{"text":"USD-C"}}}}}}
+CANTON_FACT {"kind":"created","template":"Bridge.Gateway:RedemptionRequest","cid":"request-a","updateId":"upd-request","arguments":{"record":{"holder":{"party":"seller::party"},"cashRegistry":{"party":"cashRegistry::party"},"lockId":{"text":"lock-a"},"holdingCid":{"cid":"payment-a"},"amount":{"numeric":"100000.000000"},"instrumentId":{"record":{"admin":{"party":"cashRegistry::party"},"id":{"text":"USD-C"}}},"payoutDestination":{"text":"dest"}}}}
+CANTON_FACT {"kind":"created","template":"Bridge.Gateway:RedeemedLock","cid":"redeem-a","updateId":"upd-redeem-a","arguments":{"record":{"cashRegistry":{"party":"cashRegistry::party"},"lockId":{"text":"lock-a"},"amount":{"numeric":"100000.000000"},"holder":{"party":"seller::party"}}}}
+CANTON_FACT {"kind":"exercised","template":"Template","choice":"AllocationFactory_Allocate","cid":"cash-rules","consuming":false,"updateId":"upd-alloc-a","argument":{"record":{"expectedAdmin":{"party":"cashRegistry::party"},"inputHoldingCids":{"list":[{"cid":"holding-a"}]},"allocation":{"record":{"transferLeg":{"record":{"sender":{"party":"buyer::party"},"receiver":{"party":"seller::party"},"amount":{"numeric":"100000.000000"},"instrumentId":{"record":{"admin":{"party":"cashRegistry::party"},"id":{"text":"USD-C"}}}}}}}}},"result":{"record":{"output":{"variant":{"tag":"AllocationInstructionResult_Completed","value":{"record":{"allocationCid":{"cid":"alloc-a"}}}}}}}}
+CANTON_FACT {"kind":"exercised","template":"Template","choice":"DvpTrade_Settle","cid":"trade-a","consuming":true,"updateId":"upd-1","argument":{"record":{"allocations":{"list":[{"record":{"transferLegId":{"text":"treasury-delivery"},"allocationCid":{"cid":"alloc-treas-a"}}},{"record":{"transferLegId":{"text":"stablecoin-payment"},"allocationCid":{"cid":"alloc-a"}}}]}}},"result":{"record":{"treasuryResult":{"record":{"receiverHoldingCids":{"list":[{"cid":"treasury-a"}]}}},"paymentResult":{"record":{"receiverHoldingCids":{"list":[{"cid":"payment-a"}]}}}}}}
+CANTON_FACT {"kind":"exercised","template":"Template","choice":"Gateway_Redeem","cid":"gateway","consuming":true,"updateId":"upd-redeem-a","argument":{"record":{"requestCid":{"cid":"request-a"},"mintedLockCid":{"cid":"minted-a"}}},"result":{"record":{}}}
+CANTON_FACT {"kind":"exercised","template":"Template","choice":"Burn","cid":"payment-a","consuming":true,"updateId":"upd-redeem-a","argument":{"record":{}},"result":{"record":{}}}
+CANTON_FACT {"kind":"archived","template":"Stablecoin.Holding:StablecoinHolding","cid":"holding-a","updateId":"upd-alloc-a"}
+CANTON_FACT {"kind":"archived","template":"Stablecoin.Holding:StablecoinHolding","cid":"locked-a","updateId":"upd-1"}
+CANTON_FACT {"kind":"archived","template":"Stablecoin.Allocation:StablecoinAllocation","cid":"alloc-a","updateId":"upd-1"}
+CANTON_FACT {"kind":"archived","template":"Stablecoin.Holding:StablecoinHolding","cid":"payment-a","updateId":"upd-redeem-a"}
+"#;
+        let acs_err = "Expected exactly one buyer treasury holding";
+        let evidence = require_canton_ledger_evidence(
+            completion_from_acs_and_history(
+                &format!("CANTON_ACS_SKIP {acs_err}"),
+                Ok(facts.to_string()),
+                &expected_completion(),
+            ),
+            &expected_completion(),
+        )
+        .unwrap();
+        assert_eq!(evidence.mint_holding, "holding-a");
+        assert!(evidence.settle_seen);
+        assert!(evidence.redeem_seen);
+    }
+
+    #[test]
     fn history_markers_are_required_for_archived_contracts() {
         let parsed = parse_canton_ledger_evidence(
             "CANTON_ACS_LOCK lock-a\nCANTON_ACS_MINT_HOLDING holding-a\nCANTON_ACS_REDEEM redeem-a\nCANTON_ACS_BUYER_TREASURY treasury-a",
@@ -729,7 +757,7 @@ mod tests {
         assert!(!parsed.settle_seen);
         assert!(require_canton_ledger_evidence(Ok(parsed), &expected_completion()).is_err());
         let parsed = parse_canton_ledger_evidence(
-            "CANTON_HISTORY_LOCK lock-a\nCANTON_HISTORY_MINT_HOLDING holding-a\nCANTON_HISTORY_MINT_CONSUMED holding-a\nCANTON_HISTORY_SETTLE upd-1\nCANTON_HISTORY_BUYER_TREASURY treasury-a\nCANTON_HISTORY_SELLER_PAYMENT payment-a\nCANTON_HISTORY_SELLER_BURN payment-a\nCANTON_HISTORY_REDEEM redeem-a\nCANTON_HISTORY_PAYOUT dest\nCANTON_HISTORY_PAYMENT_AMOUNT 100000.000000\nCANTON_HISTORY_TREASURY_AMOUNT 100.000000\nCANTON_HISTORY_INSTRUMENT USD-C\nCANTON_HISTORY_PAYMENT_ALLOCATION alloc-a\nCANTON_HISTORY_PAYMENT_LOCKED locked-a\nCANTON_HISTORY_ALLOCATE upd-alloc-a\nCANTON_HISTORY_REDEEM_UPDATE upd-redeem-a\nCANTON_HISTORY_BUYER buyer::party\nCANTON_HISTORY_SELLER seller::party\nCANTON_HISTORY_PAYMENT_ADMIN cashRegistry::party\nCANTON_HISTORY_TREASURY_INSTRUMENT UST-2028-11\nCANTON_HISTORY_TREASURY_ADMIN treasuryRegistry::party",
+            "CANTON_HISTORY_LOCK lock-a\nCANTON_HISTORY_MINT_HOLDING holding-a\nCANTON_HISTORY_MINT_CONSUMED holding-a\nCANTON_HISTORY_SETTLE upd-1\nCANTON_HISTORY_BUYER_TREASURY treasury-a\nCANTON_HISTORY_SELLER_PAYMENT payment-a\nCANTON_HISTORY_SELLER_BURN payment-a\nCANTON_HISTORY_REDEEM redeem-a\nCANTON_HISTORY_PAYOUT dest\nCANTON_HISTORY_PAYMENT_AMOUNT 100000.000000\nCANTON_HISTORY_TREASURY_AMOUNT 100.000000\nCANTON_HISTORY_INSTRUMENT USD-C\nCANTON_HISTORY_PAYMENT_ALLOCATION alloc-a\nCANTON_HISTORY_PAYMENT_LOCKED locked-a\nCANTON_HISTORY_ALLOCATE upd-alloc-a\nCANTON_HISTORY_REDEEM_UPDATE upd-redeem-a\nCANTON_HISTORY_BUYER buyer::party\nCANTON_HISTORY_SELLER seller::party\nCANTON_HISTORY_PAYMENT_ADMIN cashRegistry::party\nCANTON_HISTORY_TREASURY_INSTRUMENT UST-2028-11\nCANTON_HISTORY_TREASURY_ADMIN treasuryRegistry::party\nCANTON_HISTORY_BINDING_TRADE trade-a",
         );
         require_canton_ledger_evidence(Ok(parsed), &expected_completion()).unwrap();
     }

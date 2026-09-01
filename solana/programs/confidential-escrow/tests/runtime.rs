@@ -138,12 +138,10 @@ struct Harness {
     ctx: ProgramTestContext,
     attester_a: [u8; 32],
     attester_b: [u8; 32],
-    attester_a_pk: Pubkey,
     chain_id: [u8; 32],
     operation: [u8; 32],
     destination: Pubkey,
     mint: Pubkey,
-    vault: Pubkey,
     amount_commitment: [u8; 32],
     reservation: [u8; 32],
     previous: [u8; 32],
@@ -202,12 +200,10 @@ async fn start_harness(status: u8, mint_expiry: i64) -> Harness {
         ctx,
         attester_a,
         attester_b,
-        attester_a_pk,
         chain_id,
         operation,
         destination,
         mint,
-        vault,
         amount_commitment,
         reservation,
         previous,
@@ -341,6 +337,66 @@ async fn fresh_release_approval_is_allowed_after_mint_deadline() {
     assert_eq!(approval.expiry, 3_000);
     assert_eq!(approval.distinct_signers(), 2);
     assert!(!approval.consumed);
+}
+
+#[tokio::test]
+async fn unexpired_approval_rejects_a_changed_digest() {
+    let mut h = start_harness(RECEIPT_MINT_AUTHORIZED, 2_000).await;
+    set_clock(&mut h.ctx, 1_000);
+    let args = ApproveArgs {
+        operation: h.operation,
+        direction: DIRECTION_RELEASE,
+        destination: h.destination,
+        amount_commitment: h.amount_commitment,
+        zama_reservation: h.reservation,
+        previous_operation: h.previous,
+        expiry: 1_500,
+        proof_commitment: h.proof,
+    };
+    let a = h.attester_a;
+    approve(&mut h, &a, &args).await.unwrap();
+    let changed = ApproveArgs {
+        expiry: 4_000,
+        proof_commitment: [11u8; 32],
+        ..args
+    };
+    let err = approve(&mut h, &a, &changed).await.unwrap_err();
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("0x1780") || text.contains("Custom"),
+        "changing the digest under a live approval must fail: {text}"
+    );
+    let approval = read_approval(&mut h, DIRECTION_RELEASE).await;
+    assert_eq!(approval.expiry, 1_500);
+    assert_eq!(approval.distinct_signers(), 1);
+}
+
+#[tokio::test]
+async fn chain_time_equal_to_expiry_allows_replacement() {
+    let mut h = start_harness(RECEIPT_MINT_AUTHORIZED, 1_500).await;
+    set_clock(&mut h.ctx, 1_000);
+    let args = ApproveArgs {
+        operation: h.operation,
+        direction: DIRECTION_RELEASE,
+        destination: h.destination,
+        amount_commitment: h.amount_commitment,
+        zama_reservation: h.reservation,
+        previous_operation: h.previous,
+        expiry: 1_200,
+        proof_commitment: h.proof,
+    };
+    let a = h.attester_a;
+    approve(&mut h, &a, &args).await.unwrap();
+    set_clock(&mut h.ctx, 1_200);
+    let refreshed = ApproveArgs {
+        expiry: 4_000,
+        proof_commitment: [12u8; 32],
+        ..args.clone()
+    };
+    approve(&mut h, &a, &refreshed).await.unwrap();
+    let approval = read_approval(&mut h, DIRECTION_RELEASE).await;
+    assert_eq!(approval.expiry, 4_000);
+    assert_eq!(approval.distinct_signers(), 1);
 }
 
 #[tokio::test]
@@ -498,6 +554,64 @@ async fn release_without_threshold_and_failed_cpi_leave_receipt_unmoved() {
     assert_eq!(receipt.status, RECEIPT_MINT_AUTHORIZED);
     let approval = read_approval(&mut h, DIRECTION_RELEASE).await;
     assert!(!approval.consumed);
+}
+
+#[tokio::test]
+async fn conflicting_attestation_does_not_count_and_quorum_can_recover() {
+    let mut h = start_harness(RECEIPT_LOCKED, 2_000).await;
+    set_clock(&mut h.ctx, 1_000);
+    let args = mint_args(&h);
+    let a = h.attester_a;
+    let b = h.attester_b;
+    approve(&mut h, &a, &args).await.unwrap();
+    let conflicting = ApproveArgs {
+        proof_commitment: [99u8; 32],
+        ..args.clone()
+    };
+    assert!(approve(&mut h, &b, &conflicting).await.is_err());
+    let approval = read_approval(&mut h, DIRECTION_MINT).await;
+    assert_eq!(approval.distinct_signers(), 1);
+    let receipt = read_receipt(&mut h).await;
+    assert_eq!(receipt.status, RECEIPT_LOCKED);
+    approve(&mut h, &b, &args).await.unwrap();
+    let recovered = read_approval(&mut h, DIRECTION_MINT).await;
+    assert_eq!(recovered.distinct_signers(), 2);
+    let receipt = read_receipt(&mut h).await;
+    assert_eq!(receipt.status, RECEIPT_MINT_AUTHORIZED);
+}
+
+#[tokio::test]
+async fn cancel_remains_available_when_quorum_is_missing() {
+    let mut h = start_harness(RECEIPT_LOCKED, 2_000).await;
+    set_clock(&mut h.ctx, 1_000);
+    let mint = mint_args(&h);
+    let a = h.attester_a;
+    let b = h.attester_b;
+    approve(&mut h, &a, &mint).await.unwrap();
+    let conflicting = ApproveArgs {
+        proof_commitment: [99u8; 32],
+        ..mint.clone()
+    };
+    assert!(approve(&mut h, &b, &conflicting).await.is_err());
+    let receipt = read_receipt(&mut h).await;
+    assert_eq!(receipt.status, RECEIPT_LOCKED);
+    let cancel = ApproveArgs {
+        operation: h.operation,
+        direction: DIRECTION_CANCEL,
+        destination: h.destination,
+        amount_commitment: h.amount_commitment,
+        zama_reservation: h.reservation,
+        previous_operation: h.previous,
+        expiry: 2_500,
+        proof_commitment: [0u8; 32],
+    };
+    approve(&mut h, &a, &cancel).await.unwrap();
+    approve(&mut h, &b, &cancel).await.unwrap();
+    let approval = read_approval(&mut h, DIRECTION_CANCEL).await;
+    assert_eq!(approval.distinct_signers(), 2);
+    assert!(!approval.consumed);
+    let receipt = read_receipt(&mut h).await;
+    assert_eq!(receipt.status, RECEIPT_LOCKED);
 }
 
 #[tokio::test]

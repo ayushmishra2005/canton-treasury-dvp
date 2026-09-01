@@ -4,6 +4,7 @@ import DA.Assert ((===))
 import DA.Optional (isNone)
 import Daml.Script
 
+import Bridge.Binding
 import Bridge.Gateway
 import Bridge.Types
 import Stablecoin.Holding
@@ -24,7 +25,16 @@ twoAttestersMintOrdinaryHolding = do
     [(_, minted)] -> do
       minted.amount === 100000.0
       minted.beneficiary === fixture.holder
+      minted.holdingCid === holdingCid
     _ -> abort "expected one minted lock"
+  refs <- query @BridgeMintRef fixture.holder
+  case refs of
+    [(_, ref)] -> do
+      ref.cashRegistry === fixture.cashRegistry
+      ref.buyer === fixture.holder
+      ref.lockId === "lock-1"
+      ref.mintHoldingCid === holdingCid
+    _ -> abort "expected one gateway mint reference"
 
 sameLockCannotMintTwiceWithChangedDigest : Script ()
 sameLockCannotMintTwiceWithChangedDigest = do

@@ -1,0 +1,152 @@
+import com.daml.ledger.api.v2.commands.{Command, ExerciseCommand}
+import com.daml.ledger.api.v2.value.{Identifier, Record, RecordField, Value}
+import com.digitalasset.canton.admin.api.client.commands.LedgerApiTypeWrappers
+import com.digitalasset.canton.admin.api.client.commands.LedgerApiTypeWrappers.WrappedContractEntry
+import com.digitalasset.daml.lf.value.Value.ContractId
+import com.digitalasset.canton.console.RemoteParticipantReference
+import com.digitalasset.canton.topology.{PartyId, SynchronizerId}
+import java.nio.file.{Files, Paths}
+
+val settlementAlias = "settlement-sync"
+val treasuryAlias = "treasury-sync"
+
+val pTreasury = participants.remote.find(_.name == "p-treasury").getOrElse(sys.error("missing p-treasury"))
+val pSeller = participants.remote.find(_.name == "p-seller").getOrElse(sys.error("missing p-seller"))
+
+def synchronizerIdOf(alias: String): SynchronizerId =
+  pTreasury.synchronizers
+    .list_connected()
+    .find(_.synchronizerAlias.unwrap == alias)
+    .getOrElse(sys.error(s"p-treasury is not connected to $alias"))
+    .synchronizerId
+
+val treasurySynchronizerId = synchronizerIdOf(treasuryAlias)
+val settlementSynchronizerId = synchronizerIdOf(settlementAlias)
+
+def partyOf(node: RemoteParticipantReference, hint: String): PartyId =
+  node.parties
+    .hosted()
+    .map(_.party)
+    .find(_.filterString.startsWith(hint + "::"))
+    .getOrElse(sys.error(s"party $hint is not hosted on ${node.name}"))
+
+val treasuryRegistry = partyOf(pTreasury, "treasuryRegistry")
+val seller = partyOf(pSeller, "seller")
+
+val runDir = Paths.get(sys.env.getOrElse("CANTON_RUN_DIR", "canton/.run-bridge"))
+val originationLines = Files.readString(runDir.resolve("origination.txt")).split("\n").toSeq
+def originationValue(key: String): String =
+  originationLines
+    .find(_.startsWith(key + "="))
+    .map(_.drop(key.length + 1))
+    .getOrElse(sys.error(s"origination.txt is missing $key"))
+
+val instrumentCid = originationValue("instrument")
+val reservedHoldingCid = originationValue("holding")
+
+val instrumentTemplate = Identifier("#treasury-registry", "Treasury.Instrument", "TreasuryInstrument")
+
+def partyValue(party: PartyId) = Value(Value.Sum.Party(party.toProtoPrimitive))
+def numericValue(number: String) = Value(Value.Sum.Numeric(number))
+def recordValue(fields: Seq[(String, Value)]) =
+  Record(fields = fields.map { case (name, value) => RecordField(name, Some(value)) })
+
+def issueHolding(): String = {
+  val issue = Command.defaultInstance.withExercise(
+    ExerciseCommand(
+      templateId = Some(instrumentTemplate),
+      contractId = instrumentCid,
+      choice = "Issue",
+      choiceArgument = Some(
+        Value(
+          Value.Sum.Record(
+            recordValue(Seq("owner" -> partyValue(seller), "amount" -> numericValue("100.0000000000")))
+          )
+        )
+      ),
+    )
+  )
+  val tx = pTreasury.ledger_api.commands.submit(
+    actAs = Seq(treasuryRegistry),
+    commands = Seq(issue),
+    synchronizerId = Some(treasurySynchronizerId),
+  )
+  tx.events
+    .flatMap(_.event.created)
+    .find(_.templateId.exists(_.entityName == "TreasuryHolding"))
+    .getOrElse(sys.error("isolation treasury holding was not created"))
+    .contractId
+}
+
+def acsOf(node: RemoteParticipantReference, party: PartyId): Seq[WrappedContractEntry] =
+  node.ledger_api.state.acs.of_party(party = party, limit = PositiveInt.tryCreate(1000))
+    .filter(_.entry.isActiveContract)
+
+def synchronizerOf(entry: WrappedContractEntry): String =
+  entry.synchronizerId.map(_.toProtoPrimitive).getOrElse("")
+
+def holdingEntry(contractId: String): WrappedContractEntry =
+  acsOf(pSeller, seller)
+    .find(_.contractId == contractId)
+    .getOrElse(sys.error(s"treasury holding $contractId is not active for the seller"))
+
+def eventually(label: String)(condition: => Boolean): Unit = {
+  val deadline = System.currentTimeMillis() + 60000
+  while (!condition && System.currentTimeMillis() < deadline) Thread.sleep(250)
+  if (!condition) sys.error(s"timed out waiting for $label")
+}
+
+def reassignHolding(holdingCid: String): Unit = {
+  if (holdingCid == reservedHoldingCid)
+    sys.error("isolation must not reassign the reserved origination holding")
+  val sourceEntry = holdingEntry(holdingCid)
+  if (synchronizerOf(sourceEntry) != treasurySynchronizerId.toProtoPrimitive)
+    sys.error(s"isolation holding $holdingCid must start on $treasuryAlias")
+  val counterBefore = sourceEntry.reassignmentCounter
+  val payloadBefore = sourceEntry.event.createArguments
+  println(s"ISO_REASSIGN_SOURCE $holdingCid counter=$counterBefore")
+  val unassigned = pSeller.ledger_api.commands.submit_unassign(
+    submitter = seller,
+    contractIds = Seq(ContractId.assertFromString(holdingCid)),
+    source = treasurySynchronizerId,
+    target = settlementSynchronizerId,
+  )
+  val reassignmentId = unassigned.reassignmentId
+  eventually(s"$holdingCid to leave $treasuryAlias")(
+    acsOf(pSeller, seller).forall(_.contractId != holdingCid)
+  )
+  val assigned = pSeller.ledger_api.commands.submit_assign(
+    submitter = seller,
+    reassignmentId = reassignmentId,
+    source = treasurySynchronizerId,
+    target = settlementSynchronizerId,
+  )
+  val _ = assigned
+  eventually(s"$holdingCid to become active on $settlementAlias")(
+    acsOf(pSeller, seller).exists(entry =>
+      entry.contractId == holdingCid && synchronizerOf(entry) == settlementSynchronizerId.toProtoPrimitive)
+  )
+  val targetEntry = holdingEntry(holdingCid)
+  if (targetEntry.event.createArguments != payloadBefore)
+    sys.error(s"isolation holding $holdingCid payload changed during reassignment")
+  if (targetEntry.reassignmentCounter != counterBefore + 1)
+    sys.error(s"isolation holding $holdingCid counter moved from $counterBefore")
+  println(s"ISO_REASSIGN_TARGET $holdingCid synchronizer=${synchronizerOf(targetEntry)}")
+}
+
+val holdingA = issueHolding()
+val holdingB = issueHolding()
+if (holdingA == holdingB || holdingA == reservedHoldingCid || holdingB == reservedHoldingCid)
+  sys.error("isolation holdings must be distinct from each other and from origination")
+println(s"ISO_HOLDING_A $holdingA")
+println(s"ISO_HOLDING_B $holdingB")
+reassignHolding(holdingA)
+reassignHolding(holdingB)
+if (synchronizerOf(holdingEntry(reservedHoldingCid)) != treasurySynchronizerId.toProtoPrimitive)
+  sys.error("origination holding left treasury-sync during isolation setup")
+
+Files.write(
+  runDir.resolve("isolation-holdings.txt"),
+  Seq(s"holdingA=$holdingA", s"holdingB=$holdingB", s"reserved=$reservedHoldingCid").mkString("\n").getBytes("UTF-8"),
+)
+println("ISO_HOLDINGS_READY")

@@ -1,0 +1,86 @@
+module Tests.Bridge.LiveIsolation where
+
+import DA.Assert ((===))
+import DA.Optional (isNone)
+import DA.Text qualified as Text
+import Daml.Script
+
+import Tests.Bridge.Runtime
+import Treasury.Holding (TreasuryHolding)
+
+twoLiveOperations : RuntimeInput -> Script Text
+twoLiveOperations input = do
+  live <- lookupLive input
+  now <- getTime
+  unlockedBefore <- unlockedSellerTreasuries live
+  length unlockedBefore === 3
+  let inputA = RuntimeInput with
+        lockId = "lock-iso-a"
+        amount = "100000.000000"
+        digestHex = "digest-iso-a"
+        payoutDestination = "dest-iso-a"
+      inputB = RuntimeInput with
+        lockId = "lock-iso-b"
+        amount = "100000.000000"
+        digestHex = "digest-iso-b"
+        payoutDestination = "dest-iso-b"
+  mintA <- mint inputA
+  mintB <- mint inputB
+  tradeA <- prepareTrade inputA
+  tradeB <- prepareTrade inputB
+  (tradeA /= tradeB) === True
+  (mintA /= mintB) === True
+  found <- tradesMatchingPartiesAndAmount live 100000.0
+  length found === 2
+  broad <- broadTradeLookup live 100000.0
+  broad === BroadMany with count = 2
+  bindingsA <- bindingsForLock live inputA.lockId
+  bindingsB <- bindingsForLock live inputB.lockId
+  (bindingTradeA, mintHoldingA) <- case bindingsA of
+    [(_, binding)] -> pure (binding.tradeCid, binding.mintHoldingCid)
+    _ -> abort "live lock A missing binding"
+  (bindingTradeB, mintHoldingB) <- case bindingsB of
+    [(_, binding)] -> pure (binding.tradeCid, binding.mintHoldingCid)
+    _ -> abort "live lock B missing binding"
+  (bindingTradeA /= bindingTradeB) === True
+  (mintHoldingA /= mintHoldingB) === True
+  Text.isInfixOf bindingTradeA tradeA === True
+  Text.isInfixOf bindingTradeB tradeB === True
+  now2 <- getTime
+  decisionA <- decideSettle live 100000.0 inputA.lockId now2
+  decisionB <- decideSettle live 100000.0 inputB.lockId now2
+  case (decisionA, decisionB) of
+    (ResumeSettle cidA _, ResumeSettle cidB _) -> (cidA /= cidB) === True
+    _ -> abort "live operations did not resume their bound trades"
+  settledA <- settleFromLedger live inputA
+  mintedBStill <- queryContractId live.buyer mintHoldingB
+  case mintedBStill of
+    Some _ -> pure ()
+    None -> abort "completing A consumed B's mint"
+  settledB <- settleFromLedger live inputB
+  Text.isInfixOf (show mintHoldingA) settledA === True
+  Text.isInfixOf (show mintHoldingB) settledB === True
+  Text.isInfixOf (show mintHoldingB) settledA === False
+  Text.isInfixOf (show mintHoldingA) settledB === False
+  secondA <- settleFromLedger live inputA
+  secondB <- settleFromLedger live inputB
+  secondA === settledA
+  secondB === settledB
+  redeemA <- redeemFromLedger live inputA
+  redeemB <- redeemFromLedger live inputB
+  againA <- redeemFromLedger live inputA
+  againB <- redeemFromLedger live inputB
+  againA === redeemA
+  againB === redeemB
+  buyerTreasuries <- query @TreasuryHolding live.buyer
+  length [cid | (cid, holding) <- buyerTreasuries, holding.amount == 100.0, isNone holding.lock] === 2
+  debug "LIVE_ISOLATION_BROAD_LOOKUP 2"
+  debug ("LIVE_ISOLATION_BINDING_A " <> bindingTradeA)
+  debug ("LIVE_ISOLATION_BINDING_B " <> bindingTradeB)
+  debug ("LIVE_ISOLATION_MINT_A " <> show mintHoldingA)
+  debug ("LIVE_ISOLATION_MINT_B " <> show mintHoldingB)
+  debug "LIVE_ISOLATION_OK"
+  let _ = now
+  let _ = mintA
+  let _ = mintB
+  pure "LIVE_ISOLATION_OK"

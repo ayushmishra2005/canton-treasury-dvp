@@ -26,10 +26,10 @@ use crate::program::{
     MovementFields,
 };
 use crate::recovery::{
-    attesters_needed, completed_operation_decision, decode_approval, decode_receipt_status,
-    should_apply_pending, should_refresh_release_materials, should_submit_release,
-    CompletionDecision, OnChainApproval, RECEIPT_CANCELLED, RECEIPT_MINT_AUTHORIZED,
-    RECEIPT_RELEASED,
+    approval_expired_on_chain, attesters_needed, completed_operation_decision, decode_approval,
+    decode_chain_clock, decode_receipt_status, should_apply_pending,
+    should_refresh_release_materials, should_submit_release, CompletionDecision, OnChainApproval,
+    RECEIPT_CANCELLED, RECEIPT_MINT_AUTHORIZED, RECEIPT_RELEASED,
 };
 use crate::relayer::{RelayerClient, RelayerInstruction};
 use crate::reservation::{
@@ -61,6 +61,7 @@ pub struct Workflow {
     pub reuse_from: Option<PathBuf>,
     pub omit_journal_save: bool,
     pub halt_after_first_approval: bool,
+    pub inject_attester_disagreement: bool,
 }
 
 impl Workflow {
@@ -130,7 +131,7 @@ impl Workflow {
         let reservation = operation;
         let previous = [0u8; 32];
         let mint_expiry = if journal.mint_expiry == 0 {
-            mint_deadline_from_env()
+            self.mint_deadline()?
         } else {
             journal.mint_expiry
         };
@@ -247,6 +248,25 @@ impl Workflow {
         if self.halt_after_first_approval {
             return Ok(());
         }
+        if self.inject_attester_disagreement {
+            self.mark_fault_injected(&mut journal, "attester_disagreement", amount)?;
+            if let Some(approval) =
+                self.read_approval(&approval_pda(&operation, DIRECTION_MINT).0)?
+            {
+                anyhow::ensure!(
+                    approval.signer_bitmap.count_ones() < 2,
+                    "conflicting attestation must not reach quorum"
+                );
+                println!("MINT_APPROVAL_BITMAP {}", approval.signer_bitmap);
+            }
+            println!("RECOVERY_RESULT no_mint_without_quorum");
+            println!("TERMINAL_STATE locked_awaiting_quorum");
+            println!("ACTION_COUNTS mint=0 settle=0 burn=0 release=0 zama=0");
+            return Ok(());
+        }
+        if !journal.reached(Step::MintApproved) {
+            self.note_fault_recovered(&mut journal)?;
+        }
         if self.halt(Step::MintApproved, &mut journal)? {
             return Ok(());
         }
@@ -297,42 +317,43 @@ impl Workflow {
             if self.halt(Step::Reassigned, &mut journal)? {
                 return Ok(());
             }
-            if !journal.reached(Step::Settled) {
-                let settled =
-                    self.canton
-                        .settle(&lock_id, &canton_amount, &hex::encode(mint_digest))?;
-                anyhow::ensure!(
-                    settled.payment_amount.contains("100000"),
-                    "seller stablecoin amount"
-                );
-                anyhow::ensure!(
-                    settled.treasury_amount.contains("100"),
-                    "buyer treasury amount"
-                );
-                journal.seller_holding = settled.seller_stablecoin.clone();
-                journal.buyer_treasury = settled.buyer_treasury.clone();
+            let settled =
+                self.canton
+                    .settle(&lock_id, &canton_amount, &hex::encode(mint_digest))?;
+            anyhow::ensure!(
+                settled.payment_amount.contains("100000"),
+                "seller stablecoin amount"
+            );
+            anyhow::ensure!(
+                settled.treasury_amount.contains("100"),
+                "buyer treasury amount"
+            );
+            journal.seller_holding = settled.seller_stablecoin.clone();
+            journal.buyer_treasury = settled.buyer_treasury.clone();
+            if !self.omit_journal_save {
                 self.store.save_journal(&journal)?;
-                println!("DVP_BUYER_TREASURY {}", settled.buyer_treasury);
-                println!("DVP_SELLER_STABLECOIN {}", settled.seller_stablecoin);
-                println!("DVP_PAYMENT_AMOUNT {}", settled.payment_amount);
-                println!("DVP_TREASURY_AMOUNT {}", settled.treasury_amount);
-                if let Some(consumed) = settled.consumed_payment {
-                    println!("DVP_CONSUMED_PAYMENT {consumed}");
-                }
+            }
+            println!("DVP_BUYER_TREASURY {}", settled.buyer_treasury);
+            println!("DVP_SELLER_STABLECOIN {}", settled.seller_stablecoin);
+            println!("DVP_PAYMENT_AMOUNT {}", settled.payment_amount);
+            println!("DVP_TREASURY_AMOUNT {}", settled.treasury_amount);
+            if let Some(consumed) = settled.consumed_payment {
+                println!("DVP_CONSUMED_PAYMENT {consumed}");
             }
             if self.halt(Step::Settled, &mut journal)? {
                 return Ok(());
             }
-            if !journal.reached(Step::Redeemed) {
-                let redeemed = self.canton.redeem(
-                    &lock_id,
-                    &canton_amount,
-                    &hex::encode(mint_digest),
-                    &accounts.destination.token.to_string(),
-                )?;
-                println!("CANTON_REDEEM {redeemed}");
-            }
+            let redeemed = self.canton.redeem(
+                &lock_id,
+                &canton_amount,
+                &hex::encode(mint_digest),
+                &accounts.destination.token.to_string(),
+            )?;
+            println!("CANTON_REDEEM {redeemed}");
             if self.halt(Step::Redeemed, &mut journal)? {
+                self.mark_fault_injected(&mut journal, "delayed_release_after_redemption", amount)?;
+                println!("TERMINAL_STATE canton_redeemed_solana_locked");
+                println!("ACTION_COUNTS mint=1 settle=1 burn=1 release=0 zama=0");
                 return Ok(());
             }
         }
@@ -375,7 +396,7 @@ impl Workflow {
             }
         }
         anyhow::ensure!(
-            !config_is_initialized(&self.rpc).unwrap_or(false) || journal.mint.is_empty(),
+            !config_is_initialized(&self.rpc)? || journal.mint.is_empty(),
             "bridge config already exists; resume the recorded journal"
         );
         let accounts = create_bridge_accounts(
@@ -401,7 +422,7 @@ impl Workflow {
         journal.decimals = DECIMALS;
         journal.base_units = amount;
         journal.canton_amount = TokenUnits::from_base_units(amount, DECIMALS)?.canton_decimal()?;
-        journal.mint_expiry = mint_deadline_from_env();
+        journal.mint_expiry = self.mint_deadline()?;
         let secrets = Secrets {
             payer: encode_keypair(&self.payer),
             attester_a: encode_keypair(&self.attester_a),
@@ -446,7 +467,7 @@ impl Workflow {
             decimals: prior_journal.decimals,
             base_units: amount,
             canton_amount: TokenUnits::from_base_units(amount, DECIMALS)?.canton_decimal()?,
-            mint_expiry: mint_deadline_from_env(),
+            mint_expiry: self.mint_deadline()?,
             ..Journal::default()
         };
         let mut operation = [0u8; 32];
@@ -585,6 +606,7 @@ impl Workflow {
         println!("CANTON_VERIFY_TREASURY_ADMIN {}", evidence.treasury_admin);
         println!("CANTON_VERIFY_BUYER {}", evidence.buyer);
         println!("CANTON_VERIFY_SELLER {}", evidence.seller);
+        println!("CANTON_VERIFY_BINDING_TRADE {}", evidence.trade_cid);
         println!("CANTON_VERIFY_OK");
         let decision = completed_operation_decision(
             self.zama.status(reservation_hex),
@@ -749,17 +771,43 @@ impl Workflow {
                 "receipt was cancelled; release is not allowed"
             );
         }
-        let now = chrono::Utc::now().timestamp();
-        if should_refresh_release_materials(now, journal.release_expiry, receipt_status) {
+        let chain_now = self.chain_unix_timestamp()?;
+        println!("CHAIN_CLOCK {chain_now}");
+        let (approval_pda, _) = approval_pda(&operation, DIRECTION_RELEASE);
+        let on_chain = self.read_approval(&approval_pda)?;
+        if let Some(approval) = &on_chain {
+            println!("RELEASE_ONCHAIN_EXPIRY {}", approval.expiry);
+            println!("RELEASE_ONCHAIN_CONSUMED {}", approval.consumed);
+        }
+        if should_refresh_release_materials(
+            chain_now,
+            on_chain.as_ref(),
+            journal.release_expiry,
+            receipt_status,
+        ) {
+            println!("FAULT_INJECTED expiry_after_settlement");
+            println!("LOCKED_VALUE {amount}");
+            println!("LOCKED_STATE solana_vault");
+            if let Some(approval) = &on_chain {
+                println!(
+                    "RECOVERY_DURATION_CHAIN_SECS {}",
+                    chain_now.saturating_sub(approval.expiry)
+                );
+            }
+            println!("RELEASE_REFRESHED_AFTER_CHAIN_EXPIRY");
             journal.release_expiry = 0;
             journal.release_proof_hex.clear();
             journal.release_transfer_hex.clear();
             journal.release_equality.clear();
             journal.release_validity.clear();
             journal.release_range.clear();
+        } else if on_chain.as_ref().is_some_and(|approval| {
+            !approval.consumed && !approval_expired_on_chain(approval.expiry, chain_now)
+        }) {
+            println!("RELEASE_REUSING_ONCHAIN_APPROVAL");
         }
         if should_submit_release(journal.reached(Step::Released), receipt_status) {
-            let materials = self.release_materials(accounts, amount, journal)?;
+            let materials = self.release_materials(accounts, amount, chain_now, journal)?;
             let approval_expiry = materials.expiry;
             let release_proof = materials.proof;
             let transfer_data = materials.transfer_data;
@@ -836,6 +884,10 @@ impl Workflow {
             journal.release_signature = release_sig.clone();
             self.inspect_public_leak(&release, amount)?;
             println!("RELAYER_RELEASE_CONFIRMED {release_sig}");
+            self.note_fault_recovered(journal)?;
+            println!("RECOVERY_RESULT released");
+            println!("TERMINAL_STATE released");
+            println!("ACTION_COUNTS mint=1 settle=1 burn=1 release=1 zama=0");
             if let Some(status) = self.read_receipt_status(receipt)? {
                 println!("RECEIPT_STATUS {status}");
                 anyhow::ensure!(
@@ -888,6 +940,9 @@ impl Workflow {
                 Err(err) => return Err(err),
             }
             println!("ZAMA_REDEEM_OK {reservation_hex}");
+            println!("RECOVERY_RESULT zama_redeemed");
+            println!("TERMINAL_STATE zama_redeemed");
+            println!("ACTION_COUNTS mint=1 settle=1 burn=1 release=1 zama=1");
         }
         let _ = self.halt(Step::ZamaRedeemed, journal)?;
         Ok(())
@@ -897,6 +952,7 @@ impl Workflow {
         &self,
         accounts: &BridgeAccounts,
         amount: u64,
+        chain_now: i64,
         journal: &mut Journal,
     ) -> Result<ReleaseMaterials> {
         if journal.release_expiry > 0 && !journal.release_transfer_hex.is_empty() {
@@ -926,7 +982,7 @@ impl Workflow {
             &release_proofs.validity.pubkey(),
             &release_proofs.range.pubkey(),
         );
-        journal.release_expiry = chrono::Utc::now().timestamp() + release_deadline_secs();
+        journal.release_expiry = chain_now + release_deadline_secs();
         journal.release_proof_hex = hex::encode(release_proof);
         journal.release_transfer_hex = hex::encode(release_proofs.transfer_data);
         journal.release_equality = release_proofs.equality.pubkey().to_string();
@@ -973,10 +1029,17 @@ impl Workflow {
             mint_expiry,
             journal,
         )?;
-        let now = chrono::Utc::now().timestamp();
-        if now < mint_expiry {
-            std::thread::sleep(Duration::from_secs((mint_expiry - now + 1) as u64));
-        }
+        let chain_before = self.chain_unix_timestamp()?;
+        println!("FAULT_INJECTED expiry_before_settlement");
+        println!("LOCKED_VALUE {amount}");
+        println!("LOCKED_STATE solana_vault");
+        println!("CHAIN_CLOCK {chain_before}");
+        let chain_now = self.wait_until_chain_time(mint_expiry)?;
+        println!("CHAIN_CLOCK {chain_now}");
+        println!(
+            "RECOVERY_DURATION_CHAIN_SECS {}",
+            chain_now.saturating_sub(chain_before)
+        );
         let lock_proof = decode_proof32(&journal.lock_proof_hex).unwrap_or([0u8; 32]);
         let mint_digest = operation_digest(
             chain_id,
@@ -1013,7 +1076,8 @@ impl Workflow {
             "mint approval must fail after the original deadline"
         );
         println!("EXPIRY_RECOVERY_MINT_REJECTED");
-        let cancel_expiry = chrono::Utc::now().timestamp() + 3600;
+        let cancel_now = self.chain_unix_timestamp()?;
+        let cancel_expiry = cancel_now + 3600;
         let cancel_proofs = generate_transfer_proofs(
             &self.rpc,
             &self.payer,
@@ -1107,7 +1171,59 @@ impl Workflow {
         }
         println!("EXPIRY_RECOVERY_CANCEL_CONFIRMED {sig}");
         println!("ZAMA_CANCEL_OK {reservation_hex}");
+        println!("RECOVERY_RESULT cancelled");
+        println!("TERMINAL_STATE cancelled");
+        println!("ACTION_COUNTS mint=0 settle=0 burn=0 release=0 zama=1");
         println!("EXPIRY_RECOVERY_COMPLETE");
+        Ok(())
+    }
+
+    fn wait_until_chain_time(&self, expiry: i64) -> Result<i64> {
+        loop {
+            let now = self.chain_unix_timestamp()?;
+            println!("CHAIN_CLOCK {now}");
+            if approval_expired_on_chain(expiry, now) {
+                return Ok(now);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn mark_fault_injected(
+        &self,
+        journal: &mut Journal,
+        name: &str,
+        locked_value: u64,
+    ) -> Result<()> {
+        let chain_now = self.chain_unix_timestamp()?;
+        journal.fault_injected_chain_time = chain_now;
+        journal.fault_recovered_chain_time = 0;
+        if !self.omit_journal_save {
+            self.store.save_journal(journal)?;
+        }
+        println!("FAULT_INJECTED {name}");
+        println!("LOCKED_VALUE {locked_value}");
+        println!("LOCKED_STATE solana_vault");
+        println!("CHAIN_CLOCK {chain_now}");
+        println!("RECOVERY_WAIT_UNBOUNDED operator_or_quorum");
+        Ok(())
+    }
+
+    fn note_fault_recovered(&self, journal: &mut Journal) -> Result<()> {
+        if journal.fault_injected_chain_time == 0 || journal.fault_recovered_chain_time != 0 {
+            return Ok(());
+        }
+        let chain_now = self.chain_unix_timestamp()?;
+        journal.fault_recovered_chain_time = chain_now;
+        if !self.omit_journal_save {
+            self.store.save_journal(journal)?;
+        }
+        println!("CHAIN_CLOCK {chain_now}");
+        println!(
+            "RECOVERY_DURATION_CHAIN_SECS {}",
+            chain_now.saturating_sub(journal.fault_injected_chain_time)
+        );
+        println!("RECOVERY_WAIT_UNBOUNDED operator_or_quorum");
         Ok(())
     }
 
@@ -1148,12 +1264,12 @@ impl Workflow {
     ) -> Result<()> {
         let (approval, _) = approval_pda(&args.operation, args.direction);
         let existing = self.read_approval(&approval)?;
-        let now = chrono::Utc::now().timestamp();
+        let chain_now = self.chain_unix_timestamp()?;
         let needed = attesters_needed(
             existing.as_ref(),
             digest,
             args.expiry,
-            now,
+            chain_now,
             args.direction == DIRECTION_RELEASE,
         )?;
         let approve = approve_ix(*fee_payer, args)?;
@@ -1176,6 +1292,28 @@ impl Workflow {
             if self.halt_after_first_approval {
                 break;
             }
+            if self.inject_attester_disagreement {
+                let mut bad_digest = *digest;
+                bad_digest[0] ^= 0xff;
+                let conflicting = [attester_a, attester_b][1 - index];
+                let bad_ed = ed25519_approve_ix(conflicting, &bad_digest)?;
+                let bad_ix = approve_ix(*fee_payer, args)?;
+                if let Ok(bad_id) = self
+                    .relayer
+                    .send_instructions(&[to_relayer(&bad_ed), to_relayer(&bad_ix)])
+                {
+                    if let Ok(bad_sig) = self
+                        .relayer
+                        .wait_confirmed(&bad_id, Duration::from_secs(60))
+                    {
+                        anyhow::ensure!(
+                            self.confirm_on_chain(&bad_sig).is_err(),
+                            "conflicting attestation was accepted"
+                        );
+                    }
+                }
+                break;
+            }
         }
         if let Some(after) = self.read_approval(&approval)? {
             if args.direction == DIRECTION_MINT {
@@ -1183,16 +1321,28 @@ impl Workflow {
             } else {
                 println!("RELEASE_APPROVAL_BITMAP {}", after.signer_bitmap);
             }
-            if !self.halt_after_first_approval {
+            if !self.halt_after_first_approval && !self.inject_attester_disagreement {
                 anyhow::ensure!(
                     after.signer_bitmap.count_ones() >= 2,
                     "2-of-3 approval is missing"
                 );
             }
-        } else if !self.halt_after_first_approval {
+        } else if !self.halt_after_first_approval && !self.inject_attester_disagreement {
             anyhow::bail!("approval account is missing after submit");
         }
         Ok(())
+    }
+
+    fn mint_deadline(&self) -> Result<i64> {
+        Ok(self.chain_unix_timestamp()? + env_deadline_secs("BRIDGE_MINT_EXPIRY_SECS", 3600))
+    }
+
+    fn chain_unix_timestamp(&self) -> Result<i64> {
+        let account = self
+            .rpc
+            .get_account(&solana_sdk::sysvar::clock::id())
+            .context("Solana clock sysvar")?;
+        decode_chain_clock(&account.data)
     }
 
     fn read_approval(&self, approval: &Pubkey) -> Result<Option<OnChainApproval>> {
@@ -1289,10 +1439,6 @@ fn to_relayer(ix: &Instruction) -> RelayerInstruction {
             .collect(),
         data: ix.data.clone(),
     }
-}
-
-fn mint_deadline_from_env() -> i64 {
-    chrono::Utc::now().timestamp() + env_deadline_secs("BRIDGE_MINT_EXPIRY_SECS", 3600)
 }
 
 fn release_deadline_secs() -> i64 {

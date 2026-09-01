@@ -1,0 +1,471 @@
+module Tests.Bridge.CrashRecovery where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import DA.Optional (isNone)
+import DA.Text qualified as Text
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, hours, time)
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV1
+import Splice.Api.Token.AllocationRequestV1
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.MetadataV1
+
+import Bridge.Attestation
+import Bridge.Binding
+import Bridge.Gateway
+import Bridge.Types
+import Dvp.Proposal
+import Dvp.Trade
+import Stablecoin.Allocation (StablecoinAllocation(..))
+import Stablecoin.Eligibility qualified as Stablecoin
+import Stablecoin.Eligibility (StablecoinEligibility(..))
+import Stablecoin.Holding
+import Stablecoin.Instrument
+import Stablecoin.Rules qualified as Stablecoin
+import Stablecoin.Rules (StablecoinRules(..))
+import Tests.Bridge.Runtime
+import Treasury.Allocation (TreasuryAllocation(..))
+import Treasury.Eligibility qualified as Treasury
+import Treasury.Eligibility (TreasuryEligibility(..))
+import Treasury.Holding (TreasuryHolding)
+import Treasury.Instrument
+import Treasury.Rules qualified as Treasury
+import Treasury.Rules (TreasuryRules(..))
+
+data World = World with
+    live : Live
+    treasuryRulesCid : ContractId TreasuryRules
+    cashRulesCid : ContractId StablecoinRules
+    paymentHoldingCid : ContractId StablecoinHolding
+    treasuryHoldingCid : ContractId TreasuryHolding
+    tradeCid : ContractId DvpTrade
+    sellerTreasuryEligibilityCid : ContractId TreasuryEligibility
+    buyerTreasuryEligibilityCid : ContractId TreasuryEligibility
+    sellerPaymentEligibilityCid : ContractId StablecoinEligibility
+    buyerPaymentEligibilityCid : ContractId StablecoinEligibility
+
+crashInput : RuntimeInput
+crashInput = RuntimeInput with
+    lockId = "lock-crash"
+    amount = "100000.000000"
+    digestHex = "digest-crash"
+    payoutDestination = "seller-solana-dest"
+
+setupWorld : Script World
+setupWorld = do
+  setTime (time (date 2026 Jan 1) 12 0 0)
+  treasuryRegistry <- allocateParty "TreasuryRegistry"
+  cashRegistry <- allocateParty "CashRegistry"
+  venue <- allocateParty "Venue"
+  seller <- allocateParty "Seller"
+  buyer <- allocateParty "Buyer"
+  attesterA <- allocateParty "AttesterA"
+  attesterB <- allocateParty "AttesterB"
+  attesterC <- allocateParty "AttesterC"
+  now <- getTime
+  treasuryInstrumentCid <- submit treasuryRegistry $ createCmd TreasuryInstrument with
+    treasuryRegistry
+    id = "UST-2028-11"
+    description = "US Treasury Note 1.5% due 2028-11-15"
+    faceValue = 1000.0
+    maturityDate = date 2028 Nov 15
+  cashInstrumentCid <- submit cashRegistry $ createCmd StablecoinInstrument with
+    cashRegistry
+    id = "USD-C"
+    description = "Regulated USD payment stablecoin"
+  let treasuryInstrumentId = InstrumentId with admin = treasuryRegistry, id = "UST-2028-11"
+      paymentInstrumentId = InstrumentId with admin = cashRegistry, id = "USD-C"
+  treasuryRulesCid <- submit treasuryRegistry $ createCmd TreasuryRules with instrumentId = treasuryInstrumentId
+  cashRulesCid <- submit cashRegistry $ createCmd StablecoinRules with instrumentId = paymentInstrumentId
+  gatewayCid <- submit cashRegistry $ createCmd BridgeGateway with
+    cashRegistry
+    attesters = [attesterA, attesterB, attesterC]
+    instrumentCid = cashInstrumentCid
+    instrumentId = paymentInstrumentId
+    mintedLocks = []
+    redeemedLocks = []
+  firstCid <- submit attesterA $ createCmd BridgeAttestation with
+    attester = attesterA
+    cashRegistry
+    lockId = crashInput.lockId
+    amount = 100000.0
+    beneficiary = buyer
+    digestHex = crashInput.digestHex
+    direction = MintAttestation
+    instrumentId = paymentInstrumentId
+    payoutDestination = ""
+  secondCid <- submit attesterB $ createCmd BridgeAttestation with
+    attester = attesterB
+    cashRegistry
+    lockId = crashInput.lockId
+    amount = 100000.0
+    beneficiary = buyer
+    digestHex = crashInput.digestHex
+    direction = MintAttestation
+    instrumentId = paymentInstrumentId
+    payoutDestination = ""
+  (_nextGateway, paymentHoldingCid) <- submit cashRegistry $ exerciseCmd gatewayCid Gateway_Mint with firstCid, secondCid
+  currentGateways <- query @BridgeGateway cashRegistry
+  liveGatewayCid <- case currentGateways of
+    [(cid, _)] -> pure cid
+    _ -> abort "expected one bridge gateway"
+  mintRefs <- query @BridgeMintRef buyer
+  mintRefCid <- case [cid | (cid, ref) <- mintRefs, ref.lockId == crashInput.lockId, ref.mintHoldingCid == paymentHoldingCid] of
+    [cid] -> pure cid
+    [] -> abort "gateway mint did not create a mint reference"
+    _ -> abort "gateway mint created more than one mint reference"
+  treasuryHoldingCid <- submit treasuryRegistry $ exerciseCmd treasuryInstrumentCid Issue with
+    owner = seller
+    amount = 100.0
+  let allocateBefore = addRelTime now (hours 1)
+      settleBefore = addRelTime now (hours 2)
+      treasuryLeg = TransferLeg with
+        sender = seller
+        receiver = buyer
+        amount = 100.0
+        instrumentId = treasuryInstrumentId
+        meta = emptyMetadata
+      paymentLeg = TransferLeg with
+        sender = buyer
+        receiver = seller
+        amount = 100000.0
+        instrumentId = paymentInstrumentId
+        meta = emptyMetadata
+  proposalCid <- submit seller $ createCmd DvpProposal with
+    venue
+    seller
+    buyer
+    treasuryLeg
+    paymentLeg
+    requestedAt = now
+    allocateBefore
+    settleBefore
+    approvers = []
+    tradeCid = None
+  accepted <- submit seller $ exerciseCmd proposalCid DvpProposal_Accept with approver = seller
+  accepted2 <- submit buyer $ exerciseCmd accepted DvpProposal_Accept with approver = buyer
+  tradeCid <- submit venue $ exerciseCmd accepted2 DvpProposal_InitiateSettlement
+  _ <- submit buyer $ exerciseCmd mintRefCid BridgeMintRef_Bind with
+    seller
+    venue
+    tradeCid = show tradeCid
+  sellerTreasuryEligibilityCid <- submit treasuryRegistry $ createCmd TreasuryEligibility with
+    instrumentId = treasuryInstrumentId
+    investor = seller
+    status = Treasury.Eligible
+    validFrom = addRelTime now (hours (-1))
+    validUntil = addRelTime now (hours 24)
+    attestationRef = "attestation-000"
+  buyerTreasuryEligibilityCid <- submit treasuryRegistry $ createCmd TreasuryEligibility with
+    instrumentId = treasuryInstrumentId
+    investor = buyer
+    status = Treasury.Eligible
+    validFrom = addRelTime now (hours (-1))
+    validUntil = addRelTime now (hours 24)
+    attestationRef = "attestation-000"
+  sellerPaymentEligibilityCid <- submit cashRegistry $ createCmd StablecoinEligibility with
+    instrumentId = paymentInstrumentId
+    investor = seller
+    status = Stablecoin.Eligible
+    validFrom = addRelTime now (hours (-1))
+    validUntil = addRelTime now (hours 24)
+    attestationRef = "attestation-000"
+  buyerPaymentEligibilityCid <- submit cashRegistry $ createCmd StablecoinEligibility with
+    instrumentId = paymentInstrumentId
+    investor = buyer
+    status = Stablecoin.Eligible
+    validFrom = addRelTime now (hours (-1))
+    validUntil = addRelTime now (hours 24)
+    attestationRef = "attestation-000"
+  let live = Live with
+        cashRegistry
+        treasuryRegistry
+        attesterA
+        attesterB
+        attesterC
+        buyer
+        seller
+        venue
+        instrumentCid = cashInstrumentCid
+        instrumentId = paymentInstrumentId
+        gatewayCid = liveGatewayCid
+  pure World with ..
+
+legAllocation : AllocationRequestView -> Text -> Script AllocationSpecification
+legAllocation requestView transferLegId =
+  case TextMap.lookup transferLegId requestView.transferLegs of
+    Some transferLeg -> pure AllocationSpecification with
+      settlement = requestView.settlement
+      transferLegId
+      transferLeg
+    None -> abort ("missing " <> transferLegId)
+
+allocateTreasuryOnly : World -> Script (ContractId Allocation)
+allocateTreasuryOnly world = do
+  now <- getTime
+  Some sellerRequestView <- queryInterfaceContractId @AllocationRequest world.live.seller
+    (toInterfaceContractId @AllocationRequest world.tradeCid)
+  treasurySpec <- legAllocation sellerRequestView treasuryLegId
+  treasuryResult <- submit (actAs world.live.seller <> readAs world.live.treasuryRegistry) $
+    exerciseCmd (toInterfaceContractId @AllocationFactory world.treasuryRulesCid)
+      AllocationFactory_Allocate with
+        expectedAdmin = world.live.treasuryRegistry
+        allocation = treasurySpec
+        requestedAt = now
+        inputHoldingCids = [toInterfaceContractId @Holding world.treasuryHoldingCid]
+        extraArgs = ExtraArgs with
+          context = ChoiceContext with
+            values = TextMap.fromList
+              [ (Treasury.senderEligibilityKey, AV_ContractId (coerceContractId world.sellerTreasuryEligibilityCid))
+              , (Treasury.receiverEligibilityKey, AV_ContractId (coerceContractId world.buyerTreasuryEligibilityCid))
+              ]
+          meta = emptyMetadata
+  case treasuryResult.output of
+    AllocationInstructionResult_Completed cid -> pure cid
+    _ -> abort "treasury allocation failed"
+
+allocatePaymentOnly : World -> Script (ContractId Allocation)
+allocatePaymentOnly world = do
+  now <- getTime
+  Some buyerRequestView <- queryInterfaceContractId @AllocationRequest world.live.buyer
+    (toInterfaceContractId @AllocationRequest world.tradeCid)
+  paymentSpec <- legAllocation buyerRequestView paymentLegId
+  paymentResult <- submit (actAs world.live.buyer <> readAs world.live.cashRegistry) $
+    exerciseCmd (toInterfaceContractId @AllocationFactory world.cashRulesCid)
+      AllocationFactory_Allocate with
+        expectedAdmin = world.live.cashRegistry
+        allocation = paymentSpec
+        requestedAt = now
+        inputHoldingCids = [toInterfaceContractId @Holding world.paymentHoldingCid]
+        extraArgs = ExtraArgs with
+          context = ChoiceContext with
+            values = TextMap.fromList
+              [ (Stablecoin.senderEligibilityKey, AV_ContractId (coerceContractId world.buyerPaymentEligibilityCid))
+              , (Stablecoin.receiverEligibilityKey, AV_ContractId (coerceContractId world.sellerPaymentEligibilityCid))
+              ]
+          meta = emptyMetadata
+  case paymentResult.output of
+    AllocationInstructionResult_Completed cid -> pure cid
+    _ -> abort "payment allocation failed"
+
+assertSettledOutputs : World -> Script (ContractId TreasuryHolding, ContractId StablecoinHolding)
+assertSettledOutputs world = do
+  buyerTreasuries <- query @TreasuryHolding world.live.buyer
+  sellerPayments <- query @StablecoinHolding world.live.seller
+  (treasuryCid, treasury) <- case
+    [ (cid, holding)
+    | (cid, holding) <- buyerTreasuries
+    , holding.amount == 100.0
+    , isNone holding.lock
+    ] of
+    [found] -> pure found
+    _ -> abort "buyer treasury output missing"
+  (paymentCid, payment) <- case
+    [ (cid, holding)
+    | (cid, holding) <- sellerPayments
+    , holding.amount == 100000.0
+    , isNone holding.lock
+    ] of
+    [found] -> pure found
+    _ -> abort "seller stablecoin output missing"
+  treasury.owner === world.live.buyer
+  payment.owner === world.live.seller
+  tradeAfter <- queryContractId world.live.venue world.tradeCid
+  isNone tradeAfter === True
+  mintedAfter <- queryContractId world.live.buyer world.paymentHoldingCid
+  isNone mintedAfter === True
+  treasuryAfter <- queryContractId world.live.seller world.treasuryHoldingCid
+  isNone treasuryAfter === True
+  mintedLocks <- query @MintedLock world.live.cashRegistry
+  length mintedLocks === 1
+  pure (treasuryCid, paymentCid)
+
+resumeAfterTreasuryAllocationOnly : Script ()
+resumeAfterTreasuryAllocationOnly = do
+  world <- setupWorld
+  _ <- allocateTreasuryOnly world
+  treasuryAllocs <- query @TreasuryAllocation world.live.seller
+  paymentAllocs <- query @StablecoinAllocation world.live.buyer
+  length treasuryAllocs === 1
+  length paymentAllocs === 0
+  _ <- settleFromLedger world.live crashInput
+  paymentAllocsAfter <- query @StablecoinAllocation world.live.buyer
+  treasuryAllocsAfter <- query @TreasuryAllocation world.live.seller
+  length paymentAllocsAfter === 0
+  length treasuryAllocsAfter === 0
+  _ <- assertSettledOutputs world
+  trades <- query @DvpTrade world.live.venue
+  null trades === True
+
+resumeAfterBothAllocations : Script ()
+resumeAfterBothAllocations = do
+  world <- setupWorld
+  _ <- allocateTreasuryOnly world
+  _ <- allocatePaymentOnly world
+  treasuryAllocs <- query @TreasuryAllocation world.live.seller
+  paymentAllocs <- query @StablecoinAllocation world.live.buyer
+  length treasuryAllocs === 1
+  length paymentAllocs === 1
+  _ <- settleFromLedger world.live crashInput
+  _ <- assertSettledOutputs world
+  treasuryAllocsAfter <- query @TreasuryAllocation world.live.seller
+  paymentAllocsAfter <- query @StablecoinAllocation world.live.buyer
+  length treasuryAllocsAfter === 0
+  length paymentAllocsAfter === 0
+
+resumeAfterSettlementWithoutJournal : Script ()
+resumeAfterSettlementWithoutJournal = do
+  world <- setupWorld
+  _ <- allocateTreasuryOnly world
+  _ <- allocatePaymentOnly world
+  first <- settleFromLedger world.live crashInput
+  (firstTreasury, firstPayment) <- assertSettledOutputs world
+  second <- settleFromLedger world.live crashInput
+  (secondTreasury, secondPayment) <- assertSettledOutputs world
+  firstTreasury === secondTreasury
+  firstPayment === secondPayment
+  Text.isInfixOf "CANTON_SETTLE_BUYER_TREASURY" first === True
+  Text.isInfixOf "CANTON_SETTLE_BUYER_TREASURY" second === True
+  mintedLocks <- query @MintedLock world.live.cashRegistry
+  length mintedLocks === 1
+
+resumeAfterRedemptionRequestWithoutBurn : Script ()
+resumeAfterRedemptionRequestWithoutBurn = do
+  world <- setupWorld
+  _ <- allocateTreasuryOnly world
+  _ <- allocatePaymentOnly world
+  _ <- settleFromLedger world.live crashInput
+  (_treasuryCid, paymentCid) <- assertSettledOutputs world
+  requestCid <- submit world.live.seller $ createCmd RedemptionRequest with
+    holder = world.live.seller
+    cashRegistry = world.live.cashRegistry
+    lockId = crashInput.lockId
+    holdingCid = paymentCid
+    amount = 100000.0
+    digestHex = crashInput.digestHex
+    instrumentId = world.live.instrumentId
+    payoutDestination = crashInput.payoutDestination
+  requestsBefore <- query @RedemptionRequest world.live.seller
+  length requestsBefore === 1
+  redeemedBefore <- query @RedeemedLock world.live.cashRegistry
+  null redeemedBefore === True
+  _ <- redeemFromLedger world.live crashInput
+  requestsAfter <- query @RedemptionRequest world.live.seller
+  length requestsAfter === 1
+  redeemedAfter <- query @RedeemedLock world.live.cashRegistry
+  length redeemedAfter === 1
+  afterPayment <- queryContractId world.live.seller paymentCid
+  isNone afterPayment === True
+  let _ = requestCid
+  pure ()
+
+resumeAfterBurnWithoutCompletionJournal : Script ()
+resumeAfterBurnWithoutCompletionJournal = do
+  world <- setupWorld
+  _ <- allocateTreasuryOnly world
+  _ <- allocatePaymentOnly world
+  _ <- settleFromLedger world.live crashInput
+  _ <- assertSettledOutputs world
+  first <- redeemFromLedger world.live crashInput
+  redeemed <- query @RedeemedLock world.live.cashRegistry
+  length redeemed === 1
+  second <- redeemFromLedger world.live crashInput
+  redeemedAfter <- query @RedeemedLock world.live.cashRegistry
+  length redeemedAfter === 1
+  Text.isInfixOf "CANTON_REDEEM" first === True
+  Text.isInfixOf "CANTON_REDEEM" second === True
+  attestations <- query @BridgeAttestation world.live.cashRegistry
+  let redeemAttests =
+        [ cid
+        | (cid, attestation) <- attestations
+        , attestation.direction == RedeemAttestation
+        , attestation.lockId == crashInput.lockId
+        ]
+  length redeemAttests === 2
+  requests <- query @RedemptionRequest world.live.seller
+  length requests === 1
+
+expiredTradeDoesNotLoseAssets : Script ()
+expiredTradeDoesNotLoseAssets = do
+  world <- setupWorld
+  treasuryAllocationCid <- allocateTreasuryOnly world
+  paymentAllocationCid <- allocatePaymentOnly world
+  now <- getTime
+  setTime (addRelTime now (hours 3))
+  status <- inspectSettleRecovery world.live crashInput
+  Text.isPrefixOf "RECOVERY_EXPIRED_TRADE" status === True
+  Text.isInfixOf "required_action=do_not_settle" status === True
+  submitMustFail (actAs world.live.venue <> readAs world.live.seller <> readAs world.live.buyer) $
+    exerciseCmd world.tradeCid DvpTrade_Settle with
+      allocations =
+        [ SettlementAllocation with
+            transferLegId = treasuryLegId
+            allocationCid = treasuryAllocationCid
+            extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
+        , SettlementAllocation with
+            transferLegId = paymentLegId
+            allocationCid = paymentAllocationCid
+            extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
+        ]
+  _ <- submit (actAs world.live.seller <> readAs world.live.treasuryRegistry) $
+    exerciseCmd treasuryAllocationCid Allocation_Withdraw with extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
+  _ <- submit (actAs world.live.buyer <> readAs world.live.cashRegistry) $
+    exerciseCmd paymentAllocationCid Allocation_Withdraw with extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
+  sellerTreasuries <- query @TreasuryHolding world.live.seller
+  buyerPayments <- query @StablecoinHolding world.live.buyer
+  case [holding | (_, holding) <- sellerTreasuries, holding.amount == 100.0, isNone holding.lock] of
+    [_] -> pure ()
+    _ -> abort "expired trade lost the seller Treasury asset"
+  case [holding | (_, holding) <- buyerPayments, holding.amount == 100000.0, isNone holding.lock] of
+    [_] -> pure ()
+    _ -> abort "expired trade lost the buyer payment asset"
+  buyerTreasuries <- query @TreasuryHolding world.live.buyer
+  sellerPayments <- query @StablecoinHolding world.live.seller
+  null buyerTreasuries === True
+  null sellerPayments === True
+
+expiredPartialAllocationDoesNotLoseAssets : Script ()
+expiredPartialAllocationDoesNotLoseAssets = do
+  world <- setupWorld
+  treasuryAllocationCid <- allocateTreasuryOnly world
+  now <- getTime
+  setTime (addRelTime now (hours 3))
+  status <- inspectSettleRecovery world.live crashInput
+  Text.isPrefixOf "RECOVERY_EXPIRED" status === True
+  Text.isInfixOf "required_action=" status === True
+  _ <- submit (actAs world.live.seller <> readAs world.live.treasuryRegistry) $
+    exerciseCmd treasuryAllocationCid Allocation_Withdraw with extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
+  sellerTreasuries <- query @TreasuryHolding world.live.seller
+  buyerPayments <- query @StablecoinHolding world.live.buyer
+  case [holding | (_, holding) <- sellerTreasuries, holding.amount == 100.0, isNone holding.lock] of
+    [_] -> pure ()
+    _ -> abort "expired allocation lost the seller Treasury asset"
+  case [holding | (_, holding) <- buyerPayments, holding.amount == 100000.0, isNone holding.lock] of
+    [_] -> pure ()
+    _ -> abort "expired allocation lost the buyer payment asset"
+
+unrelatedBuyerTreasuryDoesNotBlockResume : Script ()
+unrelatedBuyerTreasuryDoesNotBlockResume = do
+  world <- setupWorld
+  _ <- allocateTreasuryOnly world
+  _ <- allocatePaymentOnly world
+  _ <- settleFromLedger world.live crashInput
+  (firstTreasury, firstPayment) <- assertSettledOutputs world
+  extraInstrument <- submit world.live.treasuryRegistry $ createCmd TreasuryInstrument with
+    treasuryRegistry = world.live.treasuryRegistry
+    id = "UST-EXTRA"
+    description = "unrelated Treasury"
+    faceValue = 1000.0
+    maturityDate = date 2028 Nov 15
+  _ <- submit world.live.treasuryRegistry $ exerciseCmd extraInstrument Issue with
+    owner = world.live.buyer
+    amount = 50.0
+  second <- settleFromLedger world.live crashInput
+  (secondTreasury, secondPayment) <- assertSettledOutputs world
+  firstTreasury === secondTreasury
+  firstPayment === secondPayment
+  Text.isInfixOf "CANTON_SETTLE_BUYER_TREASURY" second === True

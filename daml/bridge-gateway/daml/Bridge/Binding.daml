@@ -1,0 +1,85 @@
+module Bridge.Binding where
+
+import DA.Optional (isNone)
+
+import Stablecoin.Holding
+
+template BridgeMintRef
+  with
+    cashRegistry : Party
+    buyer : Party
+    lockId : Text
+    mintHoldingCid : ContractId StablecoinHolding
+  where
+    signatory cashRegistry
+    observer buyer
+
+    ensure
+      lockId /= ""
+        && buyer /= cashRegistry
+
+    choice BridgeMintRef_Bind : ContractId BridgeTradeBinding
+      with
+        seller : Party
+        venue : Party
+        tradeCid : Text
+      controller buyer
+      do
+        assertMsg "trade CID required" (tradeCid /= "")
+        assertMsg "seller required" (seller /= buyer && seller /= cashRegistry)
+        assertMsg "venue required" (venue /= buyer && venue /= seller && venue /= cashRegistry)
+        create BridgeTradeBinding with
+          cashRegistry
+          buyer
+          seller
+          venue
+          lockId
+          mintHoldingCid
+          tradeCid
+          buyerTreasuryCid = None
+          sellerPaymentCid = None
+
+template BridgeTradeBinding
+  with
+    cashRegistry : Party
+    buyer : Party
+    seller : Party
+    venue : Party
+    lockId : Text
+    mintHoldingCid : ContractId StablecoinHolding
+    tradeCid : Text
+    buyerTreasuryCid : Optional Text
+    sellerPaymentCid : Optional Text
+  where
+    signatory cashRegistry, buyer
+    observer seller
+
+    ensure
+      lockId /= ""
+        && tradeCid /= ""
+        && buyer /= cashRegistry
+        && seller /= buyer
+        && seller /= cashRegistry
+        && venue /= buyer
+        && venue /= seller
+        && venue /= cashRegistry
+
+    choice BridgeTradeBinding_RecordTreasury : ContractId BridgeTradeBinding
+      with
+        recordedTreasuryCid : Text
+      controller buyer
+      do
+        assertMsg "treasury already recorded" (isNone buyerTreasuryCid)
+        assertMsg "treasury required" (recordedTreasuryCid /= "")
+        create this with
+          buyerTreasuryCid = Some recordedTreasuryCid
+
+    choice BridgeTradeBinding_RecordPayment : ContractId BridgeTradeBinding
+      with
+        recordedPaymentCid : Text
+      controller seller
+      do
+        assertMsg "payment already recorded" (isNone sellerPaymentCid)
+        assertMsg "payment required" (recordedPaymentCid /= "")
+        create this with
+          sellerPaymentCid = Some recordedPaymentCid

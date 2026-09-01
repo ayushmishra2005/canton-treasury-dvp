@@ -17,4 +17,5 @@ zama/typechain-types/
 zama/coverage/
 zama/.openzeppelin/
 canton/.run-bridge/
+canton/.run-walkthrough/
 bridge/.run/

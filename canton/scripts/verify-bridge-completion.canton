@@ -151,7 +151,9 @@ def relevantCreated(template: String): Boolean =
     template.endsWith("TreasuryHolding") ||
     template.endsWith("StablecoinAllocation") ||
     template.endsWith("TreasuryAllocation") ||
-    template.endsWith("BridgeAttestation")
+    template.endsWith("BridgeAttestation") ||
+    template.endsWith("BridgeTradeBinding") ||
+    template.endsWith("BridgeMintRef")
 
 def relevantChoice(choice: String): Boolean =
   choice == "AllocationFactory_Allocate" ||
@@ -159,7 +161,10 @@ def relevantChoice(choice: String): Boolean =
     choice == "Allocation_ExecuteTransfer" ||
     choice == "Gateway_Redeem" ||
     choice == "Gateway_Mint" ||
-    choice == "Burn"
+    choice == "Burn" ||
+    choice == "BridgeMintRef_Bind" ||
+    choice == "BridgeTradeBinding_RecordTreasury" ||
+    choice == "BridgeTradeBinding_RecordPayment"
 
 def collect(participantName: String, hint: String) = {
   val (node, party) = hostedParty(participantName, hint)
@@ -338,6 +343,53 @@ try {
     fail("payment instrument admin does not match the cash registry")
   }
 
+  val mintChoices = exercised.filter { fact =>
+    fact.choice == "Gateway_Mint" && fact.updateId == minted.updateId
+  }
+  if (mintChoices.size != 1) {
+    fail("mint reference was not created by Gateway_Mint")
+  }
+  val mintRefs = created.filter { fact =>
+    fact.template.endsWith("BridgeMintRef") &&
+    fact.updateId == minted.updateId &&
+    fact.arguments.exists(args => labeledText(args, "lockId").contains(expectedLock))
+  }
+  if (mintRefs.size != 1) {
+    fail("mint reference was not created by Gateway_Mint")
+  }
+  val mintRef = mintRefs.head
+  val mintRefArgs = mintRef.arguments.getOrElse(fail("mint reference arguments unread"))
+  if (requireText(mintRefArgs, "mintHoldingCid", "mint reference holding") != mintHolding) {
+    fail("mint reference does not name the same holding as MintedLock")
+  }
+  if (requireText(mintRefArgs, "cashRegistry", "mint reference registry") != cashRegistry) {
+    fail("mint reference registry does not match MintedLock")
+  }
+  if (requireText(mintRefArgs, "buyer", "mint reference buyer") != buyer) {
+    fail("mint reference buyer does not match MintedLock")
+  }
+  val bindMatches = exercised.filter { fact =>
+    fact.choice == "BridgeMintRef_Bind" && fact.consuming && fact.cid == mintRef.cid
+  }
+  if (bindMatches.size != 1) {
+    fail("binding was not created by consuming the mint reference")
+  }
+  val bind = bindMatches.head
+  if (!consumedIn(mintRef.cid, bind.updateId)) {
+    fail("binding was not created by consuming the mint reference")
+  }
+  val boundAtBind = created.filter { fact =>
+    fact.template.endsWith("BridgeTradeBinding") &&
+    fact.updateId == bind.updateId &&
+    fact.arguments.exists(args => labeledText(args, "lockId").contains(expectedLock))
+  }
+  if (boundAtBind.size != 1) {
+    fail("binding was not created by consuming the mint reference")
+  }
+  if (!boundAtBind.head.arguments.exists(args => labeledText(args, "mintHoldingCid").contains(mintHolding))) {
+    fail("evidence belongs to another operation")
+  }
+
   val allocateMatches = exercised.filter { fact =>
     fact.choice == "AllocationFactory_Allocate" &&
     fact.argument.exists(argument => texts(argument).contains(mintHolding))
@@ -398,6 +450,22 @@ try {
     fail("DvpTrade_Settle is not connected to this operation's payment allocation")
   }
   val settle = settleMatches.head
+  val bindings = created.filter { fact =>
+    fact.template.endsWith("BridgeTradeBinding") &&
+    fact.arguments.exists(args => labeledText(args, "lockId").contains(expectedLock))
+  }
+  if (bindings.isEmpty) {
+    fail("missing BridgeTradeBinding")
+  }
+  val boundMints = bindings.flatMap(fact => fact.arguments.toSeq.flatMap(args => labeledText(args, "mintHoldingCid"))).distinct
+  val boundTrades = bindings.flatMap(fact => fact.arguments.toSeq.flatMap(args => labeledText(args, "tradeCid"))).distinct
+  if (boundMints != Seq(mintHolding) || boundTrades.size != 1) {
+    fail("evidence belongs to another operation")
+  }
+  if (settle.cid != boundTrades.head) {
+    fail("DvpTrade_Settle is not the trade bound to this lock")
+  }
+  println(s"CANTON_HISTORY_BINDING_TRADE ${boundTrades.head}")
   val settleArgs = settle.argument.getOrElse(fail("DvpTrade_Settle arguments unread"))
   val settleResult = settle.result.getOrElse(fail("DvpTrade_Settle result unread"))
   val treasuryAllocation =

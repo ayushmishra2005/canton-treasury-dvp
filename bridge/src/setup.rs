@@ -386,7 +386,14 @@ pub fn config_is_initialized(rpc: &RpcClient) -> Result<bool> {
     let (config, _) = crate::program::config_pda();
     match rpc.get_account(&config) {
         Ok(account) => Ok(account.owner == crate::program::PROGRAM_ID),
-        Err(_) => Ok(false),
+        Err(err) => {
+            let text = err.to_string();
+            if text.contains("AccountNotFound") || text.contains("could not find account") {
+                Ok(false)
+            } else {
+                Err(err).context("read bridge config")
+            }
+        }
     }
 }
 

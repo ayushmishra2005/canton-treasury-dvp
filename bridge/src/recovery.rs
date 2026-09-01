@@ -79,15 +79,19 @@ pub struct OnChainApproval {
     pub digest: [u8; 32],
 }
 
+pub fn approval_expired_on_chain(expiry: i64, chain_now: i64) -> bool {
+    chain_now >= expiry
+}
+
 pub fn attesters_needed(
     existing: Option<&OnChainApproval>,
     digest: &[u8; 32],
     expiry: i64,
-    now: i64,
+    chain_now: i64,
     replace_expired: bool,
 ) -> Result<[bool; 2]> {
     let Some(existing) = existing else {
-        if now >= expiry {
+        if approval_expired_on_chain(expiry, chain_now) {
             return Err(anyhow!("authorization has expired"));
         }
         return Ok([true, true]);
@@ -95,7 +99,7 @@ pub fn attesters_needed(
     if existing.consumed {
         return Err(anyhow!("approval already consumed"));
     }
-    if now >= existing.expiry {
+    if approval_expired_on_chain(existing.expiry, chain_now) {
         if replace_expired {
             return Ok([true, true]);
         }
@@ -108,7 +112,9 @@ pub fn attesters_needed(
         return Err(anyhow!("mint authorization has expired"));
     }
     if existing.digest != *digest || existing.expiry != expiry {
-        return Err(anyhow!("existing approval does not match this operation"));
+        return Err(anyhow!(
+            "digest mismatch while approval is valid; refusing to replace an unexpired approval"
+        ));
     }
     Ok([
         existing.signer_bitmap & 1 == 0,
@@ -133,11 +139,29 @@ pub fn should_apply_pending(pending: u64, available: u64, expected_final: u64) -
 }
 
 pub fn should_refresh_release_materials(
-    now: i64,
+    chain_now: i64,
+    on_chain: Option<&OnChainApproval>,
     journal_expiry: i64,
     receipt_status: Option<u8>,
 ) -> bool {
-    receipt_status != Some(RECEIPT_RELEASED) && journal_expiry > 0 && now >= journal_expiry
+    if receipt_status == Some(RECEIPT_RELEASED) {
+        return false;
+    }
+    if let Some(approval) = on_chain {
+        if approval.consumed {
+            return false;
+        }
+        return approval_expired_on_chain(approval.expiry, chain_now);
+    }
+    journal_expiry > 0 && approval_expired_on_chain(journal_expiry, chain_now)
+}
+
+pub fn decode_chain_clock(data: &[u8]) -> Result<i64> {
+    const UNIX_TIMESTAMP_OFFSET: usize = 32;
+    data.get(UNIX_TIMESTAMP_OFFSET..UNIX_TIMESTAMP_OFFSET + 8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(i64::from_le_bytes)
+        .ok_or_else(|| anyhow!("Solana clock sysvar is truncated"))
 }
 
 pub fn decode_approval(data: &[u8]) -> Result<OnChainApproval> {
@@ -217,33 +241,246 @@ mod tests {
         assert!(should_apply_pending(0, amount * 2, amount).is_err());
     }
 
+    fn live_approval() -> OnChainApproval {
+        OnChainApproval {
+            signer_bitmap: 0b011,
+            consumed: false,
+            expiry: 1_500,
+            digest: [7u8; 32],
+        }
+    }
+
     #[test]
-    fn expired_release_approval_refreshes_materials() {
-        assert!(should_refresh_release_materials(
-            2_000,
-            1_500,
+    fn host_clock_ahead_of_chain_does_not_replace_a_live_approval() {
+        let host_now = 2_000;
+        let chain_now = 1_000;
+        let approval = live_approval();
+        assert!(host_now >= approval.expiry);
+        assert!(!approval_expired_on_chain(approval.expiry, chain_now));
+        assert!(!should_refresh_release_materials(
+            chain_now,
+            Some(&approval),
+            approval.expiry,
             Some(RECEIPT_MINT_AUTHORIZED)
         ));
+        assert_eq!(
+            attesters_needed(
+                Some(&approval),
+                &approval.digest,
+                approval.expiry,
+                chain_now,
+                true
+            )
+            .unwrap(),
+            [false, false]
+        );
+        assert!(attesters_needed(Some(&approval), &[9u8; 32], 3_000, chain_now, true).is_err());
+    }
+
+    #[test]
+    fn host_clock_behind_chain_replaces_after_chain_expiry() {
+        let host_now = 1_000;
+        let chain_now = 2_000;
+        let approval = live_approval();
+        assert!(host_now < approval.expiry);
+        assert!(approval_expired_on_chain(approval.expiry, chain_now));
+        assert!(should_refresh_release_materials(
+            chain_now,
+            Some(&approval),
+            approval.expiry,
+            Some(RECEIPT_MINT_AUTHORIZED)
+        ));
+        assert_eq!(
+            attesters_needed(Some(&approval), &[9u8; 32], 3_000, chain_now, true).unwrap(),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn chain_time_equal_to_expiry_is_expired() {
+        let approval = live_approval();
+        assert!(approval_expired_on_chain(approval.expiry, approval.expiry));
+        assert!(should_refresh_release_materials(
+            approval.expiry,
+            Some(&approval),
+            approval.expiry,
+            Some(RECEIPT_MINT_AUTHORIZED)
+        ));
+        assert_eq!(
+            attesters_needed(Some(&approval), &[9u8; 32], 3_000, approval.expiry, true).unwrap(),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn approval_still_valid_is_reused() {
+        let approval = live_approval();
         assert!(!should_refresh_release_materials(
             1_000,
-            1_500,
+            Some(&approval),
+            approval.expiry,
+            Some(RECEIPT_MINT_AUTHORIZED)
+        ));
+        assert_eq!(
+            attesters_needed(
+                Some(&approval),
+                &approval.digest,
+                approval.expiry,
+                1_000,
+                true
+            )
+            .unwrap(),
+            [false, false]
+        );
+    }
+
+    #[test]
+    fn approval_expired_refreshes_materials() {
+        let approval = live_approval();
+        assert!(should_refresh_release_materials(
+            2_000,
+            Some(&approval),
+            approval.expiry,
             Some(RECEIPT_MINT_AUTHORIZED)
         ));
         assert!(!should_refresh_release_materials(
             2_000,
+            Some(&approval),
+            approval.expiry,
+            Some(RECEIPT_RELEASED)
+        ));
+        let consumed = OnChainApproval {
+            consumed: true,
+            ..approval
+        };
+        assert!(!should_refresh_release_materials(
+            2_000,
+            Some(&consumed),
+            consumed.expiry,
+            Some(RECEIPT_MINT_AUTHORIZED)
+        ));
+    }
+
+    #[test]
+    fn one_missing_attestation_is_the_only_submit() {
+        let first = OnChainApproval {
+            signer_bitmap: 0b001,
+            consumed: false,
+            expiry: 5_000,
+            digest: [7u8; 32],
+        };
+        assert_eq!(
+            attesters_needed(Some(&first), &[7u8; 32], 5_000, 1_000, true).unwrap(),
+            [false, true]
+        );
+        assert!(!should_refresh_release_materials(
+            1_000,
+            Some(&first),
+            5_000,
+            Some(RECEIPT_MINT_AUTHORIZED)
+        ));
+    }
+
+    #[test]
+    fn conflicting_attestation_does_not_count_toward_quorum() {
+        let first = OnChainApproval {
+            signer_bitmap: 0b001,
+            consumed: false,
+            expiry: 5_000,
+            digest: [7u8; 32],
+        };
+        let err = attesters_needed(Some(&first), &[9u8; 32], 5_000, 1_000, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("digest mismatch while approval is valid"),
+            "{err}"
+        );
+        assert_eq!(first.signer_bitmap.count_ones(), 1);
+        assert_eq!(
+            attesters_needed(Some(&first), &[7u8; 32], 5_000, 1_000, false).unwrap(),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn digest_mismatch_while_approval_is_valid_is_rejected() {
+        let approval = live_approval();
+        let err = attesters_needed(Some(&approval), &[9u8; 32], 3_000, 1_000, true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("digest mismatch while approval is valid"),
+            "{err}"
+        );
+        assert!(!should_refresh_release_materials(
+            1_000,
+            Some(&approval),
+            approval.expiry,
+            Some(RECEIPT_MINT_AUTHORIZED)
+        ));
+    }
+
+    #[test]
+    fn successful_replacement_after_expiry() {
+        let expired = live_approval();
+        assert_eq!(
+            attesters_needed(Some(&expired), &[9u8; 32], 3_000, 2_000, true).unwrap(),
+            [true, true]
+        );
+        assert!(should_refresh_release_materials(
+            2_000,
+            Some(&expired),
+            expired.expiry,
+            Some(RECEIPT_MINT_AUTHORIZED)
+        ));
+    }
+
+    #[test]
+    fn repeated_resume_after_release_does_not_release_again() {
+        assert!(!should_submit_release(false, Some(RECEIPT_RELEASED)));
+        assert!(!should_submit_release(true, Some(RECEIPT_RELEASED)));
+        assert!(!should_refresh_release_materials(
+            9_000,
+            Some(&OnChainApproval {
+                consumed: true,
+                expiry: 1_500,
+                digest: [7u8; 32],
+                signer_bitmap: 0b011,
+            }),
             1_500,
             Some(RECEIPT_RELEASED)
         ));
     }
 
     #[test]
+    fn exactly_one_confidential_release() {
+        assert!(should_submit_release(false, Some(RECEIPT_MINT_AUTHORIZED)));
+        assert!(!should_submit_release(false, Some(RECEIPT_RELEASED)));
+        assert!(!should_submit_release(true, Some(RECEIPT_MINT_AUTHORIZED)));
+        assert!(!should_submit_release(true, Some(RECEIPT_RELEASED)));
+    }
+
+    #[test]
+    fn journal_expiry_is_ignored_while_an_on_chain_approval_is_live() {
+        let approval = live_approval();
+        assert!(!should_refresh_release_materials(
+            1_000,
+            Some(&approval),
+            500,
+            Some(RECEIPT_MINT_AUTHORIZED)
+        ));
+    }
+
+    #[test]
+    fn chain_clock_sysvar_decodes_unix_timestamp() {
+        let mut data = vec![0u8; 40];
+        data[32..40].copy_from_slice(&1_700_000_000i64.to_le_bytes());
+        assert_eq!(decode_chain_clock(&data).unwrap(), 1_700_000_000);
+        assert!(decode_chain_clock(&[0u8; 16]).is_err());
+    }
+
+    #[test]
     fn expired_unused_approval_needs_both_attesters_again() {
-        let expired = OnChainApproval {
-            signer_bitmap: 0b011,
-            consumed: false,
-            expiry: 1_500,
-            digest: [7u8; 32],
-        };
+        let expired = live_approval();
         assert_eq!(
             attesters_needed(Some(&expired), &[9u8; 32], 3_000, 2_000, true).unwrap(),
             [true, true]
@@ -255,14 +492,8 @@ mod tests {
             digest: [7u8; 32],
         };
         assert!(attesters_needed(Some(&expired_one), &[7u8; 32], 1_500, 2_000, false).is_err());
-        let authorized = OnChainApproval {
-            signer_bitmap: 0b011,
-            consumed: false,
-            expiry: 1_500,
-            digest: [7u8; 32],
-        };
         assert_eq!(
-            attesters_needed(Some(&authorized), &[7u8; 32], 1_500, 2_000, false).unwrap(),
+            attesters_needed(Some(&expired), &[7u8; 32], 1_500, 2_000, false).unwrap(),
             [false, false]
         );
     }
@@ -333,6 +564,45 @@ mod tests {
             true,
         )
         .is_err());
+    }
+
+    #[test]
+    fn crash_after_solana_release_resumes_without_second_release() {
+        assert!(!should_submit_release(false, Some(RECEIPT_RELEASED)));
+        assert_eq!(
+            completed_operation_decision(
+                Ok(2),
+                Some(Ok(true)),
+                Ok(Some(RECEIPT_RELEASED)),
+                Ok(0),
+                Ok(100_000_000_000),
+                100_000_000_000,
+                true,
+                true,
+                true,
+            )
+            .unwrap(),
+            CompletionDecision::Continue
+        );
+    }
+
+    #[test]
+    fn crash_after_zama_redeem_records_completion_without_new_work() {
+        assert_eq!(
+            completed_operation_decision(
+                Ok(4),
+                Some(Ok(true)),
+                Ok(Some(RECEIPT_RELEASED)),
+                Ok(0),
+                Ok(100_000_000_000),
+                100_000_000_000,
+                true,
+                true,
+                true,
+            )
+            .unwrap(),
+            CompletionDecision::RecordAndExit
+        );
     }
 
     #[test]

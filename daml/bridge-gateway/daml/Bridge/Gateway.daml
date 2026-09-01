@@ -5,6 +5,7 @@ import DA.Optional (isNone)
 import Splice.Api.Token.HoldingV1
 
 import Bridge.Attestation
+import Bridge.Binding
 import Bridge.Types
 import Stablecoin.Holding
 import Stablecoin.Instrument
@@ -97,6 +98,11 @@ template BridgeGateway
           holdingCid
           amount = first.amount
           beneficiary = first.beneficiary
+        create BridgeMintRef with
+          cashRegistry
+          buyer = first.beneficiary
+          lockId = first.lockId
+          mintHoldingCid = holdingCid
         gatewayCid <- create this with mintedLocks = first.lockId :: mintedLocks
         pure (gatewayCid, holdingCid)
 

@@ -268,6 +268,7 @@ LP tokens, swap curves, or AMM pricing.
 | M1–M7 Canton atomic DvP, two synchronizers, verified privacy | **Complete** |
 | Phase 1 confidential settlement rail | **Complete (local only).** Encrypted capacity, confidential Solana custody, 2-of-3 mint/release approvals, live Treasury DvP funded by the minted holding, seller redemption, Relayer release, Zama redeem, journal resume from on-chain state after partial success, rejected or finalized-unapproved reservations without lock or mint, post-redemption crash recording, exact Canton decimal strings, Canton completion checked from a connected update-history sequence rather than journal fields, and Zama capacity recovery checked with approval-only probes. |
 | Phase 2 operational hardening of the confidential rail | **Complete (local only).** Each bridge lock is bound on ledger to its minted holding CID and `DvpTrade` CID. Prepare, settle, redeem, resume, and history verification use that binding, not a party-and-amount lookup. Release and mint expiry are taken from the Solana chain clock. Crash resume uses ledger contracts at each Canton and Solana/Zama boundary. Temporary secret files are created at `0600` under a `0700` directory. |
+| Public hybrid verification | **Complete on 2 September 2026.** One connected operation used Solana Devnet, Zama Ethereum Sepolia with real FHE, and the private Canton topology. See [Public hybrid verification](#public-hybrid-verification). |
 
 Phase 1 workflow, all asynchronous except the existing Canton settle:
 
@@ -681,6 +682,41 @@ observes data it should not, or any Canton process or port survives shutdown.
 - [docs/testing.md](docs/testing.md): every test level, what each one establishes, and the command
   that runs it.
 
+## Public hybrid verification
+
+Date: **2 September 2026**. Tested Git commit:
+`d42f0d55a7befcf22a58bc967b59ee61d9dd2dea`
+(`fix(bridge): use Devnet-compatible confidential proofs`), plus the unstaged
+public-hybrid coordinator, Relayer, and Zama network wiring from that run.
+
+| Network | What ran |
+|---|---|
+| Solana **Devnet** | Confidential escrow `BkDwMbtMVhDWeQ1nHwvCKmTT2XZhP2RMYGw18c6imnPf` ([Explorer](https://explorer.solana.com/address/BkDwMbtMVhDWeQ1nHwvCKmTT2XZhP2RMYGw18c6imnPf?cluster=devnet)). Probe mint `HLiwyBuuG2XS53Eg6RHVWDYkzDiuT4VTgKut1fMYQaja`. Connected-operation mint `2VVrDr9Y9TrgmJquQc2wT5FAt4PVgznxGHE9GP2HgiRF`. |
+| Zama on Ethereum **Sepolia** | `ConfidentialRiskEngine` `0x4adeaC48EaC6b2481DBCE3fA211e0Ca7945E41B5` ([Explorer](https://sepolia.etherscan.io/address/0x4adeaC48EaC6b2481DBCE3fA211e0Ca7945E41B5)) with real FHE. Mock FHE was disabled. |
+| Canton | Private six-participant topology from `canton/settlement-topology.conf`. **Not** Canton DevNet. **Not** Mainnet. |
+
+Connected operation lock `32fcf318058f1f09c4c1bbc743dcd2df6eae5471dd293619bec4fe8d3894450b`.
+Confidential release through OpenZeppelin Relayer 1.5.0:
+`3QmVTEGg3NWa67vyZCRvpfSrzzon6dXSueSZ3Eu2kfhoe75akgZkcogpD6LU6R7DyyUsj85RTTjV31jfuoWGTk2g`.
+Destination available balance after apply-pending: `100000000000` base units.
+Zama reservation redeemed (status `4`). Connected Canton history verified
+`CANTON_VERIFY_OK` on two completed resumes. Relayer release confirmed once.
+Zama redeem confirmed once.
+
+Faults that rejected as required: unconfigured Zama client, lock expiry before
+settlement with Relayer cancel, over-capacity reservation, unknown attester,
+attester disagreement without quorum, delayed release after redemption, release
+approval expiry on the Solana chain clock, wrong lock binding, wrong trade
+binding, and duplicate Zama redeem.
+
+Only `DvpTrade_Settle` is atomic. Solana, Zama, and Canton steps are
+asynchronous and recoverable. This is testnet evidence, not a security audit
+or a production-readiness claim.
+
+Remaining assumptions: 2-of-3 attested equality rather than a cryptographic
+proof between Token-2022 and Zama ciphertexts; ignored testnet keys stay off
+git; public RPCs have no availability SLO.
+
 ## Status
 
 **M1–M7 complete.** Phase 1 of the confidential rail is **complete** on the
@@ -689,8 +725,11 @@ each lock is bound to its mint holding and trade by a cash-registry mint
 reference created in `Gateway_Mint`, mint and release expiry use
 Solana chain time, Canton completion is verified from connected update history,
 crash resume uses ledger contracts rather than journal markers alone, and
-secret files are created private. The stack is local-only, unaudited, uses
-mock FHE in Hardhat, and relies on attested equality rather than a
+secret files are created private. Local Hardhat tests still use mock FHE.
+A public hybrid run on 2 September 2026 used Solana Devnet, Zama Sepolia with
+real FHE, and the private Canton topology; see
+[Public hybrid verification](#public-hybrid-verification). The work is
+unaudited and relies on attested equality rather than a
 cross-scheme proof.
 
 - M1: Treasury instrument and standard-compatible holdings
@@ -713,8 +752,8 @@ This repository is a protocol and modelling demonstration. It does not include, 
 - No PostgreSQL or authentication infrastructure
 - No Canton Network or Global Synchronizer deployment
 - No Token Standard V2
-- No production deployment or audit. Phase 2 hardening is local-only and
-  unaudited.
+- No production deployment or audit. Local Phase 2 hardening and the public
+  hybrid testnet run are unaudited.
 
 The local topology demonstrates **protocol behavior**: how Canton enforces atomicity, authorization,
 and need-to-know visibility across independently governed applications. It does not demonstrate

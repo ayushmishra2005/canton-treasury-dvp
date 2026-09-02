@@ -37,10 +37,10 @@ use crate::reservation::{
     RESERVATION_RESERVED,
 };
 use crate::setup::{
-    apply_pending, config_is_initialized, create_bridge_accounts, decode_aes, decode_elgamal,
-    decode_keypair, decrypt_available, encode_aes, encode_elgamal, encode_keypair,
-    pending_credit_counter, read_mint_decimals, vault_elgamal_pubkey, BridgeAccounts,
-    ConfidentialOwner, DECIMALS,
+    apply_pending, close_orphaned_config, config_is_initialized, create_bridge_accounts,
+    decode_aes, decode_elgamal, decode_keypair, decrypt_available, encode_aes, encode_elgamal,
+    encode_keypair, pending_credit_counter, read_bridge_config, read_mint_decimals,
+    vault_elgamal_pubkey, BridgeAccounts, ConfidentialOwner, DECIMALS,
 };
 use crate::txsize::{report_size, serialize_legacy, LEGACY_LIMIT};
 use crate::units::{require_mint_decimals, TokenUnits};
@@ -62,6 +62,7 @@ pub struct Workflow {
     pub omit_journal_save: bool,
     pub halt_after_first_approval: bool,
     pub inject_attester_disagreement: bool,
+    pub inject_unknown_attester: bool,
 }
 
 impl Workflow {
@@ -100,8 +101,8 @@ impl Workflow {
             }
         }
 
-        crate::setup::airdrop(&self.rpc, &fee_payer)?;
-        crate::setup::airdrop(&self.rpc, &self.payer.pubkey())?;
+        crate::setup::ensure_funded(&self.rpc, &self.payer, &fee_payer, 500_000_000)?;
+        crate::setup::ensure_funded(&self.rpc, &self.payer, &self.payer.pubkey(), 1_000_000_000)?;
 
         let (accounts, mut journal, secrets) =
             self.load_or_create_accounts(amount, journal, secrets)?;
@@ -130,13 +131,6 @@ impl Workflow {
         let operation = decode_operation(&journal.operation_hex)?;
         let reservation = operation;
         let previous = [0u8; 32];
-        let mint_expiry = if journal.mint_expiry == 0 {
-            self.mint_deadline()?
-        } else {
-            journal.mint_expiry
-        };
-        journal.mint_expiry = mint_expiry;
-        self.persist(&journal, &secrets)?;
         let (config, _) = config_pda();
         let (receipt, _) = receipt_pda(&operation);
         let chain_id = self.rpc.get_genesis_hash()?.to_bytes();
@@ -150,6 +144,7 @@ impl Workflow {
             self.canton.prepare()?;
             match self.reserve_once(&reservation_hex, amount)? {
                 ReservationAction::RecordCompleted => {
+                    println!("COMPLETED_RESUME_SKIP_SETUP");
                     self.record_completed_operation(
                         &accounts,
                         amount,
@@ -165,6 +160,14 @@ impl Workflow {
                 return Ok(());
             }
         }
+
+        let mint_expiry = if journal.mint_expiry == 0 {
+            self.mint_deadline()?
+        } else {
+            journal.mint_expiry
+        };
+        journal.mint_expiry = mint_expiry;
+        self.persist(&journal, &secrets)?;
 
         if self.expiry_recovery {
             return self.run_expiry_recovery(
@@ -208,7 +211,7 @@ impl Workflow {
         );
         let mint_digest = operation_digest(
             &chain_id,
-            &crate::program::PROGRAM_ID,
+            &crate::program::program_id(),
             &config,
             &operation,
             DIRECTION_MINT,
@@ -385,7 +388,7 @@ impl Workflow {
         secrets: Option<Secrets>,
     ) -> Result<(BridgeAccounts, Journal, Secrets)> {
         if let Some(secrets) = secrets {
-            if !journal.mint.is_empty() && config_is_initialized(&self.rpc)? {
+            if journal_matches_onchain(&self.rpc, &journal)? {
                 let accounts = accounts_from_secrets(&journal, &secrets)?;
                 return Ok((accounts, journal, secrets));
             }
@@ -394,9 +397,26 @@ impl Workflow {
             if let Some(prior) = &self.reuse_from {
                 return self.reuse_existing_accounts(amount, prior);
             }
+            if let Some(durable) = durable_account_dir() {
+                if durable.join("secrets.json").exists() {
+                    let prior = OperationStore::open(durable.clone())?;
+                    if let Some(prior_journal) = prior.load_journal()? {
+                        if journal_matches_onchain(&self.rpc, &prior_journal)? {
+                            return self.reuse_existing_accounts(amount, &durable);
+                        }
+                    }
+                }
+            }
+        }
+        if config_is_initialized(&self.rpc)? {
+            close_orphaned_config(
+                &self.rpc,
+                &self.payer,
+                [&self.attester_a, &self.attester_b, &self.attester_c],
+            )?;
         }
         anyhow::ensure!(
-            !config_is_initialized(&self.rpc)? || journal.mint.is_empty(),
+            !config_is_initialized(&self.rpc)?,
             "bridge config already exists; resume the recorded journal"
         );
         let accounts = create_bridge_accounts(
@@ -439,6 +459,7 @@ impl Workflow {
             blinding: encode_bytes(&blinding),
         };
         blinding.zeroize();
+        save_durable_accounts(&journal, &secrets)?;
         Ok((accounts, journal, secrets))
     }
 
@@ -805,7 +826,7 @@ impl Workflow {
             println!("RELEASE_REUSING_ONCHAIN_APPROVAL");
         }
         if should_submit_release(journal.reached(Step::Released), receipt_status) {
-            let materials = self.release_materials(accounts, amount, chain_now, journal)?;
+            let materials = self.release_materials(accounts, amount, journal)?;
             let approval_expiry = materials.expiry;
             let release_proof = materials.proof;
             let transfer_data = materials.transfer_data;
@@ -814,7 +835,7 @@ impl Workflow {
             let range = materials.range;
             let release_digest = operation_digest(
                 chain_id,
-                &crate::program::PROGRAM_ID,
+                &crate::program::program_id(),
                 config,
                 &operation,
                 DIRECTION_RELEASE,
@@ -875,9 +896,11 @@ impl Workflow {
                 fee_payer,
             )?;
             let release_id = self.relayer.send_instructions(&[to_relayer(&release)])?;
+            println!("RELAYER_TX {release_id}");
             let release_sig = self
                 .relayer
-                .wait_confirmed(&release_id, Duration::from_secs(90))?;
+                .wait_confirmed(&release_id, Duration::from_secs(180))?;
+            println!("RELAYER_SIG {release_sig}");
             self.confirm_on_chain(&release_sig)?;
             journal.release_signature = release_sig.clone();
             self.inspect_public_leak(&release, amount)?;
@@ -950,7 +973,6 @@ impl Workflow {
         &self,
         accounts: &BridgeAccounts,
         amount: u64,
-        chain_now: i64,
         journal: &mut Journal,
     ) -> Result<ReleaseMaterials> {
         if journal.release_expiry > 0 && !journal.release_transfer_hex.is_empty() {
@@ -980,6 +1002,7 @@ impl Workflow {
             &release_proofs.validity.pubkey(),
             &release_proofs.range.pubkey(),
         );
+        let chain_now = self.chain_unix_timestamp()?;
         journal.release_expiry = chain_now + release_deadline_secs();
         journal.release_proof_hex = hex::encode(release_proof);
         journal.release_transfer_hex = hex::encode(release_proofs.transfer_data);
@@ -1041,7 +1064,7 @@ impl Workflow {
         let lock_proof = decode_proof32(&journal.lock_proof_hex).unwrap_or([0u8; 32]);
         let mint_digest = operation_digest(
             chain_id,
-            &crate::program::PROGRAM_ID,
+            &crate::program::program_id(),
             config,
             &operation,
             DIRECTION_MINT,
@@ -1095,7 +1118,7 @@ impl Workflow {
         );
         let cancel_digest = operation_digest(
             chain_id,
-            &crate::program::PROGRAM_ID,
+            &crate::program::program_id(),
             config,
             &operation,
             DIRECTION_CANCEL,
@@ -1150,7 +1173,9 @@ impl Workflow {
             fee_payer,
         )?;
         let id = self.relayer.send_instructions(&[to_relayer(&cancel)])?;
-        let sig = self.relayer.wait_confirmed(&id, Duration::from_secs(90))?;
+        println!("RELAYER_TX {id}");
+        let sig = self.relayer.wait_confirmed(&id, Duration::from_secs(180))?;
+        println!("RELAYER_SIG {sig}");
         self.confirm_on_chain(&sig)?;
         apply_pending(
             &self.rpc,
@@ -1270,6 +1295,28 @@ impl Workflow {
             chain_now,
             args.direction == DIRECTION_RELEASE,
         )?;
+        if self.inject_unknown_attester {
+            let unknown = Keypair::new();
+            let ed = ed25519_approve_ix(&unknown, digest)?;
+            let ix = approve_ix(*fee_payer, args)?;
+            match self
+                .relayer
+                .send_instructions(&[to_relayer(&ed), to_relayer(&ix)])
+            {
+                Ok(id) => {
+                    println!("RELAYER_TX {id}");
+                    match self.relayer.wait_confirmed(&id, Duration::from_secs(180)) {
+                        Ok(sig) => anyhow::ensure!(
+                            self.confirm_on_chain(&sig).is_err(),
+                            "unknown attester was accepted"
+                        ),
+                        Err(_) => println!("UNKNOWN_ATTESTER_REJECTED"),
+                    }
+                }
+                Err(_) => println!("UNKNOWN_ATTESTER_REJECTED"),
+            }
+            println!("FAULT_INJECTED unknown_attester");
+        }
         let approve = approve_ix(*fee_payer, args)?;
         measure_legacy(
             "approve_with_relayer_fee_payer",
@@ -1280,36 +1327,42 @@ impl Workflow {
             if !needed[index] {
                 continue;
             }
+            if self.inject_attester_disagreement {
+                let mut bad_digest = *digest;
+                bad_digest[0] ^= 0xff;
+                let bad_ed = ed25519_approve_ix(attester, &bad_digest)?;
+                let bad_ix = approve_ix(*fee_payer, args)?;
+                match self
+                    .relayer
+                    .send_instructions(&[to_relayer(&bad_ed), to_relayer(&bad_ix)])
+                {
+                    Ok(bad_id) => {
+                        println!("RELAYER_TX {bad_id}");
+                        match self
+                            .relayer
+                            .wait_confirmed(&bad_id, Duration::from_secs(60))
+                        {
+                            Ok(bad_sig) => anyhow::ensure!(
+                                self.confirm_on_chain(&bad_sig).is_err(),
+                                "conflicting attestation was accepted"
+                            ),
+                            Err(_) => println!("ATTESTER_DISAGREEMENT_REJECTED"),
+                        }
+                    }
+                    Err(_) => println!("ATTESTER_DISAGREEMENT_REJECTED"),
+                }
+                break;
+            }
             let ed = ed25519_approve_ix(attester, digest)?;
             let ix = approve_ix(*fee_payer, args)?;
             let id = self
                 .relayer
                 .send_instructions(&[to_relayer(&ed), to_relayer(&ix)])?;
-            let sig = self.relayer.wait_confirmed(&id, Duration::from_secs(60))?;
+            println!("RELAYER_TX {id}");
+            let sig = self.relayer.wait_confirmed(&id, Duration::from_secs(180))?;
+            println!("RELAYER_SIG {sig}");
             self.confirm_on_chain(&sig)?;
             if self.halt_after_first_approval {
-                break;
-            }
-            if self.inject_attester_disagreement {
-                let mut bad_digest = *digest;
-                bad_digest[0] ^= 0xff;
-                let conflicting = [attester_a, attester_b][1 - index];
-                let bad_ed = ed25519_approve_ix(conflicting, &bad_digest)?;
-                let bad_ix = approve_ix(*fee_payer, args)?;
-                if let Ok(bad_id) = self
-                    .relayer
-                    .send_instructions(&[to_relayer(&bad_ed), to_relayer(&bad_ix)])
-                {
-                    if let Ok(bad_sig) = self
-                        .relayer
-                        .wait_confirmed(&bad_id, Duration::from_secs(60))
-                    {
-                        anyhow::ensure!(
-                            self.confirm_on_chain(&bad_sig).is_err(),
-                            "conflicting attestation was accepted"
-                        );
-                    }
-                }
                 break;
             }
         }
@@ -1377,7 +1430,10 @@ impl Workflow {
             bytes.len()
         );
         let id = self.relayer.send_transaction(&bytes)?;
-        self.relayer.wait_confirmed(&id, Duration::from_secs(90))
+        println!("RELAYER_TX {id}");
+        let sig = self.relayer.wait_confirmed(&id, Duration::from_secs(180))?;
+        println!("RELAYER_SIG {sig}");
+        Ok(sig)
     }
 
     fn confirm_on_chain(&self, signature: &str) -> Result<()> {
@@ -1425,6 +1481,34 @@ fn measure_legacy(label: &str, instructions: &[Instruction], fee_payer: &Pubkey)
         "{label} is {size} bytes and exceeds the 1232-byte legacy limit"
     );
     Ok(())
+}
+
+fn durable_account_dir() -> Option<PathBuf> {
+    std::env::var("BRIDGE_ACCOUNT_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn save_durable_accounts(journal: &Journal, secrets: &Secrets) -> Result<()> {
+    let Some(dir) = durable_account_dir() else {
+        return Ok(());
+    };
+    let store = OperationStore::open(dir)?;
+    store.save_journal(journal)?;
+    store.save_secrets(secrets)?;
+    println!("BRIDGE_ACCOUNTS_SAVED");
+    Ok(())
+}
+
+fn journal_matches_onchain(rpc: &RpcClient, journal: &Journal) -> Result<bool> {
+    if journal.mint.is_empty() || journal.vault.is_empty() {
+        return Ok(false);
+    }
+    let Some(view) = read_bridge_config(rpc)? else {
+        return Ok(false);
+    };
+    Ok(journal.mint == view.mint.to_string() && journal.vault == view.vault.to_string())
 }
 
 fn to_relayer(ix: &Instruction) -> RelayerInstruction {

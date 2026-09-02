@@ -78,9 +78,10 @@ impl ZamaClient {
     fn query(&self, method: &str, reservation_hex: &str) -> Result<Value> {
         let script = std::env::var("ZAMA_BRIDGE_RPC")
             .unwrap_or_else(|_| "scripts/bridge-rpc.ts".to_string());
+        let network = std::env::var("ZAMA_HARDHAT_NETWORK").unwrap_or_else(|_| "localhost".into());
         let output = Command::new("npx")
             .current_dir(std::env::var("ZAMA_DIR").unwrap_or_else(|_| "zama".to_string()))
-            .args(["hardhat", "run", &script, "--network", "localhost"])
+            .args(["hardhat", "run", &script, "--network", &network])
             .env("ZAMA_RPC_URL", &self.rpc_url)
             .env("ZAMA_ENGINE", &self.engine)
             .env("ZAMA_KEY", &self.settler_key)
@@ -108,9 +109,10 @@ impl ZamaClient {
         let script = std::env::var("ZAMA_BRIDGE_RPC")
             .unwrap_or_else(|_| "scripts/bridge-rpc.ts".to_string());
         let mut command = Command::new("npx");
+        let network = std::env::var("ZAMA_HARDHAT_NETWORK").unwrap_or_else(|_| "localhost".into());
         command
             .current_dir(std::env::var("ZAMA_DIR").unwrap_or_else(|_| "zama".to_string()))
-            .args(["hardhat", "run", &script, "--network", "localhost"])
+            .args(["hardhat", "run", &script, "--network", &network])
             .env("ZAMA_RPC_URL", &self.rpc_url)
             .env("ZAMA_ENGINE", &self.engine)
             .env("ZAMA_KEY", key)

@@ -15,7 +15,7 @@ use solana_sdk::account::Account;
 use solana_sdk::account::AccountSharedData;
 use solana_sdk::clock::Clock;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signer;
+use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::sysvar;
 use solana_sdk::transaction::Transaction;
 
@@ -636,6 +636,124 @@ async fn cancel_remains_available_when_quorum_is_missing() {
     assert!(!approval.consumed);
     let receipt = read_receipt(&mut h).await;
     assert_eq!(receipt.status, RECEIPT_LOCKED);
+}
+
+fn close_config_ix(payer: Pubkey, attesters: [Pubkey; 3]) -> Instruction {
+    let (config, _) = pda(&[CONFIG_SEED]);
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(config, false),
+            AccountMeta::new_readonly(attesters[0], true),
+            AccountMeta::new_readonly(attesters[1], true),
+            AccountMeta::new_readonly(attesters[2], true),
+        ],
+        data: disc("close_config").to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn configured_attesters_can_close_unused_config() {
+    let deploy = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/deploy");
+    std::env::set_var("SBF_OUT_DIR", &deploy);
+    let program = ProgramTest::new("confidential_escrow", PROGRAM_ID, None);
+    let mut ctx = program.start_with_context().await;
+    let attester_a = Keypair::new();
+    let attester_b = Keypair::new();
+    let attester_c = Keypair::new();
+    let (config, config_bump) = pda(&[CONFIG_SEED]);
+    let (_, vault_bump) = pda(&[b"vault-authority"]);
+    write_account(
+        &mut ctx,
+        config,
+        PROGRAM_ID,
+        pack_config(&BridgeConfig {
+            chain_id: [11u8; 32],
+            token_program: spl_token_2022::id(),
+            mint: Pubkey::new_unique(),
+            vault: Pubkey::new_unique(),
+            attesters: [
+                attester_a.pubkey(),
+                attester_b.pubkey(),
+                attester_c.pubkey(),
+            ],
+            bump: config_bump,
+            vault_authority_bump: vault_bump,
+        }),
+    );
+    let ix = close_config_ix(
+        ctx.payer.pubkey(),
+        [
+            attester_a.pubkey(),
+            attester_b.pubkey(),
+            attester_c.pubkey(),
+        ],
+    );
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer, &attester_a, &attester_b, &attester_c],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    assert!(ctx
+        .banks_client
+        .get_account(config)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn unknown_attester_cannot_close_config() {
+    let deploy = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/deploy");
+    std::env::set_var("SBF_OUT_DIR", &deploy);
+    let program = ProgramTest::new("confidential_escrow", PROGRAM_ID, None);
+    let mut ctx = program.start_with_context().await;
+    let attester_a = Keypair::new();
+    let attester_b = Keypair::new();
+    let attester_c = Keypair::new();
+    let outsider = Keypair::new();
+    let (config, config_bump) = pda(&[CONFIG_SEED]);
+    let (_, vault_bump) = pda(&[b"vault-authority"]);
+    write_account(
+        &mut ctx,
+        config,
+        PROGRAM_ID,
+        pack_config(&BridgeConfig {
+            chain_id: [11u8; 32],
+            token_program: spl_token_2022::id(),
+            mint: Pubkey::new_unique(),
+            vault: Pubkey::new_unique(),
+            attesters: [
+                attester_a.pubkey(),
+                attester_b.pubkey(),
+                attester_c.pubkey(),
+            ],
+            bump: config_bump,
+            vault_authority_bump: vault_bump,
+        }),
+    );
+    let ix = close_config_ix(
+        ctx.payer.pubkey(),
+        [attester_a.pubkey(), attester_b.pubkey(), outsider.pubkey()],
+    );
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer, &attester_a, &attester_b, &outsider],
+        blockhash,
+    );
+    assert!(ctx.banks_client.process_transaction(tx).await.is_err());
+    assert!(ctx
+        .banks_client
+        .get_account(config)
+        .await
+        .unwrap()
+        .is_some());
 }
 
 #[tokio::test]

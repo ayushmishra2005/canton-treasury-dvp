@@ -24,7 +24,7 @@ use spl_token_confidential_transfer_proof_extraction::instruction::ProofLocation
 use std::thread;
 use std::time::Duration;
 
-use crate::program::{initialize_ix, vault_authority_pda};
+use crate::program::{close_config_ix, initialize_ix, vault_authority_pda};
 
 pub const DECIMALS: u8 = 6;
 
@@ -125,9 +125,9 @@ pub fn create_bridge_accounts(
     let vault_aes = ConfidentialAesKey::generate()?;
     let dest_aes = ConfidentialAesKey::generate()?;
 
-    airdrop(rpc, &mint_authority.pubkey())?;
-    airdrop(rpc, &source_authority.pubkey())?;
-    airdrop(rpc, &dest_authority.pubkey())?;
+    ensure_funded(rpc, payer, &mint_authority.pubkey(), 50_000_000)?;
+    ensure_funded(rpc, payer, &source_authority.pubkey(), 50_000_000)?;
+    ensure_funded(rpc, payer, &dest_authority.pubkey(), 50_000_000)?;
 
     let mint_len = ExtensionType::try_calculate_account_len::<Mint>(&[
         ExtensionType::ConfidentialTransferMint,
@@ -530,19 +530,90 @@ pub fn read_mint_decimals(rpc: &RpcClient, mint: &Pubkey) -> Result<u8> {
     Ok(state.base.decimals)
 }
 
-pub fn config_is_initialized(rpc: &RpcClient) -> Result<bool> {
+pub struct BridgeConfigView {
+    pub mint: Pubkey,
+    pub vault: Pubkey,
+    pub attesters: [Pubkey; 3],
+}
+
+pub fn decode_bridge_config(data: &[u8]) -> Result<BridgeConfigView> {
+    const MIN_LEN: usize = 8 + 32 + 32 + 32 + 32 + 96;
+    anyhow::ensure!(data.len() >= MIN_LEN, "bridge config account is truncated");
+    let body = &data[8..];
+    Ok(BridgeConfigView {
+        mint: Pubkey::try_from(&body[64..96])?,
+        vault: Pubkey::try_from(&body[96..128])?,
+        attesters: [
+            Pubkey::try_from(&body[128..160])?,
+            Pubkey::try_from(&body[160..192])?,
+            Pubkey::try_from(&body[192..224])?,
+        ],
+    })
+}
+
+pub fn read_bridge_config(rpc: &RpcClient) -> Result<Option<BridgeConfigView>> {
     let (config, _) = crate::program::config_pda();
     match rpc.get_account(&config) {
-        Ok(account) => Ok(account.owner == crate::program::PROGRAM_ID),
+        Ok(account) => {
+            if account.owner != crate::program::program_id() {
+                return Ok(None);
+            }
+            Ok(Some(decode_bridge_config(&account.data)?))
+        }
         Err(err) => {
             let text = err.to_string();
             if text.contains("AccountNotFound") || text.contains("could not find account") {
-                Ok(false)
+                Ok(None)
             } else {
                 Err(err).context("read bridge config")
             }
         }
     }
+}
+
+pub fn config_is_initialized(rpc: &RpcClient) -> Result<bool> {
+    Ok(read_bridge_config(rpc)?.is_some())
+}
+
+pub fn close_orphaned_config(
+    rpc: &RpcClient,
+    payer: &Keypair,
+    attesters: [&Keypair; 3],
+) -> Result<String> {
+    let view =
+        read_bridge_config(rpc)?.ok_or_else(|| anyhow::anyhow!("bridge config is missing"))?;
+    let local = [
+        attesters[0].pubkey(),
+        attesters[1].pubkey(),
+        attesters[2].pubkey(),
+    ];
+    for key in view.attesters {
+        anyhow::ensure!(
+            local.contains(&key),
+            "on-chain attester is not a local attester"
+        );
+    }
+    for key in local {
+        anyhow::ensure!(
+            view.attesters.contains(&key),
+            "local attester is not configured on-chain"
+        );
+    }
+    if has_pending_encrypted_credit(rpc, &view.vault)? {
+        anyhow::bail!("refusing to close a vault with pending confidential credits");
+    }
+    let signature = send(
+        rpc,
+        payer,
+        &[close_config_ix(payer.pubkey(), local)?],
+        attesters.as_slice(),
+    )?;
+    println!("CONFIG_CLOSED {signature}");
+    anyhow::ensure!(
+        !config_is_initialized(rpc)?,
+        "bridge config still exists after close"
+    );
+    Ok(signature)
 }
 
 pub fn encode_keypair(keypair: &Keypair) -> String {
@@ -587,6 +658,36 @@ pub fn airdrop(rpc: &RpcClient, pubkey: &Pubkey) -> Result<()> {
     anyhow::ensure!(
         balance >= TARGET,
         "airdrop did not credit {pubkey}; balance={balance}"
+    );
+    Ok(())
+}
+
+pub fn ensure_funded(
+    rpc: &RpcClient,
+    funder: &Keypair,
+    pubkey: &Pubkey,
+    target: u64,
+) -> Result<()> {
+    if rpc.get_balance(pubkey)? >= target {
+        return Ok(());
+    }
+    if funder.pubkey() == *pubkey {
+        return airdrop(rpc, pubkey);
+    }
+    let need = target.saturating_sub(rpc.get_balance(pubkey)?);
+    send(
+        rpc,
+        funder,
+        &[system_instruction::transfer(
+            &funder.pubkey(),
+            pubkey,
+            need.max(target),
+        )],
+        &[],
+    )?;
+    anyhow::ensure!(
+        rpc.get_balance(pubkey)? >= target,
+        "could not fund {pubkey} from the payer"
     );
     Ok(())
 }
@@ -724,5 +825,26 @@ mod tests {
         )
         .unwrap();
         let _ = keys_from_secret(elgamal.secret_bytes(), aes.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn decode_bridge_config_reads_mint_vault_and_attesters() {
+        let mint = Pubkey::new_from_array([3u8; 32]);
+        let vault = Pubkey::new_from_array([4u8; 32]);
+        let attesters = [
+            Pubkey::new_from_array([5u8; 32]),
+            Pubkey::new_from_array([6u8; 32]),
+            Pubkey::new_from_array([7u8; 32]),
+        ];
+        let mut data = vec![0u8; 8 + 32 + 32 + 32 + 32 + 96 + 2];
+        data[8 + 64..8 + 96].copy_from_slice(mint.as_ref());
+        data[8 + 96..8 + 128].copy_from_slice(vault.as_ref());
+        data[8 + 128..8 + 160].copy_from_slice(attesters[0].as_ref());
+        data[8 + 160..8 + 192].copy_from_slice(attesters[1].as_ref());
+        data[8 + 192..8 + 224].copy_from_slice(attesters[2].as_ref());
+        let view = decode_bridge_config(&data).unwrap();
+        assert_eq!(view.mint, mint);
+        assert_eq!(view.vault, vault);
+        assert_eq!(view.attesters, attesters);
     }
 }

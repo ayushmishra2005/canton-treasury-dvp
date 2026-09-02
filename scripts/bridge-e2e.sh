@@ -390,12 +390,21 @@ BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
   run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after locked
 assert_journal_step "$journal_dir" locked
 
+echo "BRIDGE_ONE_ATTESTER"
+BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --resume --halt-after-first-approval
+assert_journal_step "$journal_dir" locked
+[[ "$(last_marker MINT_APPROVAL_BITMAP)" == "MINT_APPROVAL_BITMAP 1" ]] \
+  || fail "one-attester state was not recorded: $(last_marker MINT_APPROVAL_BITMAP)"
+
 echo "BRIDGE_ATTESTER_DISAGREEMENT"
 BRIDGE_MINT_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
   run_workflow --journal "$journal_dir" --resume --inject-attester-disagreement
 assert_journal_step "$journal_dir" locked
 grep -q "FAULT_INJECTED attester_disagreement" "$tmp_dir/ctd-workflow.log" \
   || fail "attester disagreement was not injected"
+grep -q ATTESTER_DISAGREEMENT_REJECTED "$tmp_dir/ctd-workflow.log" \
+  || fail "attester disagreement was not rejected"
 grep -q "RECOVERY_WAIT_UNBOUNDED operator_or_quorum" "$tmp_dir/ctd-workflow.log" \
   || fail "attester disagreement did not record that quorum wait is unbounded"
 grep -q CHAIN_CLOCK "$tmp_dir/ctd-workflow.log" \

@@ -1,0 +1,44 @@
+{
+  "relayers": [
+    {
+      "id": "solana-devnet",
+      "name": "solana devnet",
+      "network": "devnet",
+      "paused": false,
+      "signer_id": "devnet-signer",
+      "network_type": "solana",
+      "custom_rpc_urls": [
+        { "url": "https://api.devnet.solana.com", "weight": 100 }
+      ],
+      "policies": {
+        "fee_payment_strategy": "relayer",
+        "min_balance": 0,
+        "allowed_programs": [
+          "11111111111111111111111111111111",
+          "ComputeBudget111111111111111111111111111111",
+          "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+          "ZkE1Gama1Proof11111111111111111111111111111",
+          "recr1L3PCGKLbckBqMNcJhuuyU1zgo8nBhfLVsJNwr5",
+          "Ed25519SigVerify111111111111111111111111111",
+          "BkDwMbtMVhDWeQ1nHwvCKmTT2XZhP2RMYGw18c6imnPf"
+        ]
+      }
+    }
+  ],
+  "signers": [
+    {
+      "id": "devnet-signer",
+      "type": "local",
+      "config": {
+        "path": "config/keys/devnet-signer.json",
+        "passphrase": {
+          "type": "env",
+          "value": "KEYSTORE_PASSPHRASE"
+        }
+      }
+    }
+  ],
+  "networks": "./config/networks",
+  "notifications": [],
+  "plugins": []
+}

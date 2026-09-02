@@ -83,6 +83,26 @@ pub fn initialize(ctx: Context<Initialize>, args: InitializeArgs) -> Result<()> 
     Ok(())
 }
 
+pub fn close_config(ctx: Context<CloseConfig>) -> Result<()> {
+    let config = &ctx.accounts.config;
+    let signers = [
+        ctx.accounts.attester_a.key(),
+        ctx.accounts.attester_b.key(),
+        ctx.accounts.attester_c.key(),
+    ];
+    require!(
+        signers[0] != signers[1] && signers[0] != signers[2] && signers[1] != signers[2],
+        EscrowError::InvalidAttesterSet
+    );
+    for signer in signers {
+        require!(
+            config.attester_index(&signer).is_some(),
+            EscrowError::UnknownAttester
+        );
+    }
+    Ok(())
+}
+
 pub fn lock_confidential(ctx: Context<LockConfidential>, args: LockArgs) -> Result<()> {
     let config = &ctx.accounts.config;
     require_keys_eq!(config.mint, ctx.accounts.mint.key(), EscrowError::WrongMint);
@@ -432,6 +452,22 @@ pub struct Initialize<'info> {
     /// CHECK: must be Token-2022
     pub token_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CloseConfig<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        mut,
+        close = payer,
+        seeds = [CONFIG_SEED],
+        bump = config.bump
+    )]
+    pub config: Account<'info, BridgeConfig>,
+    pub attester_a: Signer<'info>,
+    pub attester_b: Signer<'info>,
+    pub attester_c: Signer<'info>,
 }
 
 #[derive(Accounts)]

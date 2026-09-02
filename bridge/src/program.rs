@@ -4,12 +4,23 @@ use sha2::{Digest, Sha256};
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::sysvar;
+use std::sync::OnceLock;
 
 pub const PROGRAM_ID: Pubkey = solana_sdk::pubkey!("9Yuvt4HxfbGCL9gPk3ygMLV3UdrMFgAJsyhdoJvbKcUD");
 pub const CONFIG_SEED: &[u8] = b"bridge-config";
 pub const VAULT_AUTHORITY_SEED: &[u8] = b"vault-authority";
 pub const RECEIPT_SEED: &[u8] = b"receipt";
 pub const APPROVAL_SEED: &[u8] = b"approval";
+
+pub fn program_id() -> Pubkey {
+    static ID: OnceLock<Pubkey> = OnceLock::new();
+    *ID.get_or_init(|| match std::env::var("BRIDGE_PROGRAM_ID") {
+        Ok(value) => value
+            .parse()
+            .expect("BRIDGE_PROGRAM_ID must be a base58 pubkey"),
+        Err(_) => PROGRAM_ID,
+    })
+}
 
 fn disc(name: &str) -> [u8; 8] {
     let hash = Sha256::digest(format!("global:{name}").as_bytes());
@@ -19,19 +30,19 @@ fn disc(name: &str) -> [u8; 8] {
 }
 
 pub fn config_pda() -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID)
+    Pubkey::find_program_address(&[CONFIG_SEED], &program_id())
 }
 
 pub fn vault_authority_pda() -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[VAULT_AUTHORITY_SEED], &PROGRAM_ID)
+    Pubkey::find_program_address(&[VAULT_AUTHORITY_SEED], &program_id())
 }
 
 pub fn receipt_pda(operation: &[u8; 32]) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[RECEIPT_SEED, operation], &PROGRAM_ID)
+    Pubkey::find_program_address(&[RECEIPT_SEED, operation], &program_id())
 }
 
 pub fn approval_pda(operation: &[u8; 32], direction: u8) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[APPROVAL_SEED, operation, &[direction]], &PROGRAM_ID)
+    Pubkey::find_program_address(&[APPROVAL_SEED, operation, &[direction]], &program_id())
 }
 
 #[derive(BorshSerialize)]
@@ -84,7 +95,7 @@ pub fn initialize_ix(
         data.extend_from_slice(attester.as_ref());
     }
     Ok(Instruction {
-        program_id: PROGRAM_ID,
+        program_id: program_id(),
         accounts: vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(config, false),
@@ -98,6 +109,21 @@ pub fn initialize_ix(
     })
 }
 
+pub fn close_config_ix(payer: Pubkey, attesters: [Pubkey; 3]) -> Result<Instruction> {
+    let (config, _) = config_pda();
+    Ok(Instruction {
+        program_id: program_id(),
+        accounts: vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(config, false),
+            AccountMeta::new_readonly(attesters[0], true),
+            AccountMeta::new_readonly(attesters[1], true),
+            AccountMeta::new_readonly(attesters[2], true),
+        ],
+        data: disc("close_config").to_vec(),
+    })
+}
+
 pub fn approve_ix(payer: Pubkey, args: &ApproveFields) -> Result<Instruction> {
     let (config, _) = config_pda();
     let (receipt, _) = receipt_pda(&args.operation);
@@ -105,7 +131,7 @@ pub fn approve_ix(payer: Pubkey, args: &ApproveFields) -> Result<Instruction> {
     let mut data = disc("approve_operation").to_vec();
     data.extend_from_slice(&args.try_to_vec()?);
     Ok(Instruction {
-        program_id: PROGRAM_ID,
+        program_id: program_id(),
         accounts: vec![
             AccountMeta::new(payer, true),
             AccountMeta::new_readonly(config, false),
@@ -137,7 +163,7 @@ pub fn lock_ix(
     let mut data = disc("lock_confidential").to_vec();
     data.extend_from_slice(&args.try_to_vec()?);
     Ok(Instruction {
-        program_id: PROGRAM_ID,
+        program_id: program_id(),
         accounts: vec![
             AccountMeta::new_readonly(source_authority, true),
             AccountMeta::new_readonly(config, false),
@@ -178,7 +204,7 @@ pub fn move_ix(
     let mut data = disc(name).to_vec();
     data.extend_from_slice(&args.try_to_vec()?);
     Ok(Instruction {
-        program_id: PROGRAM_ID,
+        program_id: program_id(),
         accounts: vec![
             AccountMeta::new_readonly(config, false),
             AccountMeta::new(receipt, false),

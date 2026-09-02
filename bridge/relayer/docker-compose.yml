@@ -18,6 +18,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./config.json:/app/config/config.json:ro
+      - ${RELAYER_CONFIG:-./config.json}:/app/config/config.json:ro
       - ./networks:/app/config/networks:ro
       - ./keys:/app/config/keys:ro

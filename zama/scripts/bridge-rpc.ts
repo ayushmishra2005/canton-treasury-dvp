@@ -13,6 +13,10 @@ async function main() {
     throw new Error("ZAMA_ENGINE, ZAMA_KEY and ZAMA_METHOD are required");
   }
   const provider = new ethers.JsonRpcProvider(rpc);
+  const chainId = Number((await provider.getNetwork()).chainId);
+  if (chainId === 11155111 && fhevm.isMock) {
+    throw new Error("mock FHE must be disabled on Sepolia");
+  }
   const signer = new ethers.Wallet(key, provider);
   const engine = ConfidentialRiskEngine__factory.connect(engineAddress, signer);
 
@@ -36,7 +40,11 @@ async function main() {
       .add64(BigInt(amount))
       .encrypt();
     const tx = await engine.reserve(reservationId, clientId, encrypted.handles[0], encrypted.inputProof);
-    await tx.wait();
+    const receipt = await tx.wait();
+    if (receipt) {
+      console.log("ZAMA_TX " + receipt.hash);
+      console.log("ZAMA_GAS " + receipt.gasUsed.toString());
+    }
     const handle = await engine.approvalHandle(reservationId);
     const approved = await fhevm.publicDecryptEbool(handle);
     console.log("ZAMA_RESULT " + JSON.stringify({ approved }));
@@ -44,7 +52,10 @@ async function main() {
   }
 
   if (method === "finalize" || method === "cancel" || method === "redeem") {
-    await settle(engine, method, args[0]);
+    const hash = await settle(engine, method, args[0]);
+    if (hash) {
+      console.log("ZAMA_TX " + hash);
+    }
     console.log("ZAMA_RESULT " + JSON.stringify({ ok: true }));
     return;
   }
@@ -52,16 +63,23 @@ async function main() {
   throw new Error("unsupported Zama method: " + method);
 }
 
-async function settle(engine: ConfidentialRiskEngine, method: "finalize" | "cancel" | "redeem", id: string) {
-  if (method === "finalize") {
-    await (await engine.finalize(id)).wait();
-    return;
+async function settle(
+  engine: ConfidentialRiskEngine,
+  method: "finalize" | "cancel" | "redeem",
+  id: string
+): Promise<string | undefined> {
+  const tx =
+    method === "finalize"
+      ? await engine.finalize(id)
+      : method === "cancel"
+        ? await engine.cancel(id)
+        : await engine.redeem(id);
+  const receipt = await tx.wait();
+  if (receipt) {
+    console.log("ZAMA_GAS " + receipt.gasUsed.toString());
+    return receipt.hash;
   }
-  if (method === "cancel") {
-    await (await engine.cancel(id)).wait();
-    return;
-  }
-  await (await engine.redeem(id)).wait();
+  return undefined;
 }
 
 main().catch((error) => {

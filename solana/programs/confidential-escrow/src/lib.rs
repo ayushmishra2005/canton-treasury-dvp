@@ -22,6 +22,10 @@ pub mod confidential_escrow {
         handlers::initialize(ctx, args)
     }
 
+    pub fn close_config(ctx: Context<CloseConfig>) -> Result<()> {
+        handlers::close_config(ctx)
+    }
+
     pub fn lock_confidential(ctx: Context<LockConfidential>, args: LockArgs) -> Result<()> {
         handlers::lock_confidential(ctx, args)
     }

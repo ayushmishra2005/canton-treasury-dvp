@@ -19,7 +19,8 @@ use crate::canonical::{
 use crate::canton::{require_canton_ledger_evidence, CantonClient, CantonLedgerExpectation};
 use crate::confidential::generate_transfer_proofs;
 use crate::journal::{
-    encode_bytes, resume_matches_recorded_operation, Journal, OperationStore, Secrets, Step,
+    encode_bytes, resume_matches_recorded_operation, reverse_endpoints, Journal, OperationStore,
+    Secrets, Step,
 };
 use crate::program::{
     approval_pda, approve_ix, config_pda, lock_ix, move_ix, receipt_pda, ApproveFields, LockFields,
@@ -65,6 +66,7 @@ pub struct Workflow {
     pub inject_attester_disagreement: bool,
     pub inject_unknown_attester: bool,
     pub cancel_locked: bool,
+    pub reverse_endpoints: bool,
 }
 
 impl Workflow {
@@ -548,6 +550,13 @@ impl Workflow {
         journal.operation_hex = hex::encode(operation);
         secrets.blinding = encode_bytes(&blinding);
         blinding.zeroize();
+        if self.reverse_endpoints {
+            reverse_endpoints(&mut journal, &mut secrets);
+            println!(
+                "REVERSED_ENDPOINTS source={} payout={}",
+                journal.source, journal.payout_destination
+            );
+        }
         let accounts = accounts_from_secrets(&journal, &secrets)?;
         Ok((accounts, journal, secrets))
     }

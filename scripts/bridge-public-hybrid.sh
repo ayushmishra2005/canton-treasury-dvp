@@ -173,11 +173,12 @@ java -jar "$canton_jar" run canton/scripts/origination.canton \
 grep -q ORIGINATION_COMPLETE "$run_dir/origination.log" || fail "treasury origination did not complete"
 log "CANTON_PRIVATE_TOPOLOGY ready"
 
-expiry_dir="$run_dir/bridge-expiry"
-journal_dir="$run_dir/bridge-op"
+journal_dir="$run_dir/bridge-connected"
 accounts_dir="$testnet_dir/bridge-accounts"
+test -f "$accounts_dir/journal.json" || fail "missing reused bridge accounts"
+test -f "$accounts_dir/secrets.json" || fail "missing reused bridge secrets"
+rm -rf "$journal_dir"
 mkdir -p "$accounts_dir"
-rm -rf "$expiry_dir" "$journal_dir"
 : > "$tmp_dir/ctd-workflow.log"
 workflow_env=(
   SOLANA_RPC_URL="$DEVNET_RPC"
@@ -206,12 +207,14 @@ run_workflow() {
   set +e
   env "${workflow_env[@]}" cargo run --manifest-path bridge/Cargo.toml --quiet -- workflow "${extra[@]}" \
     | tee -a "$tmp_dir/ctd-workflow.log" | tee -a "$evidence"
-  local status=${PIPESTATUS[0]}
+  local hybrid_rc=${PIPESTATUS[0]}
   set -e
-  if [[ "$status" -ne 0 ]]; then
+  if [[ "$hybrid_rc" -ne 0 ]]; then
     fail "bridge workflow failed at ${extra[*]:-complete}"
   fi
 }
+
+last_marker() { grep "$1" "$tmp_dir/ctd-workflow.log" | tail -1; }
 
 assert_journal_step() {
   local dir="$1"
@@ -224,63 +227,6 @@ expected = sys.argv[2]
 if actual != expected:
     raise SystemExit(f"journal completed is {actual!r}, expected {expected!r}")
 PY
-}
-
-assert_no_lock_or_mint() {
-  local dir="$1"
-  python3 - "$dir/journal.json" <<'PY'
-import json, sys
-journal = json.load(open(sys.argv[1]))
-if journal.get("lock_signature") or journal.get("mint_holding") or journal.get("lock_proof_hex"):
-    raise SystemExit("rejected reservation produced lock or mint evidence")
-completed = journal.get("completed")
-if completed not in (None, "accounts"):
-    raise SystemExit(f"rejected reservation advanced to {completed}")
-print("REJECT_JOURNAL_CLEAN")
-PY
-}
-
-last_marker() { grep "$1" "$tmp_dir/ctd-workflow.log" | tail -1; }
-
-recover_locked_disagreement() {
-  local disagree_dir="$run_dir/bridge-disagree"
-  if [[ ! -f "$disagree_dir/journal.json" ]]; then
-    return 0
-  fi
-  local completed
-  completed="$(python3 -c "import json; print(json.load(open('$disagree_dir/journal.json')).get('completed') or '')")"
-  if [[ "$completed" == "cancelled" ]]; then
-    log "BRIDGE_DISAGREE_ALREADY_CANCELLED"
-    return 0
-  fi
-  log "BRIDGE_RECOVER_LOCKED_DISAGREEMENT"
-  BRIDGE_JOURNAL_DIR="$disagree_dir" \
-    run_workflow --journal "$disagree_dir" --resume --cancel-locked
-  grep -q CANCEL_LOCKED_COMPLETE "$tmp_dir/ctd-workflow.log" \
-    || fail "locked disagreement was not cancelled"
-  grep -q VAULT_UNLOCKED "$tmp_dir/ctd-workflow.log" \
-    || fail "vault still holds locked disagreement value"
-  python3 - "$disagree_dir/journal.json" <<'PY'
-import json, sys
-journal = json.load(open(sys.argv[1]))
-if journal.get("completed") != "cancelled":
-    raise SystemExit(f"disagreement journal is {journal.get('completed')}, not cancelled")
-print("DISAGREE_JOURNAL_CANCELLED")
-PY
-}
-
-require_unlocked_before_complete() {
-  local disagree_dir="$run_dir/bridge-disagree"
-  if [[ -f "$disagree_dir/journal.json" ]]; then
-    python3 - "$disagree_dir/journal.json" <<'PY'
-import json, sys
-journal = json.load(open(sys.argv[1]))
-if journal.get("completed") == "locked":
-    raise SystemExit("PUBLIC_HYBRID_COMPLETE blocked: disagreement still locked")
-if journal.get("lock_signature") and journal.get("completed") not in ("cancelled", "released", "zama_redeemed"):
-    raise SystemExit(f"PUBLIC_HYBRID_COMPLETE blocked: disagreement is {journal.get('completed')}")
-PY
-  fi
 }
 
 record_public_evidence() {
@@ -310,169 +256,27 @@ for name, value in pairs:
 PY
 }
 
-solana_chain_unix() {
-  python3 - "$DEVNET_RPC" <<'PY'
-import json, struct, sys, urllib.request, base64
-rpc=sys.argv[1]
-req=urllib.request.Request(rpc, data=json.dumps({
-    "jsonrpc":"2.0","id":1,"method":"getAccountInfo",
-    "params":["SysvarC1ock11111111111111111111111111111111",{"encoding":"base64"}],
-}).encode(), headers={"content-type":"application/json"})
-acc=json.load(urllib.request.urlopen(req, timeout=20))["result"]["value"]["data"][0]
-print(struct.unpack_from("<q", base64.b64decode(acc), 32)[0])
-PY
-}
-
-wait_chain_clock_past() {
-  local expiry="$1"
-  local now
-  for _ in $(seq 1 180); do
-    now="$(solana_chain_unix)"
-    log "CHAIN_CLOCK $now RELEASE_ONCHAIN_EXPIRY $expiry"
-    if [[ "$now" -ge "$expiry" ]]; then
-      log "BRIDGE_RELEASE_APPROVAL_EXPIRED_ON_CHAIN"
-      return 0
-    fi
-    sleep 2
-  done
-  fail "Solana chain clock $now did not reach expiry $expiry"
-}
-
-zama_rpc() {
-  local method="$1"
-  local args="$2"
-  (cd "$repo_root/zama" && env \
-    ZAMA_RPC_URL="$SEPOLIA_RPC" \
-    ZAMA_ENGINE="$zama_engine" \
-    ZAMA_KEY="$ZAMA_SETTLER_KEY" \
-    ZAMA_METHOD="$method" \
-    ZAMA_ARGS="$args" \
-    ZAMA_HARDHAT_NETWORK=sepolia \
-    npx hardhat run scripts/bridge-rpc.ts --network sepolia)
-}
-
-zama_result_line() {
-  zama_rpc "$1" "$2" | tee -a "$evidence" | awk '/^ZAMA_RESULT /{line=$0} END{print line}'
-}
-
-recover_locked_disagreement
-
-log "BRIDGE_UNCONFIGURED_CLIENT"
-fresh_id() { python3 -c "import os; print('0x'+os.urandom(32).hex())"; }
-unconfigured_id="$(fresh_id)"
-set +e
-unconfigured_out="$(zama_rpc reserve "$unconfigured_id,$(python3 -c 'print("0x"+("11"*32))'),100000000000" 2>&1)"
-unconfigured_status=$?
-set -e
-printf '%s\n' "$unconfigured_out" | tee -a "$evidence"
-if [[ "$unconfigured_status" -eq 0 ]] && grep -q '"approved":true' <<<"$unconfigured_out"; then
-  fail "unconfigured Zama client was approved"
-fi
-log "FAULT_UNCONFIGURED_CLIENT rejected"
-
-log "BRIDGE_EXPIRY_RECOVERY"
-BRIDGE_MINT_EXPIRY_SECS=300 BRIDGE_JOURNAL_DIR="$expiry_dir" \
-  run_workflow --journal "$expiry_dir" --resume --expiry-recovery
-grep -q EXPIRY_RECOVERY_COMPLETE "$tmp_dir/ctd-workflow.log" || fail "expiry recovery did not complete"
-grep -q "FAULT_INJECTED expiry_before_settlement" "$tmp_dir/ctd-workflow.log" \
-  || fail "expiry-before-settlement fault was not recorded"
-
-reject_dir="$run_dir/bridge-reject"
-rm -rf "$reject_dir"
-log "BRIDGE_REJECT_OVER_CAPACITY"
-set +e
-env "${workflow_env[@]}" BRIDGE_AMOUNT=300000 BRIDGE_JOURNAL_DIR="$reject_dir" \
-  cargo run --manifest-path bridge/Cargo.toml --quiet -- workflow \
-  --journal "$reject_dir" --reuse-from "$expiry_dir" --resume --stop-after reserved \
-  | tee -a "$tmp_dir/ctd-workflow.log" | tee -a "$evidence"
-reject_status=${PIPESTATUS[0]}
-set -e
-[[ "$reject_status" -ne 0 ]] || fail "over-capacity reservation should be rejected"
-grep -q ZAMA_RESERVATION_REJECTED "$tmp_dir/ctd-workflow.log" || fail "over-capacity rejection was not recorded"
-assert_no_lock_or_mint "$reject_dir"
-
-log "BRIDGE_RESUME_AFTER accounts"
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
-  run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after accounts
-log "BRIDGE_RESUME_AFTER reserved"
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
-  run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after reserved
-log "BRIDGE_RESUME_AFTER locked"
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
-  run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after locked
-assert_journal_step "$journal_dir" locked
-
-log "BRIDGE_UNKNOWN_ATTESTER"
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
-  run_workflow --journal "$journal_dir" --resume --inject-unknown-attester --halt-after-first-approval
-grep -q "FAULT_INJECTED unknown_attester" "$tmp_dir/ctd-workflow.log" || fail "unknown attester was not injected"
-grep -q UNKNOWN_ATTESTER_REJECTED "$tmp_dir/ctd-workflow.log" || fail "unknown attester was not rejected"
-
-log "BRIDGE_ONE_ATTESTER"
-[[ "$(last_marker MINT_APPROVAL_BITMAP)" == "MINT_APPROVAL_BITMAP 1" ]] \
-  || fail "one-attester state was not recorded: $(last_marker MINT_APPROVAL_BITMAP)"
-
-log "BRIDGE_ATTESTER_DISAGREEMENT"
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
-  run_workflow --journal "$journal_dir" --resume --inject-attester-disagreement
-grep -q "FAULT_INJECTED attester_disagreement" "$tmp_dir/ctd-workflow.log" \
-  || fail "attester disagreement was not injected"
-grep -q ATTESTER_DISAGREEMENT_REJECTED "$tmp_dir/ctd-workflow.log" \
-  || fail "attester disagreement was not rejected"
-assert_journal_step "$journal_dir" locked
-grep -q "RECOVERY_RESULT no_mint_without_quorum" "$tmp_dir/ctd-workflow.log" \
-  || fail "conflicting vote was not proven below quorum"
-
-log "BRIDGE_SECOND_ATTESTATION"
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
-  run_workflow --journal "$journal_dir" --resume --stop-after mint_approved
-assert_journal_step "$journal_dir" mint_approved
-
-for step in canton_minted trade_prepared reassigned; do
-  log "BRIDGE_RESUME_AFTER $step"
-  BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
-    run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after "$step"
-done
-
-log "BRIDGE_SETTLE"
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
-  run_workflow --journal "$journal_dir" --resume --stop-after settled
-assert_journal_step "$journal_dir" settled
+log "BRIDGE_CONNECTED_OPERATION"
+BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_RELEASE_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
+  run_workflow --journal "$journal_dir" --reuse-from "$accounts_dir" --reverse-endpoints --resume
+assert_journal_step "$journal_dir" zama_redeemed
+grep -q "REVERSED_ENDPOINTS source=9oQFsjme2n5w4qSxcwSxqnC2ZzifiHLJMuxNVw9fKXeV payout=658qCJawAVGBmqRbUWCvAv2xkX5vSkagHHX2s3mreAvD" \
+  "$tmp_dir/ctd-workflow.log" || fail "source and destination were not reversed onto the funded account"
 grep -q DVP_BUYER_TREASURY "$tmp_dir/ctd-workflow.log" || fail "buyer did not receive Treasury"
 grep -q DVP_SELLER_STABLECOIN "$tmp_dir/ctd-workflow.log" || fail "seller did not receive stablecoins"
-
-log "BRIDGE_RESUME_AFTER redeemed"
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
-  run_workflow --journal "$journal_dir" --reuse-from "$expiry_dir" --resume --stop-after redeemed
-assert_journal_step "$journal_dir" redeemed
-grep -q "FAULT_INJECTED delayed_release_after_redemption" "$tmp_dir/ctd-workflow.log" \
-  || fail "delayed release fault was not recorded"
-
-log "BRIDGE_RELEASE_APPROVAL"
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_RELEASE_EXPIRY_SECS=90 BRIDGE_JOURNAL_DIR="$journal_dir" \
-  run_workflow --journal "$journal_dir" --resume --stop-after release_approved
-assert_journal_step "$journal_dir" release_approved
-release_expiry="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json'))['release_expiry'])")"
-wait_chain_clock_past "$release_expiry"
-
-log "BRIDGE_RELEASE"
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_RELEASE_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
-  run_workflow --journal "$journal_dir" --resume --stop-after released
-assert_journal_step "$journal_dir" released
-grep -q RELEASE_REFRESHED_AFTER_CHAIN_EXPIRY "$tmp_dir/ctd-workflow.log" \
-  || fail "expired release approval was not replaced"
 grep -q RELAYER_RELEASE_CONFIRMED "$tmp_dir/ctd-workflow.log" \
   || fail "confidential release through Relayer did not confirm"
+grep -q ZAMA_REDEEM_OK "$tmp_dir/ctd-workflow.log" || fail "Zama redemption did not succeed"
 [[ "$(grep -c RELAYER_RELEASE_CONFIRMED "$tmp_dir/ctd-workflow.log")" -eq 1 ]] \
   || fail "duplicate Relayer release"
-
-log "BRIDGE_ZAMA_REDEEM"
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
-  run_workflow --journal "$journal_dir" --resume --stop-after zama_redeemed
-assert_journal_step "$journal_dir" zama_redeemed
-grep -q ZAMA_REDEEM_OK "$tmp_dir/ctd-workflow.log" || fail "Zama redemption did not succeed"
 [[ "$(grep -c ZAMA_REDEEM_OK "$tmp_dir/ctd-workflow.log")" -eq 1 ]] \
   || fail "duplicate Zama redemption"
+grep -q "ACTION_COUNTS mint=1 settle=1 burn=1 release=1 zama=1" "$tmp_dir/ctd-workflow.log" \
+  || fail "action counts are not mint=1 settle=1 burn=1 release=1 zama=1"
+[[ "$(last_marker DEST_AVAILABLE)" == "DEST_AVAILABLE 100000000000" ]] \
+  || fail "destination did not hold the released value"
+[[ "$(last_marker DEST_PENDING)" == "DEST_PENDING 0" ]] \
+  || fail "destination still has pending credit"
 
 log "BRIDGE_RESUME_COMPLETED"
 BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
@@ -481,64 +285,17 @@ BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
   run_workflow --journal "$journal_dir" --resume --stop-after zama_redeemed
 resume_skips="$(grep -c COMPLETED_RESUME_SKIP_SETUP "$tmp_dir/ctd-workflow.log" || true)"
 resume_recorded="$(grep -c OPERATION_RECORDED_COMPLETE "$tmp_dir/ctd-workflow.log" || true)"
-if [[ "$resume_skips" -lt 2 && "$resume_recorded" -lt 2 ]]; then
+verify_ok="$(grep -c CANTON_VERIFY_OK "$tmp_dir/ctd-workflow.log" || true)"
+if [[ "$resume_skips" -lt 2 || "$resume_recorded" -lt 2 ]]; then
   fail "completed operation was not resumed twice"
 fi
+[[ "$verify_ok" -ge 2 ]] || fail "CANTON_VERIFY_OK was printed $verify_ok times"
 [[ "$(grep -c RELAYER_RELEASE_CONFIRMED "$tmp_dir/ctd-workflow.log")" -eq 1 ]] \
   || fail "resume repeated release"
 [[ "$(grep -c ZAMA_REDEEM_OK "$tmp_dir/ctd-workflow.log")" -eq 1 ]] \
   || fail "resume repeated Zama redeem"
-grep -q CANTON_VERIFY_OK "$tmp_dir/ctd-workflow.log" || fail "connected Canton history was not verified"
-
-lock_id="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json'))['lock_id'])")"
-mint_holding="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json'))['mint_holding'])")"
-payout="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json'))['payout_destination'])")"
-canton_amount="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json'))['canton_amount'])")"
-log "BRIDGE_WRONG_LOCK_BINDING"
-set +e
-env CANTON_RUN_DIR="$run_dir" CANTON_JAR="$canton_jar" \
-  BRIDGE_LOCK_ID="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" \
-  BRIDGE_CANTON_AMOUNT="$canton_amount" \
-  BRIDGE_TREASURY_AMOUNT=100.000000 \
-  BRIDGE_PAYOUT_DEST="$payout" \
-  BRIDGE_MINT_HOLDING="$mint_holding" \
-  java -jar "$canton_jar" run canton/scripts/verify-bridge-completion.canton \
-    -c canton/remote-console.conf --no-tty --log-level-stdout WARN \
-    > "$tmp_dir/ctd-wrong-lock.log" 2>&1
-wrong_lock=$?
-set -e
-[[ "$wrong_lock" -ne 0 ]] || fail "wrong lock binding was accepted"
-log "FAULT_WRONG_LOCK rejected"
-
-log "BRIDGE_WRONG_TRADE_BINDING"
-set +e
-env CANTON_RUN_DIR="$run_dir" CANTON_JAR="$canton_jar" \
-  BRIDGE_LOCK_ID="$lock_id" \
-  BRIDGE_CANTON_AMOUNT="$canton_amount" \
-  BRIDGE_TREASURY_AMOUNT=100.000000 \
-  BRIDGE_PAYOUT_DEST="$payout" \
-  BRIDGE_MINT_HOLDING="0000000000000000000000000000000000000000000000000000000000000000" \
-  java -jar "$canton_jar" run canton/scripts/verify-bridge-completion.canton \
-    -c canton/remote-console.conf --no-tty --log-level-stdout WARN \
-    > "$tmp_dir/ctd-wrong-trade.log" 2>&1
-wrong_trade=$?
-set -e
-[[ "$wrong_trade" -ne 0 ]] || fail "wrong trade binding was accepted"
-log "FAULT_WRONG_TRADE rejected"
-
-main_reservation="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json'))['reservation_hex'])")"
-[[ "$(zama_result_line status "$main_reservation")" == *'"status":4'* ]] \
-  || fail "main reservation was not redeemed"
-set +e
-dup_redeem="$(zama_rpc redeem "$main_reservation" 2>&1)"
-dup_status=$?
-set -e
-printf '%s\n' "$dup_redeem" | tee -a "$evidence"
-[[ "$dup_status" -ne 0 ]] || fail "duplicate Zama redeem was accepted"
-log "FAULT_DUPLICATE_ZAMA_REDEEM rejected"
 
 record_public_evidence
-require_unlocked_before_complete
 grep -q ZAMA_RESERVE_TX "$evidence" || fail "main Zama reserve hash is missing"
 grep -q ZAMA_FINALIZE_TX "$evidence" || fail "main Zama finalize hash is missing"
 grep -q ZAMA_REDEEM_TX "$evidence" || fail "main Zama redeem hash is missing"

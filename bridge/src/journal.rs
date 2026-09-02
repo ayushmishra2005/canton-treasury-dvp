@@ -342,6 +342,14 @@ pub fn units_from_journal(journal: &Journal) -> Result<TokenUnits> {
     TokenUnits::from_base_units(journal.base_units, journal.decimals)
 }
 
+pub fn reverse_endpoints(journal: &mut Journal, secrets: &mut Secrets) {
+    std::mem::swap(&mut journal.source, &mut journal.payout_destination);
+    journal.refund_destination = journal.source.clone();
+    std::mem::swap(&mut secrets.source_authority, &mut secrets.dest_authority);
+    std::mem::swap(&mut secrets.source_elgamal, &mut secrets.dest_elgamal);
+    std::mem::swap(&mut secrets.source_aes, &mut secrets.dest_aes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +368,37 @@ mod tests {
         resume_matches_recorded_operation(&journal, 100_000_000_000, "dest").unwrap();
         assert!(resume_matches_recorded_operation(&journal, 200_000_000_000, "dest").is_err());
         assert!(resume_matches_recorded_operation(&journal, 100_000_000_000, "other").is_err());
+    }
+
+    #[test]
+    fn reverse_endpoints_swaps_source_and_destination_keys() {
+        let mut journal = Journal {
+            source: "source-token".into(),
+            payout_destination: "dest-token".into(),
+            refund_destination: "source-token".into(),
+            ..Journal::default()
+        };
+        let mut secrets = Secrets {
+            source_authority: "src-auth".into(),
+            dest_authority: "dst-auth".into(),
+            source_elgamal: "src-elg".into(),
+            dest_elgamal: "dst-elg".into(),
+            source_aes: "src-aes".into(),
+            dest_aes: "dst-aes".into(),
+            vault_aes: "vault-aes".into(),
+            ..Secrets::default()
+        };
+        reverse_endpoints(&mut journal, &mut secrets);
+        assert_eq!(journal.source, "dest-token");
+        assert_eq!(journal.payout_destination, "source-token");
+        assert_eq!(journal.refund_destination, "dest-token");
+        assert_eq!(secrets.source_authority, "dst-auth");
+        assert_eq!(secrets.dest_authority, "src-auth");
+        assert_eq!(secrets.source_elgamal, "dst-elg");
+        assert_eq!(secrets.dest_elgamal, "src-elg");
+        assert_eq!(secrets.source_aes, "dst-aes");
+        assert_eq!(secrets.dest_aes, "src-aes");
+        assert_eq!(secrets.vault_aes, "vault-aes");
     }
 
     #[test]

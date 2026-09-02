@@ -75,6 +75,24 @@ No assertion relies on a contract merely being absent from the active contract s
 ACS would be satisfied by an archived contract that the participant had watched throughout, which is
 precisely the case that must not pass.
 
+## Bridge contracts
+
+These visibility rules follow the signatories and observers on the templates. They are not the
+97-assertion integration matrix above. BindingAuth checks that an outsider, attester, and venue do
+not see `BridgeMintRef` or `BridgeTradeBinding`, and that the seller sees the binding.
+
+| Contract | Signatories | Observers | Who sees it |
+|---|---|---|---|
+| `BridgeMintRef` | `cashRegistry` | `buyer` | cash registry and buyer |
+| `BridgeTradeBinding` | `cashRegistry`, `buyer` | `seller` | cash registry, buyer, and seller. The venue is not an observer |
+| `BridgeAttestation` | attester | `cashRegistry` | that attester and the cash registry |
+| `RedemptionRequest` | `holder` | `cashRegistry` | the requesting holder and the cash registry |
+| `RedeemedLock` | `cashRegistry` | `holder` | the cash registry and the redeemed holder |
+| `MintedLock` | `cashRegistry` | `beneficiary` | the cash registry and the mint beneficiary |
+| `BridgeGateway` | `cashRegistry` | none | the cash registry |
+
+No observer list was widened to make a test pass.
+
 ## What these tests do not prove
 
 - **Not confidentiality against a compromised participant.** The assertions describe what Canton

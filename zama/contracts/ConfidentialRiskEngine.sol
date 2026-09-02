@@ -14,6 +14,7 @@ contract ConfidentialRiskEngine is AccessControl, Pausable {
     bytes32 public constant POLICY_ADMIN_ROLE = keccak256("POLICY_ADMIN_ROLE");
     bytes32 public constant REQUESTER_ROLE = keccak256("REQUESTER_ROLE");
     bytes32 public constant SETTLER_ROLE = keccak256("SETTLER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
     enum ReservationStatus {
         Empty,
@@ -47,6 +48,7 @@ contract ConfidentialRiskEngine is AccessControl, Pausable {
     error DuplicateReservation();
     error UnknownReservation();
     error WrongReservationStatus();
+    error ClientNotConfigured();
 
     constructor(address policyAdmin, address requester, address settler, address pauser) {
         FHE.setCoprocessor(ZamaConfig.getEthereumCoprocessorConfig());
@@ -54,7 +56,7 @@ contract ConfidentialRiskEngine is AccessControl, Pausable {
         _grantRole(POLICY_ADMIN_ROLE, policyAdmin);
         _grantRole(REQUESTER_ROLE, requester);
         _grantRole(SETTLER_ROLE, settler);
-        _grantRole(POLICY_ADMIN_ROLE, pauser);
+        _grantRole(PAUSER_ROLE, pauser);
         globalCapacity = FHE.asEuint64(0);
         reservedExposure = FHE.asEuint64(0);
         activeExposure = FHE.asEuint64(0);
@@ -63,11 +65,11 @@ contract ConfidentialRiskEngine is AccessControl, Pausable {
         FHE.allowThis(activeExposure);
     }
 
-    function pause() external onlyRole(POLICY_ADMIN_ROLE) {
+    function pause() external onlyRole(PAUSER_ROLE) {
         _pause();
     }
 
-    function unpause() external onlyRole(POLICY_ADMIN_ROLE) {
+    function unpause() external onlyRole(PAUSER_ROLE) {
         _unpause();
     }
 
@@ -111,6 +113,9 @@ contract ConfidentialRiskEngine is AccessControl, Pausable {
     {
         if (reservationStatus[reservationId] != ReservationStatus.Empty) {
             revert DuplicateReservation();
+        }
+        if (!clientConfigured[clientId]) {
+            revert ClientNotConfigured();
         }
         euint64 amount = FHE.fromExternal(encryptedAmount, inputProof);
         (ebool reservedOk, euint64 nextReserved) = FHESafeMath.tryIncrease(reservedExposure, amount);

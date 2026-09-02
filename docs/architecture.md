@@ -6,15 +6,18 @@ contracts live, and exactly where atomicity begins and ends. The narrative overv
 
 ## Package boundaries
 
-Five Daml packages, plus the vendored Canton Token Standard V1 interface packages under `lib/`.
+Eight Daml packages, plus the vendored Canton Token Standard V1 interface packages under `lib/`.
 
 | Package | Depends on | Deliberately does not depend on |
 |---|---|---|
-| `treasury-registry` | Token Standard V1 metadata, holding, allocation, allocation-instruction | `stablecoin-registry`, `dvp-settlement` |
-| `stablecoin-registry` | the same Token Standard V1 interfaces | `treasury-registry`, `dvp-settlement` |
-| `dvp-settlement` | Token Standard V1 metadata, holding, allocation, allocation-request | both registries |
-| `tests` | all three, for test fixtures only | — |
-| `integration` | all three, for the multi-participant scenario only | — |
+| `treasury-registry` | Token Standard V1 metadata, holding, allocation, allocation-instruction | `stablecoin-registry`, `dvp-settlement`, `bridge-gateway` |
+| `stablecoin-registry` | the same Token Standard V1 interfaces | `treasury-registry`, `dvp-settlement`, `bridge-gateway` |
+| `dvp-settlement` | Token Standard V1 metadata, holding, allocation, allocation-request | both registries, `bridge-gateway` |
+| `bridge-gateway` | Token Standard V1 holding, `stablecoin-registry` | `dvp-settlement`, `treasury-registry` |
+| `bridge-tests` | registries, settlement, `bridge-gateway` | — |
+| `tests` | both registries and settlement, for core DvP fixtures only | `bridge-gateway` |
+| `integration` | both registries and settlement, for the multi-participant scenario only | `bridge-gateway` |
+| `integration-control` | none of the application packages | used only for stream-control events |
 
 The two registries share no code. Eligibility, holdings, splitting and merging, and the allocation
 factory are implemented twice rather than factored into a common package, because a shared package
@@ -147,3 +150,16 @@ legs in one Daml transaction. The two synchronizers never jointly execute anythi
 
 There is no code path that settles one leg and then the other. Both are consequences of one choice,
 so Canton either commits both or neither.
+
+## Bridge boundary
+
+The confidential rail is outside that Canton atomic unit. Solana lock, Zama reservation, Canton
+mint, `DvpTrade_Settle`, seller redemption, Relayer release, and Zama redeem are separate steps.
+A crash or delay can leave value locked on one chain while another step is unfinished. Resume
+continues the unfinished step; it does not make the whole rail one atomic transaction.
+
+`bridge-gateway` mints and burns stablecoin on Canton. It does not import `dvp-settlement`. The
+trade is named on `BridgeTradeBinding` as text. `Gateway_Redeem` accepts only the binding for that
+lock whose recorded seller payment is the holding being burned. The connected Canton history
+verifier then proves that payment was created by the bound `DvpTrade_Settle`. That is a completion
+check after settlement, not cross-chain atomicity.

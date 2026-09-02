@@ -1,0 +1,7 @@
+# Transitive RustSec advisories that remain because of the pinned Solana stack.
+# These are not fixed. The audit gate fails if any other advisory appears.
+RUSTSEC-2024-0344
+RUSTSEC-2022-0093
+RUSTSEC-2026-0104
+RUSTSEC-2026-0098
+RUSTSEC-2026-0099

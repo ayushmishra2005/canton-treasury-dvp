@@ -1,11 +1,12 @@
 use anchor_lang::prelude::*;
-use solana_program::sysvar::instructions::{
+use anchor_lang::solana_program::ed25519_program;
+use anchor_lang::solana_program::sysvar::instructions::{
     load_current_index_checked, load_instruction_at_checked, ID as INSTRUCTIONS_ID,
 };
 
 use crate::errors::EscrowError;
 
-const ED25519_PROGRAM_ID: Pubkey = solana_program::ed25519_program::ID;
+const ED25519_PROGRAM_ID: Pubkey = ed25519_program::ID;
 const CURRENT_IX: u16 = u16::MAX;
 const PUBKEY_LEN: usize = 32;
 const SIGNATURE_LEN: usize = 64;

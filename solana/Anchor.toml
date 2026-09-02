@@ -6,7 +6,10 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-confidential_escrow = "CQrz5E2egFB8AyHDBVGrCai3c1msyyXsgmD6BuhXQpQd"
+confidential_escrow = "9Yuvt4HxfbGCL9gPk3ygMLV3UdrMFgAJsyhdoJvbKcUD"
+
+# Devnet uses a newly generated ignored keypair. Record only the public
+# program ID here after a real Devnet deploy. Do not reuse the localnet ID.
 
 [provider]
 cluster = "localnet"

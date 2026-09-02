@@ -346,10 +346,10 @@ recordBindingOutputs live lockId treasuryCid paymentCid = do
             recordedTreasuryCid = show treasuryCid
       Some afterBinding <- queryContractId live.buyer afterTreasury
       case afterBinding.sellerPaymentCid of
-        Some recordedPayment -> recordedPayment === show paymentCid
+        Some recordedPayment -> recordedPayment === paymentCid
         None -> do
           _ <- submit live.seller $ exerciseCmd afterTreasury BridgeTradeBinding_RecordPayment with
-            recordedPaymentCid = show paymentCid
+            recordedPaymentCid = paymentCid
           pure ()
     [] -> abort ("missing trade binding for lock " <> lockId)
     _ -> abort ("multiple trade bindings for lock " <> lockId)
@@ -634,7 +634,7 @@ alreadySettledText live amount lockId = do
       binding.mintHoldingCid === minted.holdingCid
       let treasuryCid = fromOptional "settled" binding.buyerTreasuryCid
           paymentCid = case (binding.sellerPaymentCid, locks) of
-            (Some cid, _) -> cid
+            (Some cid, _) -> show cid
             (None, _ :: _) -> "redeemed"
             (None, []) -> "settled"
       case locks of
@@ -928,16 +928,12 @@ boundSellerPayment live lockId amount = do
   case bindings of
     [(_, binding)] ->
       case binding.sellerPaymentCid of
-        Some paymentText -> do
-          found <- query @StablecoinHolding live.seller
-          case [(cid, holding) | (cid, holding) <- found, show cid == paymentText] of
-            [(cid, holding)] -> do
-              holding.owner === live.seller
-              holding.amount === amount
-              isNone holding.lock === True
-              pure (cid, holding)
-            [] -> abort ("RECOVERY_REQUIRED_ACTION seller must provide bound stablecoin holding " <> paymentText)
-            _ -> abort ("duplicate seller holdings for bound payment " <> paymentText)
+        Some paymentCid -> do
+          Some holding <- queryContractId live.seller paymentCid
+          holding.owner === live.seller
+          holding.amount === amount
+          isNone holding.lock === True
+          pure (paymentCid, holding)
         None -> abort ("settlement outputs are not recorded on the binding for lock " <> lockId)
     [] -> abort ("missing trade binding for lock " <> lockId)
     _ -> abort ("multiple trade bindings for lock " <> lockId)
@@ -955,7 +951,7 @@ reuseOrCreateRedemptionRequest live input amount = do
       case bindings of
         [(_, binding)] ->
           case binding.sellerPaymentCid of
-            Some paymentText -> show request.holdingCid === paymentText
+            Some paymentCid -> request.holdingCid === paymentCid
             None -> abort ("settlement outputs are not recorded on the binding for lock " <> input.lockId)
         [] -> abort ("missing trade binding for lock " <> input.lockId)
         _ -> abort ("multiple trade bindings for lock " <> input.lockId)
@@ -997,11 +993,22 @@ redeemFromLedger live input = do
       (requestCid, holdingCid) <- reuseOrCreateRedemptionRequest live input amount
       (firstCid, secondCid) <- reuseOrCreateRedeemAttestations live input amount
       (gatewayCid, _) <- only "bridge gateway" =<< query @BridgeGateway live.cashRegistry
+      bound <- bindingsForLock live input.lockId
+      bindingCid <- case bound of
+        [(cid, binding)] -> do
+          binding.cashRegistry === live.cashRegistry
+          binding.lockId === input.lockId
+          binding.seller === live.seller
+          binding.sellerPaymentCid === Some holdingCid
+          pure cid
+        [] -> abort ("missing trade binding for lock " <> input.lockId)
+        _ -> abort ("multiple trade bindings for lock " <> input.lockId)
       (_nextGateway, redeemedCid) <- submit live.cashRegistry $ exerciseCmd gatewayCid Gateway_Redeem with
         requestCid
         firstCid
         secondCid
         mintedLockCid = mintedCid
+        bindingCid
       after <- queryContractId live.seller holdingCid
       isNone after === True
       let redeemed =

@@ -1,6 +1,7 @@
 import "@fhevm/hardhat-plugin";
 import "@nomicfoundation/hardhat-ethers";
 import "@nomicfoundation/hardhat-chai-matchers";
+import "@typechain/hardhat";
 import { HardhatUserConfig } from "hardhat/config";
 
 const config: HardhatUserConfig = {
@@ -11,6 +12,10 @@ const config: HardhatUserConfig = {
       viaIR: true,
       optimizer: { enabled: true, runs: 200 },
     },
+  },
+  typechain: {
+    outDir: "typechain-types",
+    target: "ethers-v6",
   },
   networks: {
     hardhat: { chainId: 31337 },

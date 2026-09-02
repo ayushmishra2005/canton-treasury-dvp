@@ -1,9 +1,22 @@
 import { expect } from "chai";
 import { ethers, fhevm } from "hardhat";
 import { FhevmType } from "@fhevm/hardhat-plugin";
+import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
+import { ConfidentialRiskEngine } from "../typechain-types/contracts/ConfidentialRiskEngine";
+import { ConfidentialRiskEngine__factory } from "../typechain-types/factories/contracts/ConfidentialRiskEngine__factory";
 
 async function encrypt64(contract: string, user: string, value: bigint) {
   return fhevm.createEncryptedInput(contract, user).add64(value).encrypt();
+}
+
+async function deployEngine(
+  policyAdmin: HardhatEthersSigner,
+  requester: HardhatEthersSigner,
+  settler: HardhatEthersSigner,
+  pauser: HardhatEthersSigner
+): Promise<ConfidentialRiskEngine> {
+  const factory = new ConfidentialRiskEngine__factory(policyAdmin);
+  return factory.deploy(policyAdmin.address, requester.address, settler.address, pauser.address);
 }
 
 describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
@@ -13,8 +26,7 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
 
   it("reserves within encrypted capacity and rejects overflow", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
-    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
-    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const engine = await deployEngine(admin, requester, settler, admin);
     const address = await engine.getAddress();
 
     const cap = await encrypt64(address, admin.address, 1000n);
@@ -37,8 +49,7 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
 
   it("rejects duplicate reservation identifiers", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
-    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
-    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const engine = await deployEngine(admin, requester, settler, admin);
     const address = await engine.getAddress();
     const cap = await encrypt64(address, admin.address, 1000n);
     await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();
@@ -54,8 +65,7 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
 
   it("finalizes then redeems and rejects a second redeem", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
-    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
-    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const engine = await deployEngine(admin, requester, settler, admin);
     const address = await engine.getAddress();
     const cap = await encrypt64(address, admin.address, 1000n);
     await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();
@@ -72,8 +82,7 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
 
   it("cancels a reservation before finalize and keeps epoch live exposure", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
-    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
-    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const engine = await deployEngine(admin, requester, settler, admin);
     const address = await engine.getAddress();
     const cap = await encrypt64(address, admin.address, 1000n);
     await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();
@@ -91,8 +100,7 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
 
   it("rejects a second finalize and keeps concurrent reservations within capacity", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
-    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
-    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const engine = await deployEngine(admin, requester, settler, admin);
     const address = await engine.getAddress();
     const cap = await encrypt64(address, admin.address, 100n);
     await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();
@@ -112,8 +120,7 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
 
   it("rejected reservation finalize and redeem do not free another client's exposure", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
-    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
-    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const engine = await deployEngine(admin, requester, settler, admin);
     const address = await engine.getAddress();
     const cap = await encrypt64(address, admin.address, 150n);
     await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();
@@ -143,8 +150,7 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
 
   it("rejected reservation cancel and repeated settle calls leave live exposure unchanged", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
-    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
-    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const engine = await deployEngine(admin, requester, settler, admin);
     const address = await engine.getAddress();
     const cap = await encrypt64(address, admin.address, 150n);
     await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();
@@ -172,8 +178,7 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
 
   it("zero and overflowing reservation amounts stay rejected without changing later capacity", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
-    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
-    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const engine = await deployEngine(admin, requester, settler, admin);
     const address = await engine.getAddress();
     const cap = await encrypt64(address, admin.address, 50n);
     await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();
@@ -201,8 +206,7 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
 
   it("reapplying or changing a client limit preserves reserved and active usage", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
-    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
-    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const engine = await deployEngine(admin, requester, settler, admin);
     const address = await engine.getAddress();
     const cap = await encrypt64(address, admin.address, 200n);
     await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();
@@ -247,8 +251,7 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
 
   it("epoch rollover does not erase reserved or active exposure", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
-    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
-    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const engine = await deployEngine(admin, requester, settler, admin);
     const address = await engine.getAddress();
     const cap = await encrypt64(address, admin.address, 100n);
     await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();
@@ -277,8 +280,7 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
 
   it("capacity probe is rejected while exposure is live and approved after redeem", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
-    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
-    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const engine = await deployEngine(admin, requester, settler, admin);
     const address = await engine.getAddress();
     const cap = await encrypt64(address, admin.address, 200n);
     await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();
@@ -322,10 +324,69 @@ describe("ConfidentialRiskEngine (MOCK_FHE local execution)", function () {
     expect(await engine.reservationStatus(unrelatedId)).to.equal(1n);
   });
 
+  it("lets only the pauser pause and unpause", async function () {
+    const [admin, requester, settler, pauser] = await ethers.getSigners();
+    const engine = await deployEngine(admin, requester, settler, pauser);
+    await (await engine.connect(pauser).pause()).wait();
+    expect(await engine.paused()).to.equal(true);
+    await (await engine.connect(pauser).unpause()).wait();
+    expect(await engine.paused()).to.equal(false);
+  });
+
+  it("keeps the pauser from changing policy unless it also has POLICY_ADMIN_ROLE", async function () {
+    const [admin, requester, settler, pauser] = await ethers.getSigners();
+    const engine = await deployEngine(admin, requester, settler, pauser);
+    const address = await engine.getAddress();
+    const cap = await encrypt64(address, pauser.address, 1000n);
+    await expect(
+      engine.connect(pauser).configureCapacity(cap.handles[0], cap.inputProof)
+    ).to.be.revertedWithCustomError(engine, "AccessControlUnauthorizedAccount");
+    const limit = await encrypt64(address, pauser.address, 400n);
+    await expect(
+      engine.connect(pauser).configureClientLimit(ethers.id("client-a"), limit.handles[0], limit.inputProof)
+    ).to.be.revertedWithCustomError(engine, "AccessControlUnauthorizedAccount");
+    await expect(engine.connect(pauser).rolloverEpoch()).to.be.revertedWithCustomError(
+      engine,
+      "AccessControlUnauthorizedAccount"
+    );
+    const adminCap = await encrypt64(address, admin.address, 1000n);
+    await (await engine.connect(admin).configureCapacity(adminCap.handles[0], adminCap.inputProof)).wait();
+    const adminLimit = await encrypt64(address, admin.address, 400n);
+    await (await engine.connect(admin).configureClientLimit(ethers.id("client-a"), adminLimit.handles[0], adminLimit.inputProof)).wait();
+    const before = await engine.epoch();
+    await (await engine.connect(admin).rolloverEpoch()).wait();
+    expect(await engine.epoch()).to.equal(before + 1n);
+  });
+
+  it("rejects an unconfigured client before encrypted reserve math", async function () {
+    const [admin, requester, settler] = await ethers.getSigners();
+    const engine = await deployEngine(admin, requester, settler, admin);
+    const address = await engine.getAddress();
+    const cap = await encrypt64(address, admin.address, 250n);
+    await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();
+    const unknownId = ethers.id("res-unconfigured");
+    const unknownClient = ethers.id("client-unknown");
+    const amount = await encrypt64(address, requester.address, 250n);
+    await expect(
+      engine.connect(requester).reserve(unknownId, unknownClient, amount.handles[0], amount.inputProof)
+    ).to.be.revertedWithCustomError(engine, "ClientNotConfigured");
+    expect(await engine.reservationStatus(unknownId)).to.equal(0n);
+    await expect(engine.connect(settler).finalize(unknownId)).to.be.revertedWithCustomError(
+      engine,
+      "UnknownReservation"
+    );
+    const limit = await encrypt64(address, admin.address, 250n);
+    await (await engine.connect(admin).configureClientLimit(ethers.id("client-a"), limit.handles[0], limit.inputProof)).wait();
+    const okId = ethers.id("res-configured");
+    const okAmount = await encrypt64(address, requester.address, 250n);
+    await (await engine.connect(requester).reserve(okId, ethers.id("client-a"), okAmount.handles[0], okAmount.inputProof)).wait();
+    expect(await fhevm.publicDecryptEbool(await engine.approvalHandle(okId))).to.equal(true);
+    expect(await engine.reservationStatus(okId)).to.equal(1n);
+  });
+
   it("does not publicly decrypt amounts or limits in this mock suite", async function () {
     const [admin, requester, settler] = await ethers.getSigners();
-    const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
-    const engine = await factory.deploy(admin.address, requester.address, settler.address, admin.address);
+    const engine = await deployEngine(admin, requester, settler, admin);
     const address = await engine.getAddress();
     const cap = await encrypt64(address, admin.address, 77n);
     await (await engine.connect(admin).configureCapacity(cap.handles[0], cap.inputProof)).wait();

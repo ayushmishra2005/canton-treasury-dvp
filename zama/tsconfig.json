@@ -5,6 +5,15 @@
     "strict": true,
     "esModuleInterop": true,
     "resolveJsonModule": true,
+    "skipLibCheck": false,
     "types": ["mocha", "node"]
-  }
+  },
+  "include": [
+    "./hardhat.config.ts",
+    "./scripts/**/*.ts",
+    "./test/**/*.ts",
+    "./typechain-types/common.ts",
+    "./typechain-types/contracts/ConfidentialRiskEngine.ts",
+    "./typechain-types/factories/contracts/ConfidentialRiskEngine__factory.ts"
+  ]
 }

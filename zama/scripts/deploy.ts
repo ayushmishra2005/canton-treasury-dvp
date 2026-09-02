@@ -1,11 +1,12 @@
 import { ethers, fhevm } from "hardhat";
+import { ConfidentialRiskEngine__factory } from "../typechain-types/factories/contracts/ConfidentialRiskEngine__factory";
 
 async function main() {
   await fhevm.initializeCLIApi();
   const [admin] = await ethers.getSigners();
   const requester = process.env.ZAMA_REQUESTER ?? admin.address;
   const settler = process.env.ZAMA_SETTLER ?? admin.address;
-  const factory = await ethers.getContractFactory("ConfidentialRiskEngine");
+  const factory = new ConfidentialRiskEngine__factory(admin);
   const engine = await factory.deploy(admin.address, requester, settler, admin.address);
   await engine.waitForDeployment();
   const capacity = process.env.ZAMA_CAPACITY ?? "200000000000";

@@ -1,4 +1,6 @@
 import { ethers, fhevm } from "hardhat";
+import { ConfidentialRiskEngine } from "../typechain-types/contracts/ConfidentialRiskEngine";
+import { ConfidentialRiskEngine__factory } from "../typechain-types/factories/contracts/ConfidentialRiskEngine__factory";
 
 async function main() {
   await fhevm.initializeCLIApi();
@@ -12,8 +14,7 @@ async function main() {
   }
   const provider = new ethers.JsonRpcProvider(rpc);
   const signer = new ethers.Wallet(key, provider);
-  const artifact = await import("../artifacts/contracts/ConfidentialRiskEngine.sol/ConfidentialRiskEngine.json");
-  const engine = new ethers.Contract(engineAddress, artifact.abi, signer);
+  const engine = ConfidentialRiskEngine__factory.connect(engineAddress, signer);
 
   if (method === "status") {
     const status = await engine.reservationStatus(args[0]);
@@ -42,9 +43,25 @@ async function main() {
     return;
   }
 
-  const tx = await engine[method](args[0]);
-  await tx.wait();
-  console.log("ZAMA_RESULT " + JSON.stringify({ ok: true }));
+  if (method === "finalize" || method === "cancel" || method === "redeem") {
+    await settle(engine, method, args[0]);
+    console.log("ZAMA_RESULT " + JSON.stringify({ ok: true }));
+    return;
+  }
+
+  throw new Error("unsupported Zama method: " + method);
+}
+
+async function settle(engine: ConfidentialRiskEngine, method: "finalize" | "cancel" | "redeem", id: string) {
+  if (method === "finalize") {
+    await (await engine.finalize(id)).wait();
+    return;
+  }
+  if (method === "cancel") {
+    await (await engine.cancel(id)).wait();
+    return;
+  }
+  await (await engine.redeem(id)).wait();
 }
 
 main().catch((error) => {

@@ -9,7 +9,7 @@ pub mod state;
 
 use handlers::*;
 
-declare_id!("CQrz5E2egFB8AyHDBVGrCai3c1msyyXsgmD6BuhXQpQd");
+declare_id!("9Yuvt4HxfbGCL9gPk3ygMLV3UdrMFgAJsyhdoJvbKcUD");
 
 #[program]
 pub mod confidential_escrow {

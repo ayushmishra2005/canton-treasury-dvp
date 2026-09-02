@@ -5,6 +5,7 @@ import Daml.Script
 import Splice.Api.Token.HoldingV1
 
 import Bridge.Attestation
+import Bridge.Binding
 import Bridge.Gateway
 import Bridge.Types
 import Stablecoin.Holding
@@ -14,6 +15,7 @@ data RedeemAttempt = RedeemAttempt with
   fixture : Fixture
   holdingCid : ContractId StablecoinHolding
   mintedLockCid : ContractId MintedLock
+  bindingCid : ContractId BridgeTradeBinding
   gatewayCid : ContractId BridgeGateway
   requestCid : ContractId RedemptionRequest
   firstCid : ContractId BridgeAttestation
@@ -22,10 +24,10 @@ data RedeemAttempt = RedeemAttempt with
 prepared : Script RedeemAttempt
 prepared = do
   fixture <- setup
-  holdingCid <- mintWith fixture fixture.attesterA fixture.attesterB "lock-1" 100000.0 "digest-1"
-  mintedLockCid <- currentMintedLock fixture "lock-1"
-  requestCid <- submit fixture.holder $ createCmd RedemptionRequest with
-    holder = fixture.holder
+  (holdingCid, bindingCid, mintedLockCid) <-
+    prepareBoundRedeem fixture "lock-1" 100000.0 "digest-1" "trade-1"
+  requestCid <- submit fixture.seller $ createCmd RedemptionRequest with
+    holder = fixture.seller
     cashRegistry = fixture.cashRegistry
     lockId = "lock-1"
     holdingCid
@@ -33,20 +35,23 @@ prepared = do
     digestHex = "redeem-1"
     instrumentId = fixture.instrumentId
     payoutDestination = "seller-solana-dest"
-  firstCid <- attestFor fixture fixture.attesterA fixture.holder "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
-  secondCid <- attestFor fixture fixture.attesterB fixture.holder "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
+  firstCid <- attestFor fixture fixture.attesterA fixture.seller "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
+  secondCid <- attestFor fixture fixture.attesterB fixture.seller "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
   gatewayCid <- currentGateway fixture
   pure RedeemAttempt with ..
 
-mustReject : RedeemAttempt -> ContractId RedemptionRequest -> ContractId BridgeAttestation -> ContractId BridgeAttestation -> ContractId MintedLock -> Script ()
-mustReject attempt requestCid firstCid secondCid mintedLockCid = do
+mustReject : RedeemAttempt -> ContractId RedemptionRequest -> ContractId BridgeAttestation -> ContractId BridgeAttestation -> ContractId MintedLock -> ContractId BridgeTradeBinding -> Script ()
+mustReject attempt requestCid firstCid secondCid mintedLockCid bindingCid = do
   submitMustFail attempt.fixture.cashRegistry $ exerciseCmd attempt.gatewayCid Gateway_Redeem with
     requestCid
     firstCid
     secondCid
     mintedLockCid
-  holdingUnchanged attempt.fixture.holder attempt.holdingCid 100000.0
+    bindingCid
+  holdingUnchanged attempt.fixture.seller attempt.holdingCid 100000.0
   gatewayUnchanged attempt.fixture attempt.gatewayCid
+  mintedLockUnchanged attempt.fixture "lock-1" attempt.mintedLockCid
+  bindingUnchanged attempt.fixture "lock-1" attempt.bindingCid
 
 wrongRegistryAttestationRejected : Script ()
 wrongRegistryAttestationRejected = do
@@ -56,41 +61,41 @@ wrongRegistryAttestationRejected = do
     cashRegistry = attempt.fixture.outsider
     lockId = "lock-1"
     amount = 100000.0
-    beneficiary = attempt.fixture.holder
+    beneficiary = attempt.fixture.seller
     digestHex = "redeem-1"
     direction = RedeemAttestation
     instrumentId = attempt.fixture.instrumentId
     payoutDestination = "seller-solana-dest"
-  mustReject attempt attempt.requestCid firstCid attempt.secondCid attempt.mintedLockCid
+  mustReject attempt attempt.requestCid firstCid attempt.secondCid attempt.mintedLockCid attempt.bindingCid
 
 singleAttesterRejected : Script ()
 singleAttesterRejected = do
   attempt <- prepared
-  mustReject attempt attempt.requestCid attempt.firstCid attempt.firstCid attempt.mintedLockCid
+  mustReject attempt attempt.requestCid attempt.firstCid attempt.firstCid attempt.mintedLockCid attempt.bindingCid
 
 unknownAttesterRejected : Script ()
 unknownAttesterRejected = do
   attempt <- prepared
-  secondCid <- attestFor attempt.fixture attempt.fixture.outsider attempt.fixture.holder "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
-  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid
+  secondCid <- attestFor attempt.fixture attempt.fixture.outsider attempt.fixture.seller "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
+  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid attempt.bindingCid
 
 mintDirectionRejected : Script ()
 mintDirectionRejected = do
   attempt <- prepared
-  firstCid <- attestFor attempt.fixture attempt.fixture.attesterA attempt.fixture.holder "lock-1" 100000.0 "redeem-1" MintAttestation "seller-solana-dest"
-  mustReject attempt attempt.requestCid firstCid attempt.secondCid attempt.mintedLockCid
+  firstCid <- attestFor attempt.fixture attempt.fixture.attesterA attempt.fixture.seller "lock-1" 100000.0 "redeem-1" MintAttestation "seller-solana-dest"
+  mustReject attempt attempt.requestCid firstCid attempt.secondCid attempt.mintedLockCid attempt.bindingCid
 
 mismatchedDigestRejected : Script ()
 mismatchedDigestRejected = do
   attempt <- prepared
-  secondCid <- attestFor attempt.fixture attempt.fixture.attesterB attempt.fixture.holder "lock-1" 100000.0 "redeem-2" RedeemAttestation "seller-solana-dest"
-  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid
+  secondCid <- attestFor attempt.fixture attempt.fixture.attesterB attempt.fixture.seller "lock-1" 100000.0 "redeem-2" RedeemAttestation "seller-solana-dest"
+  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid attempt.bindingCid
 
 requestDigestMismatchRejected : Script ()
 requestDigestMismatchRejected = do
   attempt <- prepared
-  requestCid <- submit attempt.fixture.holder $ createCmd RedemptionRequest with
-    holder = attempt.fixture.holder
+  requestCid <- submit attempt.fixture.seller $ createCmd RedemptionRequest with
+    holder = attempt.fixture.seller
     cashRegistry = attempt.fixture.cashRegistry
     lockId = "lock-1"
     holdingCid = attempt.holdingCid
@@ -98,44 +103,44 @@ requestDigestMismatchRejected = do
     digestHex = "redeem-other"
     instrumentId = attempt.fixture.instrumentId
     payoutDestination = "seller-solana-dest"
-  mustReject attempt requestCid attempt.firstCid attempt.secondCid attempt.mintedLockCid
+  mustReject attempt requestCid attempt.firstCid attempt.secondCid attempt.mintedLockCid attempt.bindingCid
 
 mismatchedLockRejected : Script ()
 mismatchedLockRejected = do
   attempt <- prepared
-  secondCid <- attestFor attempt.fixture attempt.fixture.attesterB attempt.fixture.holder "lock-2" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
-  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid
+  secondCid <- attestFor attempt.fixture attempt.fixture.attesterB attempt.fixture.seller "lock-2" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
+  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid attempt.bindingCid
 
 mismatchedAmountRejected : Script ()
 mismatchedAmountRejected = do
   attempt <- prepared
-  secondCid <- attestFor attempt.fixture attempt.fixture.attesterB attempt.fixture.holder "lock-1" 99999.0 "redeem-1" RedeemAttestation "seller-solana-dest"
-  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid
+  secondCid <- attestFor attempt.fixture attempt.fixture.attesterB attempt.fixture.seller "lock-1" 99999.0 "redeem-1" RedeemAttestation "seller-solana-dest"
+  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid attempt.bindingCid
 
 mismatchedHolderRejected : Script ()
 mismatchedHolderRejected = do
   attempt <- prepared
   secondCid <- attestFor attempt.fixture attempt.fixture.attesterB attempt.fixture.outsider "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
-  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid
+  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid attempt.bindingCid
 
 mismatchedInstrumentRejected : Script ()
 mismatchedInstrumentRejected = do
   attempt <- prepared
   let otherInstrument = InstrumentId with admin = attempt.fixture.outsider, id = "USD-C"
   secondCid <- attestFull attempt.fixture attempt.fixture.attesterB "lock-1" 100000.0 "redeem-1" RedeemAttestation otherInstrument "seller-solana-dest"
-  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid
+  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid attempt.bindingCid
 
 mismatchedPayoutDestinationRejected : Script ()
 mismatchedPayoutDestinationRejected = do
   attempt <- prepared
-  secondCid <- attestFor attempt.fixture attempt.fixture.attesterB attempt.fixture.holder "lock-1" 100000.0 "redeem-1" RedeemAttestation "other-dest"
-  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid
+  secondCid <- attestFor attempt.fixture attempt.fixture.attesterB attempt.fixture.seller "lock-1" 100000.0 "redeem-1" RedeemAttestation "other-dest"
+  mustReject attempt attempt.requestCid attempt.firstCid secondCid attempt.mintedLockCid attempt.bindingCid
 
 requestPayoutMismatchRejected : Script ()
 requestPayoutMismatchRejected = do
   attempt <- prepared
-  requestCid <- submit attempt.fixture.holder $ createCmd RedemptionRequest with
-    holder = attempt.fixture.holder
+  requestCid <- submit attempt.fixture.seller $ createCmd RedemptionRequest with
+    holder = attempt.fixture.seller
     cashRegistry = attempt.fixture.cashRegistry
     lockId = "lock-1"
     holdingCid = attempt.holdingCid
@@ -143,7 +148,7 @@ requestPayoutMismatchRejected = do
     digestHex = "redeem-1"
     instrumentId = attempt.fixture.instrumentId
     payoutDestination = "other-dest"
-  mustReject attempt requestCid attempt.firstCid attempt.secondCid attempt.mintedLockCid
+  mustReject attempt requestCid attempt.firstCid attempt.secondCid attempt.mintedLockCid attempt.bindingCid
 
 wrongMintedLockRejected : Script ()
 wrongMintedLockRejected = do
@@ -151,4 +156,114 @@ wrongMintedLockRejected = do
   _ <- mintWith attempt.fixture attempt.fixture.attesterA attempt.fixture.attesterB "lock-2" 100000.0 "digest-2"
   otherMinted <- currentMintedLock attempt.fixture "lock-2"
   gatewayCid <- currentGateway attempt.fixture
-  mustReject attempt{ gatewayCid } attempt.requestCid attempt.firstCid attempt.secondCid otherMinted
+  mustReject attempt{ gatewayCid } attempt.requestCid attempt.firstCid attempt.secondCid otherMinted attempt.bindingCid
+
+missingBindingRejected : Script ()
+missingBindingRejected = do
+  attempt <- prepared
+  mustReject attempt attempt.requestCid attempt.firstCid attempt.secondCid attempt.mintedLockCid (coerceContractId attempt.holdingCid)
+
+bindingFromAnotherLockRejected : Script ()
+bindingFromAnotherLockRejected = do
+  attempt <- prepared
+  (_otherHolding, otherBinding, _) <-
+    prepareBoundRedeem attempt.fixture "lock-2" 100000.0 "digest-2" "trade-2"
+  gatewayCid <- currentGateway attempt.fixture
+  mustReject attempt{ gatewayCid } attempt.requestCid attempt.firstCid attempt.secondCid attempt.mintedLockCid otherBinding
+
+bindingFromAnotherTradeRejected : Script ()
+bindingFromAnotherTradeRejected = do
+  attempt <- prepared
+  (_otherHolding, otherBinding, _) <-
+    prepareBoundRedeem attempt.fixture "lock-2" 100000.0 "digest-2" "trade-other"
+  gatewayCid <- currentGateway attempt.fixture
+  mustReject attempt{ gatewayCid } attempt.requestCid attempt.firstCid attempt.secondCid attempt.mintedLockCid otherBinding
+
+wrongSellerRejected : Script ()
+wrongSellerRejected = do
+  fixture <- setup
+  mintHolding <- mintWith fixture fixture.attesterA fixture.attesterB "lock-1" 100000.0 "digest-1"
+  mintedLockCid <- currentMintedLock fixture "lock-1"
+  bound <- bindMint fixture "lock-1" "trade-1"
+  sellerHolding <- issueSellerHolding fixture 100000.0
+  bindingCid <- recordSellerPayment fixture bound sellerHolding
+  requestCid <- submit fixture.holder $ createCmd RedemptionRequest with
+    holder = fixture.holder
+    cashRegistry = fixture.cashRegistry
+    lockId = "lock-1"
+    holdingCid = mintHolding
+    amount = 100000.0
+    digestHex = "redeem-1"
+    instrumentId = fixture.instrumentId
+    payoutDestination = "seller-solana-dest"
+  firstCid <- attestFor fixture fixture.attesterA fixture.holder "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
+  secondCid <- attestFor fixture fixture.attesterB fixture.holder "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
+  gatewayCid <- currentGateway fixture
+  submitMustFail fixture.cashRegistry $ exerciseCmd gatewayCid Gateway_Redeem with
+    requestCid
+    firstCid
+    secondCid
+    mintedLockCid
+    bindingCid
+  holdingUnchanged fixture.holder mintHolding 100000.0
+  holdingUnchanged fixture.seller sellerHolding 100000.0
+  gatewayUnchanged fixture gatewayCid
+  mintedLockUnchanged fixture "lock-1" mintedLockCid
+  bindingUnchanged fixture "lock-1" bindingCid
+
+wrongPaymentHoldingRejected : Script ()
+wrongPaymentHoldingRejected = do
+  attempt <- prepared
+  otherHolding <- issueSellerHolding attempt.fixture 100000.0
+  requestCid <- submit attempt.fixture.seller $ createCmd RedemptionRequest with
+    holder = attempt.fixture.seller
+    cashRegistry = attempt.fixture.cashRegistry
+    lockId = "lock-1"
+    holdingCid = otherHolding
+    amount = 100000.0
+    digestHex = "redeem-1"
+    instrumentId = attempt.fixture.instrumentId
+    payoutDestination = "seller-solana-dest"
+  firstCid <- attestFor attempt.fixture attempt.fixture.attesterA attempt.fixture.seller "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
+  secondCid <- attestFor attempt.fixture attempt.fixture.attesterB attempt.fixture.seller "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
+  submitMustFail attempt.fixture.cashRegistry $ exerciseCmd attempt.gatewayCid Gateway_Redeem with
+    requestCid
+    firstCid
+    secondCid
+    mintedLockCid = attempt.mintedLockCid
+    bindingCid = attempt.bindingCid
+  holdingUnchanged attempt.fixture.seller attempt.holdingCid 100000.0
+  holdingUnchanged attempt.fixture.seller otherHolding 100000.0
+  gatewayUnchanged attempt.fixture attempt.gatewayCid
+  mintedLockUnchanged attempt.fixture "lock-1" attempt.mintedLockCid
+  bindingUnchanged attempt.fixture "lock-1" attempt.bindingCid
+
+incompleteBindingRejected : Script ()
+incompleteBindingRejected = do
+  fixture <- setup
+  _mintHolding <- mintWith fixture fixture.attesterA fixture.attesterB "lock-1" 100000.0 "digest-1"
+  mintedLockCid <- currentMintedLock fixture "lock-1"
+  bindingCid <- bindMint fixture "lock-1" "trade-1"
+  sellerHolding <- issueSellerHolding fixture 100000.0
+  requestCid <- submit fixture.seller $ createCmd RedemptionRequest with
+    holder = fixture.seller
+    cashRegistry = fixture.cashRegistry
+    lockId = "lock-1"
+    holdingCid = sellerHolding
+    amount = 100000.0
+    digestHex = "redeem-1"
+    instrumentId = fixture.instrumentId
+    payoutDestination = "seller-solana-dest"
+  firstCid <- attestFor fixture fixture.attesterA fixture.seller "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
+  secondCid <- attestFor fixture fixture.attesterB fixture.seller "lock-1" 100000.0 "redeem-1" RedeemAttestation "seller-solana-dest"
+  gatewayCid <- currentGateway fixture
+  submitMustFail fixture.cashRegistry $ exerciseCmd gatewayCid Gateway_Redeem with
+    requestCid
+    firstCid
+    secondCid
+    mintedLockCid
+    bindingCid
+  holdingUnchanged fixture.seller sellerHolding 100000.0
+  gatewayUnchanged fixture gatewayCid
+  mintedLockUnchanged fixture "lock-1" mintedLockCid
+  bindingUnchanged fixture "lock-1" bindingCid

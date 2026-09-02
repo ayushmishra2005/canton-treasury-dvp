@@ -5,9 +5,12 @@ suite proves the same workflow across six participants and two synchronizers, wh
 reassignment, and privacy become observable.
 
 ```bash
-make verify        # everything below, plus lint, DAR validation, and whitespace
-make test          # Daml Script suite only
-make integration   # Canton suite only
+make verify         # original Canton DvP only
+make test           # 194 core Daml Script tests
+make integration    # two-synchronizer Canton suite
+make bridge-test    # Solana, Zama mock-FHE, bridge Daml, Rust, format, clippy, typecheck
+make bridge-verify  # verify plus every confidential-bridge gate
+make dep-audit      # production npm audit and RustSec checks
 ```
 
 ## Daml Script coverage
@@ -123,3 +126,23 @@ VERIFY_COMPLETE
 The integration suite additionally asserts that the buyer ends with exactly 100 Treasury units, the
 seller with exactly 100,000 stablecoins, both allocations and the trade consumed, no duplicate
 receiver holding, and both instrument totals conserved.
+
+## Confidential bridge tests
+
+These are outside `make verify`.
+
+| Command | What it checks |
+|---|---|
+| `cd daml/bridge-tests && dpm test` | Gateway mint and redeem, binding authorization, operation isolation, crash resume, faults, and bridged DvP |
+| `cd solana && cargo test --manifest-path programs/confidential-escrow/Cargo.toml` | Token-2022 confidential escrow |
+| `cd bridge && cargo test` | Coordinator, journal resume, and connected Canton history |
+| `cd zama && npx hardhat test` | ConfidentialRiskEngine under mock FHE |
+| `cd zama && npm run typecheck` | TypeScript type-check against generated TypeChain types |
+| `scripts/bridge-e2e.sh` | Live local rail: mint-funded DvP, redemption binding, expiry, resume, Zama probes |
+| `scripts/bridge-walkthrough.sh` | Separate operator cases, including two identical-term operations |
+| `make dep-audit` | Production npm audit and RustSec on both lockfiles |
+| `scripts/bridge-secret-scan.sh` | NUL-safe scan for private keys, Solana keypairs, and local secrets |
+| `scripts/bridge-license-check.sh` | LICENSE and recorded NOTICE license identifiers |
+
+`make bridge-test` runs the Solana, Zama, bridge Daml, Rust, format, clippy, and type-check gates.
+`make bridge-verify` then runs the live E2E script, license, secret, and dependency checks.

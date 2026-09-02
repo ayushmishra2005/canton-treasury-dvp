@@ -7,6 +7,7 @@ import Daml.Script
 import Splice.Api.Token.HoldingV1
 
 import Bridge.Attestation
+import Bridge.Binding
 import Bridge.Gateway
 import Bridge.Types
 import Stablecoin.Holding
@@ -18,6 +19,8 @@ data Fixture = Fixture with
   attesterB : Party
   attesterC : Party
   holder : Party
+  seller : Party
+  venue : Party
   outsider : Party
   instrumentCid : ContractId StablecoinInstrument
   instrumentId : InstrumentId
@@ -30,6 +33,8 @@ setup = do
   attesterB <- allocateParty "AttesterB"
   attesterC <- allocateParty "AttesterC"
   holder <- allocateParty "Holder"
+  seller <- allocateParty "Seller"
+  venue <- allocateParty "Venue"
   outsider <- allocateParty "Outsider"
   instrumentCid <- submit cashRegistry $ createCmd StablecoinInstrument with
     cashRegistry
@@ -113,3 +118,59 @@ gatewayUnchanged : Fixture -> ContractId BridgeGateway -> Script ()
 gatewayUnchanged fixture expected = do
   actual <- currentGateway fixture
   actual === expected
+
+currentMintRef : Fixture -> Text -> Script (ContractId BridgeMintRef)
+currentMintRef fixture lockId = do
+  found <- query @BridgeMintRef fixture.holder
+  case [cid | (cid, ref) <- found, ref.lockId == lockId] of
+    [cid] -> pure cid
+    _ -> abort ("expected one mint reference " <> lockId)
+
+currentBinding : Fixture -> Text -> Script (ContractId BridgeTradeBinding)
+currentBinding fixture lockId = do
+  found <- query @BridgeTradeBinding fixture.holder
+  case [cid | (cid, binding) <- found, binding.lockId == lockId] of
+    [cid] -> pure cid
+    _ -> abort ("expected one trade binding " <> lockId)
+
+bindMint : Fixture -> Text -> Text -> Script (ContractId BridgeTradeBinding)
+bindMint fixture lockId tradeCid = do
+  refCid <- currentMintRef fixture lockId
+  submit fixture.holder $ exerciseCmd refCid BridgeMintRef_Bind with
+    seller = fixture.seller
+    venue = fixture.venue
+    tradeCid
+
+issueSellerHolding : Fixture -> Decimal -> Script (ContractId StablecoinHolding)
+issueSellerHolding fixture amount =
+  submit fixture.cashRegistry $ exerciseCmd fixture.instrumentCid Mint with
+    owner = fixture.seller
+    amount
+
+recordSellerPayment : Fixture -> ContractId BridgeTradeBinding -> ContractId StablecoinHolding -> Script (ContractId BridgeTradeBinding)
+recordSellerPayment fixture bindingCid holdingCid =
+  submit fixture.seller $ exerciseCmd bindingCid BridgeTradeBinding_RecordPayment with
+    recordedPaymentCid = holdingCid
+
+mintedLockUnchanged : Fixture -> Text -> ContractId MintedLock -> Script ()
+mintedLockUnchanged fixture lockId expected = do
+  actual <- currentMintedLock fixture lockId
+  actual === expected
+  Some minted <- queryContractId fixture.cashRegistry expected
+  minted.lockId === lockId
+
+bindingUnchanged : Fixture -> Text -> ContractId BridgeTradeBinding -> Script ()
+bindingUnchanged fixture lockId expected = do
+  actual <- currentBinding fixture lockId
+  actual === expected
+  Some binding <- queryContractId fixture.holder expected
+  binding.lockId === lockId
+
+prepareBoundRedeem : Fixture -> Text -> Decimal -> Text -> Text -> Script (ContractId StablecoinHolding, ContractId BridgeTradeBinding, ContractId MintedLock)
+prepareBoundRedeem fixture lockId amount mintDigest tradeCid = do
+  _mintHolding <- mintWith fixture fixture.attesterA fixture.attesterB lockId amount mintDigest
+  mintedLockCid <- currentMintedLock fixture lockId
+  bound <- bindMint fixture lockId tradeCid
+  sellerHolding <- issueSellerHolding fixture amount
+  bindingCid <- recordSellerPayment fixture bound sellerHolding
+  pure (sellerHolding, bindingCid, mintedLockCid)

@@ -567,6 +567,13 @@ try {
   if (requireText(redeemArgs, "mintedLockCid", "redeemed minted lock") != minted.cid) {
     fail("Gateway_Redeem is not connected to this operation's minted lock")
   }
+  val redeemBinding = requireText(redeemArgs, "bindingCid", "redeemed binding")
+  val paidBindings = bindings.filter { fact =>
+    fact.arguments.exists(args => labeledText(args, "sellerPaymentCid").contains(sellerPayment.cid))
+  }
+  if (paidBindings.size != 1 || paidBindings.head.cid != redeemBinding) {
+    fail("Gateway_Redeem is not connected to this operation's trade binding")
+  }
   val sellerBurned =
     consumedIn(sellerPayment.cid, redeem.updateId) &&
       exercised.exists { fact =>

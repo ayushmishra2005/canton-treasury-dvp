@@ -112,12 +112,14 @@ template BridgeGateway
         firstCid : ContractId BridgeAttestation
         secondCid : ContractId BridgeAttestation
         mintedLockCid : ContractId MintedLock
+        bindingCid : ContractId BridgeTradeBinding
       controller cashRegistry
       do
         request <- fetch requestCid
         first <- fetch firstCid
         second <- fetch secondCid
         minted <- fetch mintedLockCid
+        binding <- fetch bindingCid
         holding <- fetch request.holdingCid
         assertMsg "Redemption must name this registry" (request.cashRegistry == cashRegistry)
         assertMsg "Holding must belong to the requesting holder" (holding.owner == request.holder)
@@ -156,6 +158,11 @@ template BridgeGateway
         assertMsg "Burn must match the lock's authorized backing"
           (minted.amount == request.amount && minted.amount == holding.amount)
         assertMsg "Lock has already been redeemed" (request.lockId `notElem` redeemedLocks)
+        assertMsg "Binding must belong to this registry" (binding.cashRegistry == cashRegistry)
+        assertMsg "Binding must match the redemption lock" (binding.lockId == request.lockId)
+        assertMsg "Binding seller must be the requesting holder" (binding.seller == request.holder)
+        assertMsg "Binding payment must name the request holding"
+          (binding.sellerPaymentCid == Some request.holdingCid)
         exercise request.holdingCid Burn
         redeemedCid <- create RedeemedLock with
           cashRegistry

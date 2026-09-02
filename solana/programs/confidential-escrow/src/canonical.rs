@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use solana_program::hash::hashv;
+use anchor_lang::solana_program::hash::hashv;
 
 pub const DIGEST_DOMAIN: &[u8] = b"canton-treasury-dvp/bridge-digest/v1";
 pub const AMOUNT_DOMAIN: &[u8] = b"canton-treasury-dvp/amount-commitment/v1";

@@ -245,10 +245,7 @@ pub fn approve_operation(ctx: Context<ApproveOperation>, args: ApproveArgs) -> R
             approval.operation == args.operation,
             EscrowError::ReceiptMismatch
         );
-        require!(
-            approval.expiry == args.expiry,
-            EscrowError::ReceiptMismatch
-        );
+        require!(approval.expiry == args.expiry, EscrowError::ReceiptMismatch);
     }
     let bit = 1u8 << index;
     require!(
@@ -296,10 +293,7 @@ fn move_vault_tokens(
     let now = Clock::get()?.unix_timestamp;
     require!(now < args.expiry, EscrowError::Expired);
     require!(now < approval.expiry, EscrowError::Expired);
-    require!(
-        approval.expiry == args.expiry,
-        EscrowError::ReceiptMismatch
-    );
+    require!(approval.expiry == args.expiry, EscrowError::ReceiptMismatch);
     require!(!approval.consumed, EscrowError::ApprovalConsumed);
     require!(
         approval.direction == direction,

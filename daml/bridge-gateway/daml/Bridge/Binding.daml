@@ -49,7 +49,7 @@ template BridgeTradeBinding
     mintHoldingCid : ContractId StablecoinHolding
     tradeCid : Text
     buyerTreasuryCid : Optional Text
-    sellerPaymentCid : Optional Text
+    sellerPaymentCid : Optional (ContractId StablecoinHolding)
   where
     signatory cashRegistry, buyer
     observer seller
@@ -76,10 +76,9 @@ template BridgeTradeBinding
 
     choice BridgeTradeBinding_RecordPayment : ContractId BridgeTradeBinding
       with
-        recordedPaymentCid : Text
+        recordedPaymentCid : ContractId StablecoinHolding
       controller seller
       do
         assertMsg "payment already recorded" (isNone sellerPaymentCid)
-        assertMsg "payment required" (recordedPaymentCid /= "")
         create this with
           sellerPaymentCid = Some recordedPaymentCid

@@ -352,7 +352,12 @@ ciphertexts.
 
 ### Bridge setup and tests
 
-Original demo: `make verify` (194 Daml tests and the two-synchronizer suite).
+`make verify` checks the original Canton DvP only: 194 Daml tests, lint, DAR validation, the
+two-synchronizer suite, and whitespace.
+
+`make bridge-verify` checks the complete confidential bridge: `make verify`, then Solana, Zama
+mock-FHE, bridge Daml, Rust, type-checking, the live E2E script, walkthrough gates included in
+that script, license, secret, and dependency checks.
 
 Bridge prerequisites, in addition to the original demo: Node 22, Rust, Solana
 CLI 3.1.10, Anchor 0.31.1, Docker, and `cd zama && npm ci`. Agave 3.1.10 ships
@@ -366,6 +371,13 @@ scripts/bridge-e2e.sh
 scripts/bridge-walkthrough.sh
 make bridge-verify
 ```
+
+Redemption trust boundary: `Gateway_Redeem` fetches `BridgeTradeBinding` and requires the same
+cash registry, the same lock, `binding.seller == request.holder`, and
+`binding.sellerPaymentCid` equal to the holding being burned. An incomplete binding or a binding
+from another operation is rejected. The connected Canton history verifier then proves that the
+recorded payment was created by the bound `DvpTrade_Settle`. That is a completion check, not
+cross-chain atomicity.
 
 `scripts/bridge-e2e.sh` starts only the local validator, Relayer 1.5.0, Hardhat,
 and related processes it created. Occupied ports fail the run. Missing services
@@ -441,7 +453,7 @@ not recompute the Solana digest.
 ## Repository structure
 
 ```
-Makefile                       build, test, lint, validate, integration, verify, bridge-*, clean
+Makefile                       build, test, lint, validate, integration, verify, bridge-*, clean, distclean
 docs/
   architecture.md              packages, placement, reassignment and allocation sequences
   privacy.md                   visibility matrix and what the privacy tests do and do not prove
@@ -488,7 +500,7 @@ Original Canton demo:
 
 No database is required for the original demo. All Canton nodes use in-memory storage.
 
-Bridge Phase 1, in addition:
+Bridge Phases 1 and 2, in addition:
 
 - Node 22
 - Rust, Solana CLI, Anchor 0.31.1
@@ -497,16 +509,18 @@ Bridge Phase 1, in addition:
 
 ## Quick start
 
-Everything the project claims is checked by one command:
+`make verify` checks the original Canton DvP only. `make bridge-verify` checks the complete
+confidential bridge.
 
 ```bash
 make verify
+make bridge-verify
 ```
 
-It builds every package, runs the 194 Daml Script tests, lints every module, validates every DAR and
-checks the vendored Token Standard DARs against their pinned digests, runs the full two-synchronizer
-integration suite, and checks whitespace. It takes roughly three minutes from a clean checkout, needs no database or container
-runtime, and leaves no process running.
+`make verify` builds every core package, runs the 194 Daml Script tests, lints every module,
+validates every DAR and checks the vendored Token Standard DARs against their pinned digests, runs
+the two-synchronizer integration suite, and checks whitespace. It takes roughly three minutes from
+a clean checkout, needs no database or container runtime, and leaves no process running.
 
 Individual targets:
 
@@ -518,10 +532,19 @@ Individual targets:
 | `make lint` | `damlc lint` over every module in every package |
 | `make validate` | validate every project DAR, and validate and digest-check the vendored DARs |
 | `make integration` | the two-synchronizer Canton suite |
-| `make clean` | remove `.daml` build output, `canton/.run`, and `log` |
+| `make clean` | remove generated Daml output, Rust and Solana targets, Zama artifacts and cache, TypeChain output, FHE temporary output, Canton and bridge run directories, and logs |
+| `make distclean` | `make clean`, plus `zama/node_modules` and the downloaded `.cache` Token-2022 source |
 
-`make clean` deletes only generated artifacts. Source, configuration, documentation, and the
-vendored DARs under `lib/` are never touched, and `make verify` regenerates everything it needs.
+`make clean` deletes only generated artifacts. Source, configuration, documentation, vendored DARs
+under `lib/`, lockfiles, `zama/node_modules`, and the downloaded pinned Token-2022 source under
+`.cache` are not removed. Solana keypairs stay untracked. `make verify` regenerates the original
+Canton artifacts it needs.
+
+The local escrow program ID is public and lives in `declare_id`, `Anchor.toml`, and
+`bridge/src/program.rs`. Local tests load `confidential_escrow.so` with
+`--bpf-program` at that address. They do not deploy with a private key. Devnet must use a newly
+generated ignored keypair and must not reuse the local test identity. After a real Devnet deploy,
+commit only the public program ID.
 
 ## Daml Script tests
 
@@ -645,7 +668,7 @@ observes data it should not, or any Canton process or port survives shutdown.
 | `java not found on PATH` | Canton needs a JDK. Install JDK 21 and put `java` on `PATH`. |
 | `canton runtime not found under ...` | The Canton component has not been fetched yet. Run `make build` once; `dpm` downloads it into `~/.dpm/cache/components/canton-open-source`. |
 | `ports already in use: 5001 ...` | Another process holds a topology port, usually a Canton node from an interrupted run. Stop it, then re-run. The suite refuses to start rather than attach to a foreign node. |
-| Stale runtime state, or a run that behaves unlike a fresh checkout | `make clean` removes `.daml`, `canton/.run`, and `log`, after which `make verify` rebuilds everything. All nodes are in-memory, so there is no database to reset. |
+| Stale runtime state, or a run that behaves unlike a fresh checkout | `make clean` removes generated Daml, Rust, Solana, Zama, Canton, and log output. It does not remove `node_modules` or `.cache`. `make distclean` removes those as well. |
 | `expected 194 passing Daml Script tests but counted ...` | A test module failed to load or was not compiled. Run `make build` and read the `dpm test` output. |
 | A `CHECKSUMS.sha256` mismatch | A vendored Token Standard DAR under `lib/` was modified or replaced. Restore it from the Splice `v0.6.14` bundle; the digests are pinned deliberately. |
 

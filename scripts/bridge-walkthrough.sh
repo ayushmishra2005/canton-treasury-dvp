@@ -3,72 +3,21 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
-export PATH="$HOME/.dpm/bin:$HOME/.nvm/versions/node/v22.9.0/bin:$PATH"
+# shellcheck source=bridge-local-stack.sh
+source "$repo_root/scripts/bridge-local-stack.sh"
 
-started_pids=()
-started_compose=""
-ledger_dir=""
-canton_pid=""
 dpm_home="${DPM_HOME:-$HOME/.dpm}"
 run_dir="$repo_root/canton/.run-walkthrough"
-log=/tmp/ctd-walkthrough.log
 
-fail() { echo "$1" >&2; exit 1; }
-
-require_cmd() { command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"; }
-
-port_free() {
-  local port="$1"
-  if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-    fail "port $port is already in use; refusing to start or to kill the occupant"
-  fi
-}
-
-cleanup() {
-  local pid
-  for pid in "${started_pids[@]:-}"; do
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-    fi
-  done
-  if [[ -n "${canton_pid:-}" ]] && kill -0 "$canton_pid" 2>/dev/null; then
-    kill "$canton_pid" 2>/dev/null || true
-    for _ in $(seq 1 30); do
-      kill -0 "$canton_pid" 2>/dev/null || break
-      sleep 1
-    done
-    kill -9 "$canton_pid" 2>/dev/null || true
-    wait "$canton_pid" 2>/dev/null || true
-  fi
-  if [[ -n "$started_compose" ]]; then
-    docker compose -f "$started_compose" down --remove-orphans >/dev/null 2>&1 || true
-  fi
-  if [[ -n "$ledger_dir" && -d "$ledger_dir" ]]; then
-    rm -rf "$ledger_dir"
-  fi
-}
-trap cleanup EXIT
-
-require_cmd dpm
-require_cmd java
-require_cmd cargo
-require_cmd solana
-require_cmd solana-test-validator
-require_cmd node
-require_cmd docker
-require_cmd npx
-require_cmd anchor
-node -e 'if (process.versions.node.split(".")[0]!=="22") process.exit(1)' || fail "Node 22 is required"
+trap cleanup_bridge_stack EXIT
+init_bridge_stack
+log="$tmp_dir/ctd-walkthrough.log"
 test -d zama/node_modules || fail "zama dependencies are not installed; run: (cd zama && npm ci)"
 test -f daml/bridge-gateway/.daml/dist/bridge-gateway-0.1.0.dar || fail "missing bridge-gateway DAR; run: make build"
 test -f daml/bridge-tests/.daml/dist/canton-treasury-dvp-bridge-tests-0.1.0.dar || fail "missing bridge-tests DAR; run: make build"
 canton_jar="$(ls "$dpm_home"/cache/components/canton-open-source/*/lib/canton-open-source-*.jar 2>/dev/null | sort -V | tail -1)"
 [[ -n "$canton_jar" ]] || fail "canton runtime not found under $dpm_home/cache/components/canton-open-source"
-
-for port in 8899 8900 8545 18080 16379 5001 5002 5003 5011 5012 5021 5022 5031 5032 5041 5042 5051 5052 5061 5062 5101 5102 5103; do
-  port_free "$port"
-done
+require_bridge_ports_free
 
 (cd solana && anchor build)
 test -f solana/target/deploy/confidential_escrow.so || fail "missing confidential_escrow.so"
@@ -78,7 +27,8 @@ test -f "$token_2022_so" || fail "missing Token-2022 zk-ops program"
 
 ledger_dir="$(mktemp -d "${TMPDIR:-/tmp}/ctd-walk-solana-XXXXXX")"
 solana-test-validator --reset --quiet --ledger "$ledger_dir" --rpc-port 8899 --faucet-port 9900 \
-  --bpf-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb "$token_2022_so" >/tmp/ctd-walk-solana.log 2>&1 &
+  --bpf-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb "$token_2022_so" \
+  --bpf-program "$ESCROW_PROGRAM_ID" "$(escrow_so)" >"$tmp_dir/ctd-walk-solana.log" 2>&1 &
 started_pids+=("$!")
 for _ in $(seq 1 60); do
   solana cluster-version --url http://127.0.0.1:8899 >/dev/null 2>&1 && break
@@ -88,10 +38,7 @@ solana cluster-version --url http://127.0.0.1:8899 >/dev/null || fail "solana-te
 solana airdrop 100 --url http://127.0.0.1:8899 >/dev/null
 solana account ZkE1Gama1Proof11111111111111111111111111111 --url http://127.0.0.1:8899 >/dev/null \
   || fail "zk-elgamal-proof program is missing on the local validator"
-solana program deploy solana/target/deploy/confidential_escrow.so \
-  --program-id solana/target/deploy/confidential_escrow-keypair.json \
-  --url http://127.0.0.1:8899 >/tmp/ctd-walk-program-deploy.log \
-  || fail "failed to deploy confidential escrow program"
+require_escrow_loaded
 
 export RELAYER_API_KEY="${RELAYER_API_KEY:-bridge-local-api-key-32chars-min}"
 export KEYSTORE_PASSPHRASE="${KEYSTORE_PASSPHRASE:-Bridge-Local-1!}"
@@ -116,7 +63,7 @@ printf '%s' "$relayer_json" | grep -q '"system_disabled":false' \
   || fail "Relayer is system_disabled"
 
 cd zama
-npx hardhat node --hostname 127.0.0.1 --port 8545 >/tmp/ctd-walk-hardhat.log 2>&1 &
+npx hardhat node --hostname 127.0.0.1 --port 8545 >"$tmp_dir/ctd-walk-hardhat.log" 2>&1 &
 started_pids+=("$!")
 cd "$repo_root"
 for _ in $(seq 1 60); do
@@ -125,8 +72,8 @@ for _ in $(seq 1 60); do
 done
 curl -sf -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://127.0.0.1:8545 >/dev/null \
   || fail "hardhat node did not start"
-(cd zama && ZAMA_CAPACITY=200000000000 npx hardhat run scripts/deploy.ts --network localhost | tee /tmp/ctd-walk-zama-deploy.log)
-grep -q 'ZAMA_ENGINE ' /tmp/ctd-walk-zama-deploy.log || fail "Zama deploy did not print ZAMA_ENGINE"
+(cd zama && ZAMA_CAPACITY=200000000000 npx hardhat run scripts/deploy.ts --network localhost | tee "$tmp_dir/ctd-walk-zama-deploy.log")
+grep -q 'ZAMA_ENGINE ' "$tmp_dir/ctd-walk-zama-deploy.log" || fail "Zama deploy did not print ZAMA_ENGINE"
 
 rm -rf "$run_dir"
 mkdir -p "$run_dir"
@@ -153,15 +100,15 @@ java -jar "$canton_jar" run canton/scripts/origination.canton \
   -c canton/remote-console.conf --no-tty --log-level-stdout WARN >"$run_dir/origination.log" 2>&1 \
   || { tail -40 "$run_dir/origination.log" >&2; fail "treasury origination failed"; }
 
-python3 - <<'PY' > /tmp/ctd-walk-input.json
+python3 - <<'PY' > "$tmp_dir/ctd-walk-input.json"
 print('{"lockId":"unused","amount":"100000.000000","digestHex":"unused","payoutDestination":"unused"}')
 PY
 echo "WALKTHROUGH_TWO_IDENTICAL_OPERATIONS"
 dpm script --dar daml/bridge-tests/.daml/dist/canton-treasury-dvp-bridge-tests-0.1.0.dar \
   --script-name Tests.Bridge.Runtime:prepare \
   --participant-config "$run_dir/participants.json" \
-  --input-file /tmp/ctd-walk-input.json \
-  --wall-clock-time > /tmp/ctd-walk-prepare.log 2>&1 \
+  --input-file "$tmp_dir/ctd-walk-input.json" \
+  --wall-clock-time > "$tmp_dir/ctd-walk-prepare.log" 2>&1 \
   || fail "walkthrough prepare failed"
 REASSIGNMENT_CAPABILITY=granted java -jar "$canton_jar" run canton/scripts/reassignment-capability.canton \
   -c canton/remote-console.conf --no-tty --log-level-stdout WARN \
@@ -178,12 +125,12 @@ REASSIGNMENT_CAPABILITY=revoked java -jar "$canton_jar" run canton/scripts/reass
 dpm script --dar daml/bridge-tests/.daml/dist/canton-treasury-dvp-bridge-tests-0.1.0.dar \
   --script-name Tests.Bridge.LiveIsolation:twoLiveOperations \
   --participant-config "$run_dir/participants.json" \
-  --input-file /tmp/ctd-walk-input.json \
-  --wall-clock-time > /tmp/ctd-walk-isolation.log 2>&1 \
-  || { tail -40 /tmp/ctd-walk-isolation.log >&2; fail "walkthrough two identical-term operations failed"; }
-grep -q LIVE_ISOLATION_OK /tmp/ctd-walk-isolation.log || fail "two identical-term operations did not finish"
-iso_a="$(sed -n 's/.*LIVE_ISOLATION_BINDING_A \([0-9a-fA-F]*\).*/\1/p' /tmp/ctd-walk-isolation.log | tail -1)"
-iso_b="$(sed -n 's/.*LIVE_ISOLATION_BINDING_B \([0-9a-fA-F]*\).*/\1/p' /tmp/ctd-walk-isolation.log | tail -1)"
+  --input-file "$tmp_dir/ctd-walk-input.json" \
+  --wall-clock-time > "$tmp_dir/ctd-walk-isolation.log" 2>&1 \
+  || { tail -40 "$tmp_dir/ctd-walk-isolation.log" >&2; fail "walkthrough two identical-term operations failed"; }
+grep -q LIVE_ISOLATION_OK "$tmp_dir/ctd-walk-isolation.log" || fail "two identical-term operations did not finish"
+iso_a="$(sed -n 's/.*LIVE_ISOLATION_BINDING_A \([0-9a-fA-F]*\).*/\1/p' "$tmp_dir/ctd-walk-isolation.log" | tail -1)"
+iso_b="$(sed -n 's/.*LIVE_ISOLATION_BINDING_B \([0-9a-fA-F]*\).*/\1/p' "$tmp_dir/ctd-walk-isolation.log" | tail -1)"
 [[ -n "$iso_a" && -n "$iso_b" && "$iso_a" != "$iso_b" ]] || fail "walkthrough bindings were not distinct"
 echo "WALKTHROUGH_CHECKED two_identical_operations $iso_a $iso_b"
 
@@ -194,8 +141,8 @@ workflow_env=(
   RELAYER_API_KEY="$RELAYER_API_KEY"
   RELAYER_ID=solana-local
   ZAMA_RPC_URL=http://127.0.0.1:8545
-  ZAMA_ENGINE="$(awk '/ZAMA_ENGINE /{print $2}' /tmp/ctd-walk-zama-deploy.log | tail -1)"
-  ZAMA_CLIENT="$(awk '/ZAMA_CLIENT /{print $2}' /tmp/ctd-walk-zama-deploy.log | tail -1)"
+  ZAMA_ENGINE="$(awk '/ZAMA_ENGINE /{print $2}' "$tmp_dir/ctd-walk-zama-deploy.log" | tail -1)"
+  ZAMA_CLIENT="$(awk '/ZAMA_CLIENT /{print $2}' "$tmp_dir/ctd-walk-zama-deploy.log" | tail -1)"
   ZAMA_REQUESTER_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
   ZAMA_SETTLER_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
   CANTON_PARTICIPANTS="$run_dir/participants.json"

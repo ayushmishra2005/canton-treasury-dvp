@@ -1,5 +1,8 @@
 .daml/
 log/
+.env
+.env.*
+!.env.example
 canton/.run/
 .cache/
 .idea/
@@ -9,6 +12,8 @@ bridge/relayer/keys/
 solana/target/
 solana/.anchor/
 solana/test-ledger/
+solana/keys/
+*-keypair.json
 zama/node_modules/
 zama/artifacts/
 zama/cache/

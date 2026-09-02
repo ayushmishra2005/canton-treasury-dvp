@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
-use solana_program::program::invoke_signed;
+use anchor_lang::solana_program::instruction::Instruction;
+use anchor_lang::solana_program::program::{invoke, invoke_signed};
 use spl_token_2022::extension::{
     confidential_transfer::ConfidentialTransferAccount, BaseStateWithExtensions,
     PodStateWithExtensions,
@@ -120,7 +121,7 @@ pub fn confidential_transfer_cpi<'info>(
         AccountMeta::new_readonly(*range_ctx.key, false),
         AccountMeta::new_readonly(*authority.key, true),
     ];
-    let ix = solana_program::instruction::Instruction {
+    let ix = Instruction {
         program_id: TOKEN_2022_PROGRAM_ID,
         accounts,
         data,
@@ -136,7 +137,7 @@ pub fn confidential_transfer_cpi<'info>(
         token_program,
     ];
     if signer_seeds.is_empty() {
-        solana_program::program::invoke(&ix, infos)?;
+        invoke(&ix, infos)?;
     } else {
         invoke_signed(&ix, infos, signer_seeds)?;
     }
@@ -157,7 +158,7 @@ pub fn apply_pending_cpi<'info>(
     data.push(8);
     data.extend_from_slice(&expected_counter.to_le_bytes());
     data.extend_from_slice(new_decryptable);
-    let ix = solana_program::instruction::Instruction {
+    let ix = Instruction {
         program_id: TOKEN_2022_PROGRAM_ID,
         accounts: vec![
             AccountMeta::new(*account.key, false),

@@ -5,7 +5,7 @@ use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::sysvar;
 
-pub const PROGRAM_ID: Pubkey = solana_sdk::pubkey!("CQrz5E2egFB8AyHDBVGrCai3c1msyyXsgmD6BuhXQpQd");
+pub const PROGRAM_ID: Pubkey = solana_sdk::pubkey!("9Yuvt4HxfbGCL9gPk3ygMLV3UdrMFgAJsyhdoJvbKcUD");
 pub const CONFIG_SEED: &[u8] = b"bridge-config";
 pub const VAULT_AUTHORITY_SEED: &[u8] = b"vault-authority";
 pub const RECEIPT_SEED: &[u8] = b"receipt";

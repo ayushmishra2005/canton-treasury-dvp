@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 use solana_program::instruction::{AccountMeta, Instruction};
 use solana_program_test::{ProgramTest, ProgramTestContext};
 use solana_sdk::account::Account;
-use solana_sdk::clock::Clock;
 use solana_sdk::account::AccountSharedData;
+use solana_sdk::clock::Clock;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
 use solana_sdk::sysvar;
@@ -108,7 +108,14 @@ fn approve_ix(payer: Pubkey, args: &ApproveArgs) -> Instruction {
     }
 }
 
-fn move_ix(name: &str, destination: Pubkey, mint: Pubkey, args: &MovementArgs, operation: &[u8; 32], direction: u8) -> Instruction {
+fn move_ix(
+    name: &str,
+    destination: Pubkey,
+    mint: Pubkey,
+    args: &MovementArgs,
+    operation: &[u8; 32],
+    direction: u8,
+) -> Instruction {
     let (config, _) = pda(&[CONFIG_SEED]);
     let (receipt, _) = pda(&[RECEIPT_SEED, operation]);
     let (approval, _) = pda(&[APPROVAL_SEED, operation, &[direction]]);
@@ -238,7 +245,13 @@ fn mint_args(h: &Harness) -> ApproveArgs {
     }
 }
 
-fn digest_for(h: &Harness, direction: u8, dest: &Pubkey, expiry: i64, proof: &[u8; 32]) -> [u8; 32] {
+fn digest_for(
+    h: &Harness,
+    direction: u8,
+    dest: &Pubkey,
+    expiry: i64,
+    proof: &[u8; 32],
+) -> [u8; 32] {
     let (config, _) = pda(&[CONFIG_SEED]);
     let (receipt, _) = pda(&[RECEIPT_SEED, h.operation.as_ref()]);
     operation_digest(
@@ -262,7 +275,13 @@ async fn approve(
     secret: &[u8; 32],
     args: &ApproveArgs,
 ) -> std::result::Result<(), solana_sdk::transaction::TransactionError> {
-    let digest = digest_for(h, args.direction, &args.destination, args.expiry, &args.proof_commitment);
+    let digest = digest_for(
+        h,
+        args.direction,
+        &args.destination,
+        args.expiry,
+        &args.proof_commitment,
+    );
     let ed = ed25519_ix(secret, &digest);
     let ix = approve_ix(h.ctx.payer.pubkey(), args);
     let blockhash = h.ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -272,10 +291,14 @@ async fn approve(
         &[&h.ctx.payer],
         blockhash,
     );
-    h.ctx.banks_client.process_transaction(tx).await.map_err(|e| match e {
-        solana_program_test::BanksClientError::TransactionError(err) => err,
-        other => panic!("{other}"),
-    })
+    h.ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .map_err(|e| match e {
+            solana_program_test::BanksClientError::TransactionError(err) => err,
+            other => panic!("{other}"),
+        })
 }
 
 async fn read_approval(h: &mut Harness, direction: u8) -> OperationApproval {
@@ -424,7 +447,8 @@ async fn expired_unused_approval_can_be_replaced_but_consumed_cannot() {
     let approval = read_approval(&mut h, DIRECTION_RELEASE).await;
     assert_eq!(approval.expiry, 4_000);
     assert_eq!(approval.distinct_signers(), 1);
-    let (approval_key, approval_bump) = pda(&[APPROVAL_SEED, h.operation.as_ref(), &[DIRECTION_RELEASE]]);
+    let (approval_key, approval_bump) =
+        pda(&[APPROVAL_SEED, h.operation.as_ref(), &[DIRECTION_RELEASE]]);
     write_account(
         &mut h.ctx,
         approval_key,

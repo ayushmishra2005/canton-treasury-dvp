@@ -450,6 +450,12 @@ pub fn connect_canton_history(
             "Gateway_Redeem is not connected to this operation's minted lock"
         ));
     }
+    let redeem_binding = require_text(redeem_args, "bindingCid", "redeemed binding")?;
+    if redeem_binding != binding.cid {
+        return Err(anyhow!(
+            "Gateway_Redeem is not connected to this operation's trade binding"
+        ));
+    }
     if !consumed_in(history, &seller_payment.cid, &redeem.update_id)
         || !history.exercised.iter().any(|fact| {
             fact.choice == "Burn"
@@ -1346,6 +1352,14 @@ mod tests {
                     rec(&[
                         ("requestCid", cid(op.request)),
                         ("mintedLockCid", cid(op.minted_lock)),
+                        (
+                            "bindingCid",
+                            cid(if op.lock == "lock-a" {
+                                "binding-a"
+                            } else {
+                                "binding-b"
+                            }),
+                        ),
                     ]),
                     rec(&[]),
                 ),
@@ -1681,6 +1695,26 @@ mod tests {
                 || err.to_string().contains("another operation")
                 || err.to_string().contains("not connected"),
             "A's mint bound to B's trade must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn redeem_binding_from_another_operation_fails() {
+        let mut history = operation_history(&OP_A);
+        for fact in &mut history.exercised {
+            if fact.choice == "Gateway_Redeem" {
+                fact.argument = Some(rec(&[
+                    ("requestCid", cid(OP_A.request)),
+                    ("mintedLockCid", cid(OP_A.minted_lock)),
+                    ("bindingCid", cid("binding-b")),
+                ]));
+            }
+        }
+        let err = connect_canton_history(&history, &expected_a()).unwrap_err();
+        assert!(
+            err.to_string().contains("not connected")
+                || err.to_string().contains("another operation"),
+            "redeem must name this operation's binding: {err}"
         );
     }
 

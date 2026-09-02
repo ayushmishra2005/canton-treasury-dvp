@@ -1,11 +1,11 @@
 canton-treasury-dvp
 Copyright 2026 the canton-treasury-dvp authors
 
-This product is licensed under the Apache License, Version 2.0.
+This product is licensed under the Apache License, Version 2.0 (Apache-2.0).
 
 Third-party components used by the confidential settlement rail:
 
-- OpenZeppelin Relayer 1.5.0 (official container image and unmodified source tag v1.5.0, commit 3db7d38c34ca05ab5f51dd74817889a1e388eec6)
+- OpenZeppelin Relayer 1.5.0 (official container image and unmodified source tag v1.5.0, commit 3db7d38c34ca05ab5f51dd74817889a1e388eec6), license AGPL-3.0
 - OpenZeppelin Contracts 5.6.1 and OpenZeppelin Confidential Contracts 0.5.1 (MIT)
 - Zama FHEVM Solidity 0.11.1, Hardhat plugin 0.4.2, and mock-utils 0.4.2 (BSD-3-Clause-Clear)
 - Solana Token-2022 program@v7.0.0 (commit ed6f74f960a3c06cf681c6b0a31552f2f4956df3), built locally with zk-ops, ZK ElGamal proof program, and Anchor 0.31.1 (Apache-2.0)

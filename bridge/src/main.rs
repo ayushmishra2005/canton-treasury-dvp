@@ -38,6 +38,8 @@ enum Command {
         inject_attester_disagreement: bool,
         #[arg(long)]
         inject_unknown_attester: bool,
+        #[arg(long)]
+        cancel_locked: bool,
     },
     RelayerProof,
 }
@@ -57,6 +59,7 @@ fn main() -> Result<()> {
                     halt_after_first_approval,
                     inject_attester_disagreement,
                     inject_unknown_attester,
+                    cancel_locked,
                 },
         } => run_workflow(
             true,
@@ -69,11 +72,12 @@ fn main() -> Result<()> {
             halt_after_first_approval,
             inject_attester_disagreement,
             inject_unknown_attester,
+            cancel_locked,
         ),
         Args {
             command: Command::RelayerProof,
         } => run_workflow(
-            false, false, None, None, false, None, false, false, false, false,
+            false, false, None, None, false, None, false, false, false, false, false,
         ),
     }
 }
@@ -90,6 +94,7 @@ fn run_workflow(
     halt_after_first_approval: bool,
     inject_attester_disagreement: bool,
     inject_unknown_attester: bool,
+    cancel_locked: bool,
 ) -> Result<()> {
     let rpc =
         RpcClient::new_with_commitment(required("SOLANA_RPC_URL"), CommitmentConfig::confirmed());
@@ -142,6 +147,7 @@ fn run_workflow(
         halt_after_first_approval,
         inject_attester_disagreement,
         inject_unknown_attester,
+        cancel_locked,
     };
     let tokens = required("BRIDGE_AMOUNT").parse()?;
     if full {

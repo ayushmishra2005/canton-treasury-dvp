@@ -29,7 +29,7 @@ use crate::recovery::{
     approval_expired_on_chain, attesters_needed, completed_operation_decision, decode_approval,
     decode_chain_clock, decode_receipt_status, should_apply_pending,
     should_refresh_release_materials, should_submit_release, CompletionDecision, OnChainApproval,
-    RECEIPT_CANCELLED, RECEIPT_MINT_AUTHORIZED, RECEIPT_RELEASED,
+    RECEIPT_CANCELLED, RECEIPT_LOCKED, RECEIPT_MINT_AUTHORIZED, RECEIPT_RELEASED,
 };
 use crate::relayer::{RelayerClient, RelayerInstruction};
 use crate::reservation::{
@@ -37,14 +37,15 @@ use crate::reservation::{
     RESERVATION_RESERVED,
 };
 use crate::setup::{
-    apply_pending, close_orphaned_config, config_is_initialized, create_bridge_accounts,
-    decode_aes, decode_elgamal, decode_keypair, decrypt_available, encode_aes, encode_elgamal,
-    encode_keypair, pending_credit_counter, read_bridge_config, read_mint_decimals,
+    apply_pending, config_is_compatible, config_is_initialized, create_bridge_accounts, decode_aes,
+    decode_elgamal, decode_keypair, decrypt_available, encode_aes, encode_elgamal, encode_keypair,
+    has_pending_encrypted_credit, pending_credit_counter, read_bridge_config, read_mint_decimals,
     vault_elgamal_pubkey, BridgeAccounts, ConfidentialOwner, DECIMALS,
 };
 use crate::txsize::{report_size, serialize_legacy, LEGACY_LIMIT};
 use crate::units::{require_mint_decimals, TokenUnits};
 use crate::zama::ZamaClient;
+use crate::zama::ZamaReceipt;
 
 pub struct Workflow {
     pub rpc: RpcClient,
@@ -63,6 +64,7 @@ pub struct Workflow {
     pub halt_after_first_approval: bool,
     pub inject_attester_disagreement: bool,
     pub inject_unknown_attester: bool,
+    pub cancel_locked: bool,
 }
 
 impl Workflow {
@@ -140,9 +142,36 @@ impl Workflow {
         journal.lock_id = lock_id.clone();
         self.persist(&journal, &secrets)?;
 
+        let mint_expiry = if journal.mint_expiry == 0 {
+            self.mint_deadline()?
+        } else {
+            journal.mint_expiry
+        };
+        journal.mint_expiry = mint_expiry;
+        self.persist(&journal, &secrets)?;
+
+        if self.cancel_locked || journal.completed == Some(Step::Cancelled) {
+            return self.cancel_locked_operation(
+                &accounts,
+                &fee_payer,
+                amount,
+                commitment,
+                operation,
+                reservation,
+                previous,
+                &chain_id,
+                &config,
+                &receipt,
+                &reservation_hex,
+                &attester_a,
+                &attester_b,
+                &mut journal,
+            );
+        }
+
         if include_canton_zama {
             self.canton.prepare()?;
-            match self.reserve_once(&reservation_hex, amount)? {
+            match self.reserve_once(&reservation_hex, amount, &mut journal, &secrets)? {
                 ReservationAction::RecordCompleted => {
                     println!("COMPLETED_RESUME_SKIP_SETUP");
                     self.record_completed_operation(
@@ -160,14 +189,6 @@ impl Workflow {
                 return Ok(());
             }
         }
-
-        let mint_expiry = if journal.mint_expiry == 0 {
-            self.mint_deadline()?
-        } else {
-            journal.mint_expiry
-        };
-        journal.mint_expiry = mint_expiry;
-        self.persist(&journal, &secrets)?;
 
         if self.expiry_recovery {
             return self.run_expiry_recovery(
@@ -225,7 +246,7 @@ impl Workflow {
         );
         let mint_receipt = self.read_receipt_status(&receipt)?;
         if mint_receipt != Some(RECEIPT_MINT_AUTHORIZED) && mint_receipt != Some(RECEIPT_RELEASED) {
-            self.approve_needed(
+            let minted = self.approve_needed(
                 &fee_payer,
                 &attester_a,
                 &attester_b,
@@ -241,6 +262,8 @@ impl Workflow {
                 },
                 &mint_digest,
             )?;
+            record_mint_approvals(&mut journal, &minted);
+            self.store.save_journal(&journal)?;
         }
         if let Some(approval) = self.read_approval(&approval_pda(&operation, DIRECTION_MINT).0)? {
             println!("MINT_APPROVAL_BITMAP {}", approval.signer_bitmap);
@@ -288,7 +311,11 @@ impl Workflow {
                     "cannot finalize a rejected reservation"
                 );
                 match zama_status {
-                    1 => self.zama.finalize(&reservation_hex)?,
+                    1 => {
+                        let receipt = self.zama.finalize(&reservation_hex)?;
+                        apply_zama_receipt(&mut journal, "finalize", &receipt);
+                        self.store.save_journal(&journal)?;
+                    }
                     2 | 4 => {}
                     status => anyhow::bail!("unexpected zama status {status} after mint"),
                 }
@@ -389,6 +416,14 @@ impl Workflow {
     ) -> Result<(BridgeAccounts, Journal, Secrets)> {
         if let Some(secrets) = secrets {
             if journal_matches_onchain(&self.rpc, &journal)? {
+                if let Some(view) = read_bridge_config(&self.rpc)? {
+                    config_is_compatible(
+                        &view,
+                        &journal.mint,
+                        &journal.vault,
+                        &attesters_from_secrets(&secrets)?,
+                    )?;
+                }
                 let accounts = accounts_from_secrets(&journal, &secrets)?;
                 return Ok((accounts, journal, secrets));
             }
@@ -407,18 +442,28 @@ impl Workflow {
                     }
                 }
             }
+        } else if config_is_initialized(&self.rpc)? {
+            anyhow::bail!(
+                "recorded accounts do not match the on-chain bridge config; reuse the existing mint and vault"
+            );
         }
-        if config_is_initialized(&self.rpc)? {
-            close_orphaned_config(
-                &self.rpc,
-                &self.payer,
-                [&self.attester_a, &self.attester_b, &self.attester_c],
-            )?;
+        if let Some(view) = read_bridge_config(&self.rpc)? {
+            if let Some(durable) = durable_account_dir() {
+                if durable.join("secrets.json").exists() {
+                    let prior = OperationStore::open(durable.clone())?;
+                    if let Some(prior_journal) = prior.load_journal()? {
+                        if prior_journal.mint == view.mint.to_string()
+                            && prior_journal.vault == view.vault.to_string()
+                        {
+                            return self.reuse_existing_accounts(amount, &durable);
+                        }
+                    }
+                }
+            }
+            anyhow::bail!(
+                "bridge config already exists; reuse matching recorded accounts or abort. the coordinator never closes a shared config"
+            );
         }
-        anyhow::ensure!(
-            !config_is_initialized(&self.rpc)?,
-            "bridge config already exists; resume the recorded journal"
-        );
         let accounts = create_bridge_accounts(
             &self.rpc,
             &self.payer,
@@ -468,10 +513,9 @@ impl Workflow {
         amount: u64,
         prior: &std::path::Path,
     ) -> Result<(BridgeAccounts, Journal, Secrets)> {
-        anyhow::ensure!(
-            config_is_initialized(&self.rpc)?,
-            "cannot reuse accounts before the bridge config exists"
-        );
+        let view = read_bridge_config(&self.rpc)?.ok_or_else(|| {
+            anyhow::anyhow!("cannot reuse accounts before the bridge config exists")
+        })?;
         let prior_store = OperationStore::open(prior.to_path_buf())?;
         let prior_journal = prior_store
             .load_journal()?
@@ -479,6 +523,12 @@ impl Workflow {
         let mut secrets = prior_store
             .load_secrets()?
             .ok_or_else(|| anyhow::anyhow!("reuse-from secrets are missing"))?;
+        config_is_compatible(
+            &view,
+            &prior_journal.mint,
+            &prior_journal.vault,
+            &attesters_from_secrets(&secrets)?,
+        )?;
         let mut journal = Journal {
             mint: prior_journal.mint,
             source: prior_journal.source,
@@ -550,7 +600,13 @@ impl Workflow {
         }
     }
 
-    fn reserve_once(&self, reservation_hex: &str, amount: u64) -> Result<ReservationAction> {
+    fn reserve_once(
+        &self,
+        reservation_hex: &str,
+        amount: u64,
+        journal: &mut Journal,
+        secrets: &Secrets,
+    ) -> Result<ReservationAction> {
         let status = self.zama.status(reservation_hex);
         let approved = match &status {
             Ok(status)
@@ -564,13 +620,16 @@ impl Workflow {
         };
         match reservation_resume(status, approved) {
             Ok(action) => {
-                if action == ReservationAction::SubmitReserve
-                    && !self.zama.reserve(reservation_hex, amount)?
-                {
-                    println!("ZAMA_RESERVATION_REJECTED");
-                    anyhow::bail!(
-                        "Zama rejected the reservation; no lock or mint will be attempted"
-                    );
+                if action == ReservationAction::SubmitReserve {
+                    let receipt = self.zama.reserve(reservation_hex, amount)?;
+                    if !receipt.approved {
+                        println!("ZAMA_RESERVATION_REJECTED");
+                        anyhow::bail!(
+                            "Zama rejected the reservation; no lock or mint will be attempted"
+                        );
+                    }
+                    apply_zama_receipt(journal, "reserve", &receipt);
+                    self.persist(journal, secrets)?;
                 }
                 Ok(action)
             }
@@ -956,7 +1015,11 @@ impl Workflow {
         if include_canton_zama && !journal.reached(Step::ZamaRedeemed) {
             match self.zama.status(reservation_hex) {
                 Ok(RESERVATION_REDEEMED) => {}
-                Ok(RESERVATION_FINALIZED) => self.zama.redeem(reservation_hex)?,
+                Ok(RESERVATION_FINALIZED) => {
+                    let receipt = self.zama.redeem(reservation_hex)?;
+                    apply_zama_receipt(journal, "redeem", &receipt);
+                    self.store.save_journal(journal)?;
+                }
                 Ok(status) => anyhow::bail!("unexpected zama status {status} before redeem"),
                 Err(err) => return Err(err),
             }
@@ -1097,6 +1160,61 @@ impl Workflow {
             "mint approval must fail after the original deadline"
         );
         println!("EXPIRY_RECOVERY_MINT_REJECTED");
+        self.cancel_locked_operation(
+            accounts,
+            fee_payer,
+            amount,
+            commitment,
+            operation,
+            reservation,
+            previous,
+            chain_id,
+            config,
+            receipt,
+            reservation_hex,
+            attester_a,
+            attester_b,
+            journal,
+        )?;
+        println!("EXPIRY_RECOVERY_COMPLETE");
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cancel_locked_operation(
+        &self,
+        accounts: &BridgeAccounts,
+        fee_payer: &Pubkey,
+        amount: u64,
+        commitment: [u8; 32],
+        operation: [u8; 32],
+        reservation: [u8; 32],
+        previous: [u8; 32],
+        chain_id: &[u8; 32],
+        config: &Pubkey,
+        receipt: &Pubkey,
+        reservation_hex: &str,
+        attester_a: &Keypair,
+        attester_b: &Keypair,
+        journal: &mut Journal,
+    ) -> Result<()> {
+        if self.read_receipt_status(receipt)? == Some(RECEIPT_CANCELLED) {
+            self.cancel_zama_if_reserved(journal, reservation_hex)?;
+            self.prove_vault_unlocked(accounts)?;
+            let _ = self.halt(Step::Cancelled, journal)?;
+            println!("RECOVERY_RESULT cancelled");
+            println!("TERMINAL_STATE cancelled");
+            return Ok(());
+        }
+        let status = self.read_receipt_status(receipt)?;
+        anyhow::ensure!(
+            status == Some(RECEIPT_LOCKED),
+            "cancel is only allowed while the receipt is locked; status={status:?}"
+        );
+        anyhow::ensure!(
+            status != Some(RECEIPT_MINT_AUTHORIZED) && status != Some(RECEIPT_RELEASED),
+            "refusing to cancel after mint authorization"
+        );
         let cancel_now = self.chain_unix_timestamp()?;
         let cancel_expiry = cancel_now + 3600;
         let cancel_proofs = generate_transfer_proofs(
@@ -1177,27 +1295,56 @@ impl Workflow {
         let sig = self.relayer.wait_confirmed(&id, Duration::from_secs(180))?;
         println!("RELAYER_SIG {sig}");
         self.confirm_on_chain(&sig)?;
-        apply_pending(
-            &self.rpc,
-            &self.payer,
-            &accounts.source.token,
-            &accounts.source.authority,
-            &accounts.source.aes,
-            amount,
-            1,
-        )?;
-        match self.zama.status(reservation_hex) {
-            Ok(1) => self.zama.cancel(reservation_hex)?,
-            Ok(3) => {}
-            Ok(status) => anyhow::bail!("unexpected zama status {status} after expiry cancel"),
-            Err(err) => return Err(err),
+        let source_pending = pending_credit_counter(&self.rpc, &accounts.source.token)?;
+        if source_pending > 0 {
+            apply_pending(
+                &self.rpc,
+                &self.payer,
+                &accounts.source.token,
+                &accounts.source.authority,
+                &accounts.source.aes,
+                amount,
+                source_pending,
+            )?;
         }
+        self.cancel_zama_if_reserved(journal, reservation_hex)?;
+        self.prove_vault_unlocked(accounts)?;
         println!("EXPIRY_RECOVERY_CANCEL_CONFIRMED {sig}");
         println!("ZAMA_CANCEL_OK {reservation_hex}");
         println!("RECOVERY_RESULT cancelled");
         println!("TERMINAL_STATE cancelled");
         println!("ACTION_COUNTS mint=0 settle=0 burn=0 release=0 zama=1");
-        println!("EXPIRY_RECOVERY_COMPLETE");
+        println!("CANCEL_LOCKED_COMPLETE");
+        let _ = self.halt(Step::Cancelled, journal)?;
+        Ok(())
+    }
+
+    fn cancel_zama_if_reserved(&self, journal: &mut Journal, reservation_hex: &str) -> Result<()> {
+        match self.zama.status(reservation_hex) {
+            Ok(1) => {
+                let receipt = self.zama.cancel(reservation_hex)?;
+                apply_zama_receipt(journal, "cancel", &receipt);
+                self.store.save_journal(journal)?;
+            }
+            Ok(3) => {}
+            Ok(status) => anyhow::bail!("unexpected zama status {status} after cancel"),
+            Err(err) => return Err(err),
+        }
+        Ok(())
+    }
+
+    fn prove_vault_unlocked(&self, accounts: &BridgeAccounts) -> Result<()> {
+        let pending = pending_credit_counter(&self.rpc, &accounts.vault)?;
+        let available = decrypt_available(&self.rpc, &accounts.vault, &accounts.vault_aes)?;
+        println!("VAULT_PENDING {pending}");
+        println!("VAULT_AVAILABLE {available}");
+        anyhow::ensure!(pending == 0, "vault still has pending confidential credits");
+        anyhow::ensure!(available == 0, "vault still holds locked value {available}");
+        anyhow::ensure!(
+            !has_pending_encrypted_credit(&self.rpc, &accounts.vault)?,
+            "vault still has encrypted pending credits"
+        );
+        println!("VAULT_UNLOCKED");
         Ok(())
     }
 
@@ -1275,6 +1422,7 @@ impl Workflow {
         digest: &[u8; 32],
     ) -> Result<()> {
         self.approve_needed(fee_payer, attester_a, attester_b, args, digest)
+            .map(|_| ())
     }
 
     fn approve_needed(
@@ -1284,7 +1432,7 @@ impl Workflow {
         attester_b: &Keypair,
         args: &ApproveFields,
         digest: &[u8; 32],
-    ) -> Result<()> {
+    ) -> Result<Vec<(String, String)>> {
         let (approval, _) = approval_pda(&args.operation, args.direction);
         let existing = self.read_approval(&approval)?;
         let chain_now = self.chain_unix_timestamp()?;
@@ -1323,6 +1471,7 @@ impl Workflow {
             &[ed25519_approve_ix(attester_a, digest)?, approve.clone()],
             fee_payer,
         )?;
+        let mut submitted = Vec::new();
         for (index, attester) in [attester_a, attester_b].into_iter().enumerate() {
             if !needed[index] {
                 continue;
@@ -1362,6 +1511,11 @@ impl Workflow {
             let sig = self.relayer.wait_confirmed(&id, Duration::from_secs(180))?;
             println!("RELAYER_SIG {sig}");
             self.confirm_on_chain(&sig)?;
+            if args.direction == DIRECTION_MINT {
+                println!("MINT_APPROVAL_RELAYER_TX {id}");
+                println!("MINT_APPROVAL_SIG {sig}");
+            }
+            submitted.push((id, sig));
             if self.halt_after_first_approval {
                 break;
             }
@@ -1369,6 +1523,8 @@ impl Workflow {
         if let Some(after) = self.read_approval(&approval)? {
             if args.direction == DIRECTION_MINT {
                 println!("MINT_APPROVAL_BITMAP {}", after.signer_bitmap);
+            } else if args.direction == DIRECTION_CANCEL {
+                println!("CANCEL_APPROVAL_BITMAP {}", after.signer_bitmap);
             } else {
                 println!("RELEASE_APPROVAL_BITMAP {}", after.signer_bitmap);
             }
@@ -1381,7 +1537,7 @@ impl Workflow {
         } else if !self.halt_after_first_approval && !self.inject_attester_disagreement {
             anyhow::bail!("approval account is missing after submit");
         }
-        Ok(())
+        Ok(submitted)
     }
 
     fn mint_deadline(&self) -> Result<i64> {
@@ -1490,6 +1646,14 @@ fn durable_account_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn attesters_from_secrets(secrets: &Secrets) -> Result<[Pubkey; 3]> {
+    Ok([
+        decode_keypair(&secrets.attester_a)?.pubkey(),
+        decode_keypair(&secrets.attester_b)?.pubkey(),
+        decode_keypair(&secrets.attester_c)?.pubkey(),
+    ])
+}
+
 fn save_durable_accounts(journal: &Journal, secrets: &Secrets) -> Result<()> {
     let Some(dir) = durable_account_dir() else {
         return Ok(());
@@ -1525,6 +1689,46 @@ fn to_relayer(ix: &Instruction) -> RelayerInstruction {
 
 fn release_deadline_secs() -> i64 {
     env_deadline_secs("BRIDGE_RELEASE_EXPIRY_SECS", 3600)
+}
+
+fn apply_zama_receipt(journal: &mut Journal, kind: &str, receipt: &ZamaReceipt) {
+    let hash = receipt.tx_hash.clone().unwrap_or_default();
+    let gas = receipt.gas_used.clone().unwrap_or_default();
+    match kind {
+        "reserve" => {
+            journal.zama_reserve_tx = hash;
+            journal.zama_reserve_gas = gas;
+        }
+        "finalize" => {
+            journal.zama_finalize_tx = hash;
+            journal.zama_finalize_gas = gas;
+        }
+        "cancel" => {
+            journal.zama_cancel_tx = hash;
+            journal.zama_cancel_gas = gas;
+        }
+        "redeem" => {
+            journal.zama_redeem_tx = hash;
+            journal.zama_redeem_gas = gas;
+        }
+        _ => {}
+    }
+}
+
+fn record_mint_approvals(journal: &mut Journal, minted: &[(String, String)]) {
+    if let Some((tx, sig)) = minted.first() {
+        if journal.mint_approval_tx_a.is_empty() {
+            journal.mint_approval_tx_a = tx.clone();
+            journal.mint_approval_sig_a = sig.clone();
+        }
+    }
+    if let Some((tx, sig)) = minted.get(1) {
+        journal.mint_approval_tx_b = tx.clone();
+        journal.mint_approval_sig_b = sig.clone();
+    } else if minted.len() == 1 && journal.mint_approval_tx_a != minted[0].0 {
+        journal.mint_approval_tx_b = minted[0].0.clone();
+        journal.mint_approval_sig_b = minted[0].1.clone();
+    }
 }
 
 fn env_deadline_secs(name: &str, default: i64) -> i64 {
@@ -1602,5 +1806,137 @@ impl Step {
             Some(done) if done.rank() > self.rank() => done,
             _ => self,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_two_mint_approvals_in_order() {
+        let mut journal = Journal::default();
+        record_mint_approvals(
+            &mut journal,
+            &[
+                ("tx-a".into(), "sig-a".into()),
+                ("tx-b".into(), "sig-b".into()),
+            ],
+        );
+        assert_eq!(journal.mint_approval_tx_a, "tx-a");
+        assert_eq!(journal.mint_approval_sig_a, "sig-a");
+        assert_eq!(journal.mint_approval_tx_b, "tx-b");
+        assert_eq!(journal.mint_approval_sig_b, "sig-b");
+    }
+
+    #[test]
+    fn records_the_second_mint_approval_on_resume() {
+        let mut journal = Journal {
+            mint_approval_tx_a: "tx-a".into(),
+            mint_approval_sig_a: "sig-a".into(),
+            ..Journal::default()
+        };
+        record_mint_approvals(&mut journal, &[("tx-b".into(), "sig-b".into())]);
+        assert_eq!(journal.mint_approval_tx_a, "tx-a");
+        assert_eq!(journal.mint_approval_tx_b, "tx-b");
+        assert_eq!(journal.mint_approval_sig_b, "sig-b");
+    }
+
+    #[test]
+    fn reuse_accepts_recorded_attesters_that_match_the_config() {
+        let a = Keypair::new();
+        let b = Keypair::new();
+        let c = Keypair::new();
+        let secrets = Secrets {
+            attester_a: encode_keypair(&a),
+            attester_b: encode_keypair(&b),
+            attester_c: encode_keypair(&c),
+            ..Secrets::default()
+        };
+        let recorded = attesters_from_secrets(&secrets).unwrap();
+        let view = crate::setup::BridgeConfigView {
+            mint: Pubkey::new_from_array([3u8; 32]),
+            vault: Pubkey::new_from_array([4u8; 32]),
+            attesters: recorded,
+        };
+        config_is_compatible(
+            &view,
+            &view.mint.to_string(),
+            &view.vault.to_string(),
+            &recorded,
+        )
+        .unwrap();
+        let outsider = [Keypair::new().pubkey(), b.pubkey(), c.pubkey()];
+        assert!(config_is_compatible(
+            &view,
+            &view.mint.to_string(),
+            &view.vault.to_string(),
+            &outsider,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stores_successful_zama_receipt_fields() {
+        let mut journal = Journal::default();
+        apply_zama_receipt(
+            &mut journal,
+            "reserve",
+            &ZamaReceipt {
+                approved: true,
+                tx_hash: Some(
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                ),
+                gas_used: Some("111".into()),
+            },
+        );
+        apply_zama_receipt(
+            &mut journal,
+            "finalize",
+            &ZamaReceipt {
+                approved: true,
+                tx_hash: Some(
+                    "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+                ),
+                gas_used: Some("333".into()),
+            },
+        );
+        apply_zama_receipt(
+            &mut journal,
+            "cancel",
+            &ZamaReceipt {
+                approved: true,
+                tx_hash: Some(
+                    "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
+                ),
+                gas_used: Some("444".into()),
+            },
+        );
+        apply_zama_receipt(
+            &mut journal,
+            "redeem",
+            &ZamaReceipt {
+                approved: true,
+                tx_hash: Some(
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                ),
+                gas_used: Some("222".into()),
+            },
+        );
+        assert_eq!(
+            journal.zama_reserve_tx,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(journal.zama_reserve_gas, "111");
+        assert_eq!(
+            journal.zama_finalize_tx,
+            "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
+        assert_eq!(journal.zama_cancel_gas, "444");
+        assert_eq!(
+            journal.zama_redeem_tx,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(journal.zama_redeem_gas, "222");
     }
 }

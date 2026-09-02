@@ -685,29 +685,59 @@ observes data it should not, or any Canton process or port survives shutdown.
 ## Public hybrid verification
 
 Date: **2 September 2026**. Tested Git commit:
-`d42f0d55a7befcf22a58bc967b59ee61d9dd2dea`
-(`fix(bridge): use Devnet-compatible confidential proofs`), plus the unstaged
-public-hybrid coordinator, Relayer, and Zama network wiring from that run.
+`2ee9001adff80032c474aa8a7040fb277b724db3`
+(`feat(bridge): add public hybrid testnet verification`) plus the working-tree
+fixes on the same `main` branch: recover a locked disagreement, remove
+`close_config`, transfer only missing lamports, and require Relayer secrets
+from the environment.
 
 | Network | What ran |
 |---|---|
-| Solana **Devnet** | Confidential escrow `BkDwMbtMVhDWeQ1nHwvCKmTT2XZhP2RMYGw18c6imnPf` ([Explorer](https://explorer.solana.com/address/BkDwMbtMVhDWeQ1nHwvCKmTT2XZhP2RMYGw18c6imnPf?cluster=devnet)). Probe mint `HLiwyBuuG2XS53Eg6RHVWDYkzDiuT4VTgKut1fMYQaja`. Connected-operation mint `2VVrDr9Y9TrgmJquQc2wT5FAt4PVgznxGHE9GP2HgiRF`. |
-| Zama on Ethereum **Sepolia** | `ConfidentialRiskEngine` `0x4adeaC48EaC6b2481DBCE3fA211e0Ca7945E41B5` ([Explorer](https://sepolia.etherscan.io/address/0x4adeaC48EaC6b2481DBCE3fA211e0Ca7945E41B5)) with real FHE. Mock FHE was disabled. |
+| Solana **Devnet** | Confidential escrow `BkDwMbtMVhDWeQ1nHwvCKmTT2XZhP2RMYGw18c6imnPf` ([Explorer](https://explorer.solana.com/address/BkDwMbtMVhDWeQ1nHwvCKmTT2XZhP2RMYGw18c6imnPf?cluster=devnet)). Probe mint `HLiwyBuuG2XS53Eg6RHVWDYkzDiuT4VTgKut1fMYQaja`. Shared mint `8TtT6MXtR3XihLJP5jrAW5EuLg4WgyDcYgWJYbf3ZPGD`. |
+| Zama on Ethereum **Sepolia** | `ConfidentialRiskEngine` `0x4adeaC48EaC6b2481DBCE3fA211e0Ca7945E41B5` ([Explorer](https://sepolia.etherscan.io/address/0x4adeaC48EaC6b2481DBCE3fA211e0Ca7945E41B5)) with real FHE. Mock FHE was disabled. One wallet held the deployer, requester, and settler roles. |
 | Canton | Private six-participant topology from `canton/settlement-topology.conf`. **Not** Canton DevNet. **Not** Mainnet. |
 
-Connected operation lock `32fcf318058f1f09c4c1bbc743dcd2df6eae5471dd293619bec4fe8d3894450b`.
+The locked disagreement `5ff1a45e4567f14e79b52fdbe18410037788d27299d310552863ad1d84e81f40`
+was cancelled through Relayer
+`p3k8h9HxMMqJK9e5xpcU5mqZwYPtEwq3Hbuv272kNz4PFHVLsmcTqgA2DYZsGugn5nkGtecJEXe9AaJFgCwXce3`
+and Zama cancel
+[`0x7364f9e1c0320c7d79a2b27ae5b8ebc99b363393496ef0fb5bd3105dcc7dfa57`](https://sepolia.etherscan.io/tx/0x7364f9e1c0320c7d79a2b27ae5b8ebc99b363393496ef0fb5bd3105dcc7dfa57)
+(gas `288226`, reservation status `3`). The shared vault decrypted to `0`
+available and `0` pending. The shared config was not closed.
+
+The same program ID was then upgraded:
+[`2bR6LRCT4ZYu8yRS92urHjkHmULUgzs4jPsNVrtctG7DKVK4sFyVZQqiiZEY57fsB6v9jqXyTzJaVq8R9CE4v4w8`](https://explorer.solana.com/tx/2bR6LRCT4ZYu8yRS92urHjkHmULUgzs4jPsNVrtctG7DKVK4sFyVZQqiiZEY57fsB6v9jqXyTzJaVq8R9CE4v4w8?cluster=devnet),
+slot `491994540`, upgrade authority
+`9EMA7SScSpniQFELnrEdQyYCozxfDhv6t6CKnc8ytdkF`.
+
+This working tree then reused the shared mint and completed a new
+connected operation lock
+`fd1dda634bed7de17547c1c5009dbede3de231e322cfdde4a1c137891e9d7426`.
+Zama reserve
+[`0x24be8e35fd17c3513134565b329d093645e2f18582dd865e0962bf24c2189534`](https://sepolia.etherscan.io/tx/0x24be8e35fd17c3513134565b329d093645e2f18582dd865e0962bf24c2189534)
+(gas `846598`), finalize
+[`0x80f3685ea05fe20ab72707df48061e8f74f6cbddd492277f6d17908990e7f60c`](https://sepolia.etherscan.io/tx/0x80f3685ea05fe20ab72707df48061e8f74f6cbddd492277f6d17908990e7f60c)
+(gas `285498`), and redeem
+[`0x193d790d42ca01f1781f73509eff8ba93a8c73423c039819bedede6a2919acb8`](https://sepolia.etherscan.io/tx/0x193d790d42ca01f1781f73509eff8ba93a8c73423c039819bedede6a2919acb8)
+(gas `288341`, reservation status `4`). Mint-approval Relayer transactions:
+`0fe33e76-dda4-4bae-ad0c-93c22bb04203` /
+`5byFs2isHN5f2njNjUnqswKbG37Dqiu7juc6LyTR1VrpXrhhQXJaTqoWr259FfcARE2ZR8j8pzRWPxxhNpr6ojjw`
+and
+`e082dcba-e75e-4639-b02e-423d0c5227ee` /
+`2xAFuYkVBDtspDTno3FGr3kqsGwtjj55mJ2sDJTwWeqcdWJa8phnKKRhnLhJLzQy59yoKzAJYTZzUBF8ZGnXb5e8`.
 Confidential release through OpenZeppelin Relayer 1.5.0:
-`3QmVTEGg3NWa67vyZCRvpfSrzzon6dXSueSZ3Eu2kfhoe75akgZkcogpD6LU6R7DyyUsj85RTTjV31jfuoWGTk2g`.
+`2uGMyuL2i1oKN6SofZrxhqoUXGfNZUsjdqD4Hpb7T4oRS5rZKqW38XudmBrYi9e6kHMrEJWqCrFovPAHY7ra77xK`.
 Destination available balance after apply-pending: `100000000000` base units.
-Zama reservation redeemed (status `4`). Connected Canton history verified
-`CANTON_VERIFY_OK` on two completed resumes. Relayer release confirmed once.
-Zama redeem confirmed once.
+The private Canton topology settled and redeemed this lock. The in-memory
+Canton process was stopped before two completed-resume history checks could
+be repeated.
 
 Faults that rejected as required: unconfigured Zama client, lock expiry before
 settlement with Relayer cancel, over-capacity reservation, unknown attester,
-attester disagreement without quorum, delayed release after redemption, release
-approval expiry on the Solana chain clock, wrong lock binding, wrong trade
-binding, and duplicate Zama redeem.
+attester disagreement without quorum followed by cancel or a second valid
+vote, delayed release after redemption, release approval expiry on the Solana
+chain clock, wrong lock binding, wrong trade binding, and duplicate Zama
+redeem.
 
 Only `DvpTrade_Settle` is atomic. Solana, Zama, and Canton steps are
 asynchronous and recoverable. This is testnet evidence, not a security audit

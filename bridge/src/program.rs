@@ -109,21 +109,6 @@ pub fn initialize_ix(
     })
 }
 
-pub fn close_config_ix(payer: Pubkey, attesters: [Pubkey; 3]) -> Result<Instruction> {
-    let (config, _) = config_pda();
-    Ok(Instruction {
-        program_id: program_id(),
-        accounts: vec![
-            AccountMeta::new(payer, true),
-            AccountMeta::new(config, false),
-            AccountMeta::new_readonly(attesters[0], true),
-            AccountMeta::new_readonly(attesters[1], true),
-            AccountMeta::new_readonly(attesters[2], true),
-        ],
-        data: disc("close_config").to_vec(),
-    })
-}
-
 pub fn approve_ix(payer: Pubkey, args: &ApproveFields) -> Result<Instruction> {
     let (config, _) = config_pda();
     let (receipt, _) = receipt_pda(&args.operation);

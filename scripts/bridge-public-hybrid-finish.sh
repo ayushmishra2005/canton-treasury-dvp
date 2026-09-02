@@ -42,10 +42,7 @@ zama_engine="$(tr -d '[:space:]' < "$engine_file")"
 zama_client="$(tr -d '[:space:]' < "$client_file")"
 log "PUBLIC_HYBRID_FINISH"
 
-export RELAYER_API_KEY="${RELAYER_API_KEY:-bridge-local-api-key-32chars-min}"
-export KEYSTORE_PASSPHRASE="${KEYSTORE_PASSPHRASE:-Bridge-Local-1!}"
-mkdir -p bridge/relayer/keys
-cp "$testnet_dir/relayer-devnet-signer.json" bridge/relayer/keys/devnet-signer.json
+prepare_devnet_relayer_runtime "$testnet_dir/relayer-devnet-signer.json"
 started_compose="$repo_root/bridge/relayer/docker-compose.yml"
 RELAYER_CONFIG=./config.devnet.json docker compose -f "$started_compose" up -d
 for _ in $(seq 1 90); do
@@ -117,6 +114,48 @@ run_workflow() {
   fi
 }
 
+record_public_evidence() {
+  python3 - "$journal_dir/journal.json" <<'PY' | tee -a "$evidence"
+import json, sys
+journal = json.load(open(sys.argv[1]))
+pairs = [
+    ("ZAMA_RESERVE_TX", journal.get("zama_reserve_tx", "")),
+    ("ZAMA_RESERVE_GAS", journal.get("zama_reserve_gas", "")),
+    ("ZAMA_FINALIZE_TX", journal.get("zama_finalize_tx", "")),
+    ("ZAMA_FINALIZE_GAS", journal.get("zama_finalize_gas", "")),
+    ("ZAMA_REDEEM_TX", journal.get("zama_redeem_tx", "")),
+    ("ZAMA_REDEEM_GAS", journal.get("zama_redeem_gas", "")),
+    ("MINT_APPROVAL_RELAYER_TX_A", journal.get("mint_approval_tx_a", "")),
+    ("MINT_APPROVAL_SIG_A", journal.get("mint_approval_sig_a", "")),
+    ("MINT_APPROVAL_RELAYER_TX_B", journal.get("mint_approval_tx_b", "")),
+    ("MINT_APPROVAL_SIG_B", journal.get("mint_approval_sig_b", "")),
+]
+missing = [name for name, value in pairs if not value]
+if missing:
+    raise SystemExit("missing public evidence: " + ", ".join(missing))
+for name, value in pairs:
+    print(f"{name} {value}")
+for name, value in pairs:
+    if name.endswith("_TX") and value.startswith("0x"):
+        print(f"{name}_EXPLORER https://sepolia.etherscan.io/tx/{value}")
+PY
+}
+
+main_completed="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json')).get('completed') or '')")"
+if [[ "$main_completed" == "zama_redeemed" ]]; then
+  log "BRIDGE_RESUME_COMPLETED"
+  BRIDGE_JOURNAL_DIR="$journal_dir" \
+    run_workflow --journal "$journal_dir" --resume --stop-after zama_redeemed
+  BRIDGE_JOURNAL_DIR="$journal_dir" \
+    run_workflow --journal "$journal_dir" --resume --stop-after zama_redeemed
+  resume_skips="$(grep -c COMPLETED_RESUME_SKIP_SETUP "$tmp_dir/ctd-workflow.log" || true)"
+  resume_recorded="$(grep -c OPERATION_RECORDED_COMPLETE "$tmp_dir/ctd-workflow.log" || true)"
+  if [[ "$resume_skips" -lt 2 && "$resume_recorded" -lt 2 ]]; then
+    fail "completed operation was not resumed twice"
+  fi
+  grep -q CANTON_VERIFY_OK "$tmp_dir/ctd-workflow.log" || fail "connected Canton history was not verified"
+fi
+
 zama_rpc() {
   local method="$1"
   local args="$2"
@@ -175,33 +214,33 @@ printf '%s\n' "$dup_redeem" | tee -a "$evidence"
 [[ "$dup_status" -ne 0 ]] || fail "duplicate Zama redeem was accepted"
 log "FAULT_DUPLICATE_ZAMA_REDEEM rejected"
 
-if [[ -d "$accounts_dir" ]]; then
-  rm -rf "$testnet_dir/bridge-accounts-completed"
-  mv "$accounts_dir" "$testnet_dir/bridge-accounts-completed"
-fi
-mkdir -p "$accounts_dir"
 disagree_dir="$run_dir/bridge-disagree"
-rm -rf "$disagree_dir"
-log "BRIDGE_ATTESTER_DISAGREEMENT_REPLAY"
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$disagree_dir" BRIDGE_ACCOUNT_DIR="$accounts_dir" \
-  run_workflow --journal "$disagree_dir" --resume --stop-after locked
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$disagree_dir" BRIDGE_ACCOUNT_DIR="$accounts_dir" \
-  run_workflow --journal "$disagree_dir" --resume --inject-unknown-attester --halt-after-first-approval
-BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$disagree_dir" BRIDGE_ACCOUNT_DIR="$accounts_dir" \
-  run_workflow --journal "$disagree_dir" --resume --inject-attester-disagreement
-grep -q "FAULT_INJECTED attester_disagreement" "$tmp_dir/ctd-workflow.log" \
-  || fail "attester disagreement was not injected"
-grep -q ATTESTER_DISAGREEMENT_REJECTED "$tmp_dir/ctd-workflow.log" \
-  || fail "attester disagreement was not rejected"
-python3 - "$disagree_dir/journal.json" <<'PY'
+if [[ -f "$disagree_dir/journal.json" ]]; then
+  completed="$(python3 -c "import json; print(json.load(open('$disagree_dir/journal.json')).get('completed') or '')")"
+  if [[ "$completed" == "locked" ]]; then
+    log "BRIDGE_RECOVER_LOCKED_DISAGREEMENT"
+    BRIDGE_JOURNAL_DIR="$disagree_dir" \
+      run_workflow --journal "$disagree_dir" --resume --cancel-locked
+  fi
+  python3 - "$disagree_dir/journal.json" <<'PY'
 import json, sys
 journal = json.load(open(sys.argv[1]))
-if journal.get("completed") != "locked":
-    raise SystemExit(f"disagreement advanced to {journal.get('completed')}")
-print("DISAGREE_JOURNAL_LOCKED")
+if journal.get("completed") == "locked":
+    raise SystemExit("PUBLIC_HYBRID_COMPLETE blocked: disagreement still locked")
+print("DISAGREE_TERMINAL", journal.get("completed"))
 PY
-log "FAULT_ATTESTER_DISAGREEMENT rejected"
-
+  if grep -q CANCEL_LOCKED_COMPLETE "$tmp_dir/ctd-workflow.log"; then
+    grep -q VAULT_UNLOCKED "$tmp_dir/ctd-workflow.log" \
+      || fail "vault still holds locked disagreement value"
+  fi
+fi
+record_public_evidence
+python3 - "$journal_dir/journal.json" <<'PY'
+import json, sys
+journal = json.load(open(sys.argv[1]))
+if journal.get("completed") != "zama_redeemed":
+    raise SystemExit("PUBLIC_HYBRID_COMPLETE blocked: main operation is %s" % journal.get("completed"))
+PY
 cp "$tmp_dir/ctd-workflow.log" "$log_dir/public-hybrid-finish.log"
 log "PUBLIC_HYBRID_COMPLETE"
 echo "PUBLIC_HYBRID_COMPLETE"

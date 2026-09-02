@@ -21,6 +21,7 @@ pub enum Step {
     ReleaseApproved,
     Released,
     ZamaRedeemed,
+    Cancelled,
 }
 
 impl Step {
@@ -38,6 +39,7 @@ impl Step {
             "release_approved" => Self::ReleaseApproved,
             "released" => Self::Released,
             "zama_redeemed" => Self::ZamaRedeemed,
+            "cancelled" => Self::Cancelled,
             other => anyhow::bail!("unknown stop-after step {other}"),
         })
     }
@@ -56,6 +58,7 @@ impl Step {
             Self::ReleaseApproved => 10,
             Self::Released => 11,
             Self::ZamaRedeemed => 12,
+            Self::Cancelled => 13,
         }
     }
 }
@@ -91,6 +94,30 @@ pub struct Journal {
     pub fault_injected_chain_time: i64,
     #[serde(default)]
     pub fault_recovered_chain_time: i64,
+    #[serde(default)]
+    pub mint_approval_tx_a: String,
+    #[serde(default)]
+    pub mint_approval_sig_a: String,
+    #[serde(default)]
+    pub mint_approval_tx_b: String,
+    #[serde(default)]
+    pub mint_approval_sig_b: String,
+    #[serde(default)]
+    pub zama_reserve_tx: String,
+    #[serde(default)]
+    pub zama_reserve_gas: String,
+    #[serde(default)]
+    pub zama_finalize_tx: String,
+    #[serde(default)]
+    pub zama_finalize_gas: String,
+    #[serde(default)]
+    pub zama_cancel_tx: String,
+    #[serde(default)]
+    pub zama_cancel_gas: String,
+    #[serde(default)]
+    pub zama_redeem_tx: String,
+    #[serde(default)]
+    pub zama_redeem_gas: String,
 }
 
 impl Journal {
@@ -333,6 +360,18 @@ mod tests {
         resume_matches_recorded_operation(&journal, 100_000_000_000, "dest").unwrap();
         assert!(resume_matches_recorded_operation(&journal, 200_000_000_000, "dest").is_err());
         assert!(resume_matches_recorded_operation(&journal, 100_000_000_000, "other").is_err());
+    }
+
+    #[test]
+    fn cancelled_is_a_terminal_step() {
+        assert_eq!(Step::parse("cancelled").unwrap(), Step::Cancelled);
+        assert!(Step::Cancelled.rank() > Step::ZamaRedeemed.rank());
+        let journal = Journal {
+            completed: Some(Step::Cancelled),
+            ..Journal::default()
+        };
+        assert!(journal.reached(Step::Locked));
+        assert!(journal.reached(Step::Cancelled));
     }
 
     #[test]

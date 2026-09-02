@@ -43,13 +43,7 @@ solana account "$RECORD_PROGRAM_ID" --url http://127.0.0.1:8899 >/dev/null \
   || fail "official Record program is missing on the local validator"
 require_escrow_loaded
 
-export RELAYER_API_KEY="${RELAYER_API_KEY:-bridge-local-api-key-32chars-min}"
-export KEYSTORE_PASSPHRASE="${KEYSTORE_PASSPHRASE:-Bridge-Local-1!}"
-mkdir -p bridge/relayer/keys
-if [[ ! -f bridge/relayer/keys/local-signer.json ]]; then
-  node scripts/write-relayer-keystore.mjs \
-    bridge/relayer/keys/local-signer.json "$KEYSTORE_PASSPHRASE"
-fi
+prepare_local_relayer_runtime
 started_compose="$repo_root/bridge/relayer/docker-compose.yml"
 docker compose -f "$started_compose" up -d
 for _ in $(seq 1 90); do

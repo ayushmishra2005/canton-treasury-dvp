@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 const require = createRequire(new URL("../zama/package.json", import.meta.url));
@@ -17,5 +17,6 @@ if (parsed.Crypto && !parsed.crypto) {
 }
 delete parsed["x-ethers"];
 await mkdir(dirname(path), { recursive: true });
-await writeFile(path, JSON.stringify(parsed));
+await writeFile(path, JSON.stringify(parsed), { mode: 0o600 });
+await chmod(path, 0o600);
 console.log("wrote " + path);

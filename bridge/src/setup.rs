@@ -24,7 +24,7 @@ use spl_token_confidential_transfer_proof_extraction::instruction::ProofLocation
 use std::thread;
 use std::time::Duration;
 
-use crate::program::{close_config_ix, initialize_ix, vault_authority_pda};
+use crate::program::{initialize_ix, vault_authority_pda};
 
 pub const DECIMALS: u8 = 6;
 
@@ -110,6 +110,10 @@ pub fn create_bridge_accounts(
     attesters: [Pubkey; 3],
     amount: u64,
 ) -> Result<BridgeAccounts> {
+    anyhow::ensure!(
+        !config_is_initialized(rpc)?,
+        "bridge config already exists; reuse the recorded mint and vault"
+    );
     let token_program = spl_token_2022::id();
     let mint_authority = Keypair::new();
     let mint = Keypair::new();
@@ -575,45 +579,33 @@ pub fn config_is_initialized(rpc: &RpcClient) -> Result<bool> {
     Ok(read_bridge_config(rpc)?.is_some())
 }
 
-pub fn close_orphaned_config(
-    rpc: &RpcClient,
-    payer: &Keypair,
-    attesters: [&Keypair; 3],
-) -> Result<String> {
-    let view =
-        read_bridge_config(rpc)?.ok_or_else(|| anyhow::anyhow!("bridge config is missing"))?;
-    let local = [
-        attesters[0].pubkey(),
-        attesters[1].pubkey(),
-        attesters[2].pubkey(),
-    ];
+pub fn missing_lamports(balance: u64, target: u64) -> u64 {
+    target.saturating_sub(balance)
+}
+
+pub fn config_is_compatible(
+    view: &BridgeConfigView,
+    mint: &str,
+    vault: &str,
+    attesters: &[Pubkey; 3],
+) -> Result<()> {
+    anyhow::ensure!(
+        view.mint.to_string() == mint && view.vault.to_string() == vault,
+        "on-chain bridge config mint/vault do not match the recorded accounts"
+    );
     for key in view.attesters {
         anyhow::ensure!(
-            local.contains(&key),
+            attesters.contains(&key),
             "on-chain attester is not a local attester"
         );
     }
-    for key in local {
+    for key in attesters {
         anyhow::ensure!(
-            view.attesters.contains(&key),
+            view.attesters.contains(key),
             "local attester is not configured on-chain"
         );
     }
-    if has_pending_encrypted_credit(rpc, &view.vault)? {
-        anyhow::bail!("refusing to close a vault with pending confidential credits");
-    }
-    let signature = send(
-        rpc,
-        payer,
-        &[close_config_ix(payer.pubkey(), local)?],
-        attesters.as_slice(),
-    )?;
-    println!("CONFIG_CLOSED {signature}");
-    anyhow::ensure!(
-        !config_is_initialized(rpc)?,
-        "bridge config still exists after close"
-    );
-    Ok(signature)
+    Ok(())
 }
 
 pub fn encode_keypair(keypair: &Keypair) -> String {
@@ -668,21 +660,18 @@ pub fn ensure_funded(
     pubkey: &Pubkey,
     target: u64,
 ) -> Result<()> {
-    if rpc.get_balance(pubkey)? >= target {
+    let balance = rpc.get_balance(pubkey)?;
+    let need = missing_lamports(balance, target);
+    if need == 0 {
         return Ok(());
     }
     if funder.pubkey() == *pubkey {
         return airdrop(rpc, pubkey);
     }
-    let need = target.saturating_sub(rpc.get_balance(pubkey)?);
     send(
         rpc,
         funder,
-        &[system_instruction::transfer(
-            &funder.pubkey(),
-            pubkey,
-            need.max(target),
-        )],
+        &[system_instruction::transfer(&funder.pubkey(), pubkey, need)],
         &[],
     )?;
     anyhow::ensure!(
@@ -846,5 +835,61 @@ mod tests {
         assert_eq!(view.mint, mint);
         assert_eq!(view.vault, vault);
         assert_eq!(view.attesters, attesters);
+    }
+
+    #[test]
+    fn partly_funded_account_needs_only_the_missing_lamports() {
+        assert_eq!(missing_lamports(20_000_000, 50_000_000), 30_000_000);
+        assert_eq!(missing_lamports(50_000_000, 50_000_000), 0);
+        assert_eq!(missing_lamports(0, 50_000_000), 50_000_000);
+        assert_eq!(missing_lamports(80_000_000, 50_000_000), 0);
+    }
+
+    #[test]
+    fn compatible_config_accepts_matching_mint_vault_and_attesters() {
+        let attesters = [
+            Pubkey::new_from_array([5u8; 32]),
+            Pubkey::new_from_array([6u8; 32]),
+            Pubkey::new_from_array([7u8; 32]),
+        ];
+        let view = BridgeConfigView {
+            mint: Pubkey::new_from_array([3u8; 32]),
+            vault: Pubkey::new_from_array([4u8; 32]),
+            attesters,
+        };
+        config_is_compatible(
+            &view,
+            &view.mint.to_string(),
+            &view.vault.to_string(),
+            &attesters,
+        )
+        .unwrap();
+        let shuffled = [attesters[2], attesters[0], attesters[1]];
+        config_is_compatible(
+            &view,
+            &view.mint.to_string(),
+            &view.vault.to_string(),
+            &shuffled,
+        )
+        .unwrap();
+        assert!(config_is_compatible(
+            &view,
+            &Pubkey::new_from_array([9u8; 32]).to_string(),
+            &view.vault.to_string(),
+            &attesters,
+        )
+        .is_err());
+        let outsider = [
+            attesters[0],
+            attesters[1],
+            Pubkey::new_from_array([8u8; 32]),
+        ];
+        assert!(config_is_compatible(
+            &view,
+            &view.mint.to_string(),
+            &view.vault.to_string(),
+            &outsider,
+        )
+        .is_err());
     }
 }

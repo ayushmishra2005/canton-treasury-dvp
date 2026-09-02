@@ -2,6 +2,10 @@
 # Source this file after setting repo_root.
 
 export PATH="${HOME}/.dpm/bin:${PATH}"
+node22_bin="$(ls -d "${HOME}/.nvm/versions/node"/v22.*/bin 2>/dev/null | sort -V | tail -1 || true)"
+if [[ -n "$node22_bin" ]]; then
+  export PATH="${node22_bin}:${PATH}"
+fi
 export HARDHAT_TELEMETRY=false
 export HARDHAT_DISABLE_TELEMETRY=1
 
@@ -18,6 +22,8 @@ ledger_dir=""
 canton_pid=""
 tmp_dir=""
 stack_failed=0
+relayer_runtime_key=""
+generated_local_signer=0
 
 fail() {
   echo "$1" >&2
@@ -113,6 +119,12 @@ cleanup_bridge_stack() {
   if [[ -n "$started_compose" ]]; then
     docker compose -f "$started_compose" down --remove-orphans >/dev/null 2>&1 || true
   fi
+  if [[ -n "${relayer_runtime_key:-}" && -f "$relayer_runtime_key" ]]; then
+    rm -f "$relayer_runtime_key"
+  fi
+  if [[ "${generated_local_signer:-0}" -eq 1 ]]; then
+    rm -f "$repo_root/bridge/relayer/keys/local-signer.json"
+  fi
   if [[ -n "$ledger_dir" && -d "$ledger_dir" ]]; then
     rm -rf "$ledger_dir"
   fi
@@ -154,6 +166,43 @@ require_devnet_matching_validator() {
 require_escrow_loaded() {
   solana program show "$ESCROW_PROGRAM_ID" --url http://127.0.0.1:8899 >/dev/null \
     || fail "confidential escrow $ESCROW_PROGRAM_ID is not loaded"
+}
+
+prepare_generated_relayer_secrets() {
+  if [[ -z "${RELAYER_API_KEY:-}" ]]; then
+    RELAYER_API_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+    export RELAYER_API_KEY
+  fi
+  if [[ -z "${KEYSTORE_PASSPHRASE:-}" ]]; then
+    KEYSTORE_PASSPHRASE="$(python3 -c 'import secrets; print("Tmp-" + secrets.token_urlsafe(18) + "!")')"
+    export KEYSTORE_PASSPHRASE
+  fi
+}
+
+prepare_local_relayer_runtime() {
+  prepare_generated_relayer_secrets
+  mkdir -p "$repo_root/bridge/relayer/keys"
+  rm -f "$repo_root/bridge/relayer/keys/local-signer.json"
+  node "$repo_root/scripts/write-relayer-keystore.mjs" \
+    "$repo_root/bridge/relayer/keys/local-signer.json" "$KEYSTORE_PASSPHRASE"
+  chmod 600 "$repo_root/bridge/relayer/keys/local-signer.json"
+  generated_local_signer=1
+}
+
+prepare_devnet_relayer_runtime() {
+  local source_key="$1"
+  if [[ -z "${RELAYER_API_KEY:-}" ]]; then
+    RELAYER_API_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+    export RELAYER_API_KEY
+  fi
+  [[ -n "${KEYSTORE_PASSPHRASE:-}" ]] \
+    || fail "KEYSTORE_PASSPHRASE is required to open the ignored Relayer signer"
+  test -f "$source_key" || fail "missing ignored Relayer signer"
+  chmod 600 "$source_key"
+  mkdir -p "$repo_root/bridge/relayer/keys"
+  relayer_runtime_key="$repo_root/bridge/relayer/keys/devnet-signer.json"
+  cp "$source_key" "$relayer_runtime_key"
+  chmod 600 "$relayer_runtime_key"
 }
 
 init_bridge_stack() {

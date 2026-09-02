@@ -50,11 +50,7 @@ zama_client="$(tr -d '[:space:]' < "$client_file")"
 log "PUBLIC_HYBRID_CONTINUE"
 log "ZAMA_ENGINE_REUSED $zama_engine"
 
-export RELAYER_API_KEY="${RELAYER_API_KEY:-bridge-local-api-key-32chars-min}"
-export KEYSTORE_PASSPHRASE="${KEYSTORE_PASSPHRASE:-Bridge-Local-1!}"
-mkdir -p bridge/relayer/keys
-test -f "$testnet_dir/relayer-devnet-signer.json" || fail "missing Relayer Devnet signer"
-cp "$testnet_dir/relayer-devnet-signer.json" bridge/relayer/keys/devnet-signer.json
+prepare_devnet_relayer_runtime "$testnet_dir/relayer-devnet-signer.json"
 started_compose="$repo_root/bridge/relayer/docker-compose.yml"
 RELAYER_CONFIG=./config.devnet.json docker compose -f "$started_compose" up -d
 for _ in $(seq 1 90); do
@@ -190,6 +186,64 @@ zama_result_line() {
   zama_rpc "$1" "$2" | tee -a "$evidence" | awk '/^ZAMA_RESULT /{line=$0} END{print line}'
 }
 
+require_unlocked_before_complete() {
+  local disagree_dir="$run_dir/bridge-disagree"
+  if [[ -f "$disagree_dir/journal.json" ]]; then
+    python3 - "$disagree_dir/journal.json" <<'PY'
+import json, sys
+journal = json.load(open(sys.argv[1]))
+if journal.get("completed") == "locked":
+    raise SystemExit("PUBLIC_HYBRID_COMPLETE blocked: disagreement still locked")
+PY
+  fi
+}
+
+record_public_evidence() {
+  python3 - "$journal_dir/journal.json" <<'PY' | tee -a "$evidence"
+import json, sys
+journal = json.load(open(sys.argv[1]))
+pairs = [
+    ("ZAMA_RESERVE_TX", journal.get("zama_reserve_tx", "")),
+    ("ZAMA_RESERVE_GAS", journal.get("zama_reserve_gas", "")),
+    ("ZAMA_FINALIZE_TX", journal.get("zama_finalize_tx", "")),
+    ("ZAMA_FINALIZE_GAS", journal.get("zama_finalize_gas", "")),
+    ("ZAMA_REDEEM_TX", journal.get("zama_redeem_tx", "")),
+    ("ZAMA_REDEEM_GAS", journal.get("zama_redeem_gas", "")),
+    ("MINT_APPROVAL_RELAYER_TX_A", journal.get("mint_approval_tx_a", "")),
+    ("MINT_APPROVAL_SIG_A", journal.get("mint_approval_sig_a", "")),
+    ("MINT_APPROVAL_RELAYER_TX_B", journal.get("mint_approval_tx_b", "")),
+    ("MINT_APPROVAL_SIG_B", journal.get("mint_approval_sig_b", "")),
+]
+missing = [name for name, value in pairs if not value]
+if missing:
+    raise SystemExit("missing public evidence: " + ", ".join(missing))
+for name, value in pairs:
+    print(f"{name} {value}")
+for name, value in pairs:
+    if name.endswith("_TX") and value.startswith("0x"):
+        print(f"{name}_EXPLORER https://sepolia.etherscan.io/tx/{value}")
+PY
+}
+
+completed="$(python3 -c "import json; print(json.load(open('$journal_dir/journal.json')).get('completed') or '')")"
+if [[ "$completed" == "locked" ]]; then
+  log "BRIDGE_UNKNOWN_ATTESTER"
+  BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
+    run_workflow --journal "$journal_dir" --resume --inject-unknown-attester --halt-after-first-approval
+  grep -q "FAULT_INJECTED unknown_attester" "$tmp_dir/ctd-workflow.log" || fail "unknown attester was not injected"
+  grep -q UNKNOWN_ATTESTER_REJECTED "$tmp_dir/ctd-workflow.log" || fail "unknown attester was not rejected"
+  log "BRIDGE_ATTESTER_DISAGREEMENT"
+  BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
+    run_workflow --journal "$journal_dir" --resume --inject-attester-disagreement
+  grep -q "FAULT_INJECTED attester_disagreement" "$tmp_dir/ctd-workflow.log" \
+    || fail "attester disagreement was not injected"
+  grep -q ATTESTER_DISAGREEMENT_REJECTED "$tmp_dir/ctd-workflow.log" \
+    || fail "attester disagreement was not rejected"
+  assert_journal_step "$journal_dir" locked
+  grep -q "RECOVERY_RESULT no_mint_without_quorum" "$tmp_dir/ctd-workflow.log" \
+    || fail "conflicting vote was not proven below quorum"
+fi
+
 log "BRIDGE_SECOND_ATTESTATION"
 BRIDGE_MINT_EXPIRY_SECS=1800 BRIDGE_JOURNAL_DIR="$journal_dir" \
   run_workflow --journal "$journal_dir" --resume --stop-after mint_approved
@@ -304,6 +358,11 @@ printf '%s\n' "$dup_redeem" | tee -a "$evidence"
 [[ "$dup_status" -ne 0 ]] || fail "duplicate Zama redeem was accepted"
 log "FAULT_DUPLICATE_ZAMA_REDEEM rejected"
 
+record_public_evidence
+require_unlocked_before_complete
+grep -q ZAMA_RESERVE_TX "$evidence" || fail "main Zama reserve hash is missing"
+grep -q ZAMA_FINALIZE_TX "$evidence" || fail "main Zama finalize hash is missing"
+grep -q ZAMA_REDEEM_TX "$evidence" || fail "main Zama redeem hash is missing"
 cp "$tmp_dir/ctd-workflow.log" "$log_dir/public-hybrid-workflow.log"
 log "PUBLIC_HYBRID_COMPLETE"
 echo "PUBLIC_HYBRID_COMPLETE"

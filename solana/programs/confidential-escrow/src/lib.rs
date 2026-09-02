@@ -9,6 +9,9 @@ pub mod state;
 
 use handlers::*;
 
+#[cfg(feature = "devnet-id")]
+declare_id!("BkDwMbtMVhDWeQ1nHwvCKmTT2XZhP2RMYGw18c6imnPf");
+#[cfg(not(feature = "devnet-id"))]
 declare_id!("9Yuvt4HxfbGCL9gPk3ygMLV3UdrMFgAJsyhdoJvbKcUD");
 
 #[program]

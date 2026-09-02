@@ -14,6 +14,21 @@
         "fee_payment_strategy": "relayer",
         "min_balance": 0
       }
+    },
+    {
+      "id": "solana-devnet",
+      "name": "solana devnet",
+      "network": "devnet",
+      "paused": false,
+      "signer_id": "local-signer",
+      "network_type": "solana",
+      "custom_rpc_urls": [
+        { "url": "https://api.devnet.solana.com", "weight": 100 }
+      ],
+      "policies": {
+        "fee_payment_strategy": "relayer",
+        "min_balance": 0
+      }
     }
   ],
   "signers": [

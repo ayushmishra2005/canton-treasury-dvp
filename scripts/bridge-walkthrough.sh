@@ -24,10 +24,12 @@ test -f solana/target/deploy/confidential_escrow.so || fail "missing confidentia
 "$repo_root/scripts/build-token-2022-zk-ops.sh"
 token_2022_so="$repo_root/solana/target/deploy/spl_token_2022_zk_ops.so"
 test -f "$token_2022_so" || fail "missing Token-2022 zk-ops program"
+require_devnet_matching_validator
 
 ledger_dir="$(mktemp -d "${TMPDIR:-/tmp}/ctd-walk-solana-XXXXXX")"
-solana-test-validator --reset --quiet --ledger "$ledger_dir" --rpc-port 8899 --faucet-port 9900 \
+"$(agave_devnet_validator)" --reset --quiet --ledger "$ledger_dir" --rpc-port 8899 --faucet-port 9900 \
   --bpf-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb "$token_2022_so" \
+  --bpf-program "$RECORD_PROGRAM_ID" "$(record_so)" \
   --bpf-program "$ESCROW_PROGRAM_ID" "$(escrow_so)" >"$tmp_dir/ctd-walk-solana.log" 2>&1 &
 started_pids+=("$!")
 for _ in $(seq 1 60); do
@@ -38,6 +40,8 @@ solana cluster-version --url http://127.0.0.1:8899 >/dev/null || fail "solana-te
 solana airdrop 100 --url http://127.0.0.1:8899 >/dev/null
 solana account ZkE1Gama1Proof11111111111111111111111111111 --url http://127.0.0.1:8899 >/dev/null \
   || fail "zk-elgamal-proof program is missing on the local validator"
+solana account "$RECORD_PROGRAM_ID" --url http://127.0.0.1:8899 >/dev/null \
+  || fail "official Record program is missing on the local validator"
 require_escrow_loaded
 
 export RELAYER_API_KEY="${RELAYER_API_KEY:-bridge-local-api-key-32chars-min}"

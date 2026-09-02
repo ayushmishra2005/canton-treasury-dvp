@@ -684,7 +684,7 @@ impl Workflow {
             &accounts.source.elgamal,
             &accounts.source.aes,
             &accounts.source.token,
-            &vault_elgamal_pubkey(accounts),
+            vault_elgamal_pubkey(accounts),
             amount,
         )?;
         let lock_proof = proof_commitment(
@@ -697,9 +697,7 @@ impl Workflow {
         );
         journal.lock_proof_hex = hex::encode(lock_proof);
         self.store.save_journal(journal)?;
-        let vault_decryptable = crate::confidential::decryptable_bytes(
-            &accounts.vault_aes.encrypt(vault_before + amount),
-        )?;
+        let vault_decryptable = accounts.vault_aes.encrypt(vault_before + amount)?;
         let lock_fields = LockFields {
             operation,
             destination: accounts.source.token,

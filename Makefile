@@ -95,6 +95,7 @@ bridge-build: require-dpm require-bridge-tools build
 	@cd solana && cargo test --manifest-path programs/confidential-escrow/Cargo.toml --lib --no-run
 	@cd solana && anchor build
 	@cd zama && npx hardhat compile
+	@cd bridge/devnet-zk && cargo test --lib --no-run
 	@cd bridge && cargo build
 	@echo "BRIDGE_BUILD_COMPLETE"
 
@@ -105,6 +106,7 @@ bridge-test: bridge-build
 	@cd zama && npx hardhat test
 	@cd zama && npm run typecheck
 	@cd daml/bridge-tests && dpm test
+	@cd bridge/devnet-zk && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 	@cd bridge && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 	@echo "BRIDGE_TEST_COMPLETE"
 

@@ -129,9 +129,26 @@ cleanup_bridge_stack() {
 }
 
 ESCROW_PROGRAM_ID="9Yuvt4HxfbGCL9gPk3ygMLV3UdrMFgAJsyhdoJvbKcUD"
+RECORD_PROGRAM_ID="recr1L3PCGKLbckBqMNcJhuuyU1zgo8nBhfLVsJNwr5"
+AGAVE_DEVNET_VALIDATOR_VERSION="v4.3.0-beta.3"
 
 escrow_so() {
   echo "${repo_root}/solana/target/deploy/confidential_escrow.so"
+}
+
+record_so() {
+  echo "${repo_root}/solana/target/deploy/spl_record.so"
+}
+
+agave_devnet_validator() {
+  echo "${repo_root}/.cache/agave-${AGAVE_DEVNET_VALIDATOR_VERSION}/solana-release/bin/solana-test-validator"
+}
+
+require_devnet_matching_validator() {
+  "$repo_root/scripts/fetch-agave-devnet-validator.sh"
+  "$repo_root/scripts/build-spl-record.sh"
+  test -x "$(agave_devnet_validator)" || fail "missing Devnet-matching solana-test-validator"
+  test -f "$(record_so)" || fail "missing official Record program"
 }
 
 require_escrow_loaded() {

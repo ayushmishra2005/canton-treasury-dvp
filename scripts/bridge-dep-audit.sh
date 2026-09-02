@@ -76,5 +76,6 @@ PY
 
 require_cargo_audit
 audit_lockfile bridge/Cargo.lock BRIDGE
+audit_lockfile bridge/devnet-zk/Cargo.lock DEVNET_ZK
 audit_lockfile solana/Cargo.lock SOLANA
 echo "DEP_AUDIT_OK"

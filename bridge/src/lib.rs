@@ -4,6 +4,7 @@ pub mod canton;
 pub mod canton_history;
 pub mod confidential;
 pub mod journal;
+pub mod probe;
 pub mod program;
 pub mod recovery;
 pub mod relayer;

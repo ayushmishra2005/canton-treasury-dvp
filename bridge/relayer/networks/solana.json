@@ -7,6 +7,14 @@
       "average_blocktime_ms": 400,
       "is_testnet": true,
       "tags": ["local", "solana"]
+    },
+    {
+      "type": "solana",
+      "network": "devnet",
+      "rpc_urls": ["https://api.devnet.solana.com"],
+      "average_blocktime_ms": 400,
+      "is_testnet": true,
+      "tags": ["devnet", "solana"]
     }
   ]
 }

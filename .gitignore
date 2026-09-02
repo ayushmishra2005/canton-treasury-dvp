@@ -8,6 +8,7 @@ canton/.run/
 .idea/
 .vendor/
 bridge/target/
+bridge/devnet-zk/target/
 bridge/relayer/keys/
 solana/target/
 solana/.anchor/
